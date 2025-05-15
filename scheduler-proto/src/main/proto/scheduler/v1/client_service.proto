@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package scheduler.v1;
+
+option java_multiple_files = true;
+option java_package = "com.scheduler.proto.v1";
+
+import "scheduler/v1/common.proto";
+
+message TaskDefinition {
+  string name = 1;
+}
+
+message SubmitJobRequest {
+  string name = 1;
+  string jar_path = 2;
+  string main_class = 3;
+  repeated TaskDefinition tasks = 4;
+  int32 priority = 5;
+}
+
+message SubmitJobResponse {
+  Job job = 1;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message GetJobStatusResponse {
+  Job job = 1;
+}
+
+service ClientService {
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+}

@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package scheduler.v1;
+
+option java_multiple_files = true;
+option java_package = "com.scheduler.proto.v1";
+
+import "scheduler/v1/common.proto";
+
+message RegisterWorkerRequest {
+  string hostname = 1;
+  int32 port = 2;
+  int32 capacity = 3;
+}
+
+message RegisterWorkerResponse {
+  string worker_id = 1;
+}
+
+message PullJobRequest {
+  string worker_id = 1;
+}
+
+message PullJobResponse {
+  Job job = 1; // empty if no job available
+}
+
+message ReportTaskStatusRequest {
+  string job_id = 1;
+  int32 task_index = 2;
+  TaskStatus status = 3;
+  string error_message = 4;
+}
+
+message ReportTaskStatusResponse {
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+}
+
+message HeartbeatResponse {
+  bool should_drain = 1;
+}
+
+service WorkerService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc PullJob(PullJobRequest) returns (PullJobResponse);
+  rpc ReportTaskStatus(stream ReportTaskStatusRequest) returns (ReportTaskStatusResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}

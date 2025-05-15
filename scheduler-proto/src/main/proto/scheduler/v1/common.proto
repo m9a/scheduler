@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package scheduler.v1;
+
+option java_multiple_files = true;
+option java_package = "com.scheduler.proto.v1";
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_QUEUED = 1;
+  JOB_STATUS_STARTING = 2;
+  JOB_STATUS_RUNNING = 3;
+  JOB_STATUS_COMPLETED = 4;
+  JOB_STATUS_FAILED = 5;
+  JOB_STATUS_CANCELLED = 6;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_COMPLETED = 3;
+  TASK_STATUS_FAILED = 4;
+  TASK_STATUS_SKIPPED = 5;
+}
+
+message Task {
+  string id = 1;
+  string name = 2;
+  int32 sequence_number = 3;
+  TaskStatus status = 4;
+}
+
+message Job {
+  string id = 1;
+  string name = 2;
+  string jar_path = 3;
+  string main_class = 4;
+  JobStatus status = 5;
+  repeated Task tasks = 6;
+  int32 priority = 7;
+  int64 created_at_millis = 8;
+  int64 started_at_millis = 9;
+  int64 completed_at_millis = 10;
+  string error_message = 11;
+}
