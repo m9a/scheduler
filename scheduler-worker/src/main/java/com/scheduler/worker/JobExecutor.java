@@ -10,13 +10,21 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Spawns a child JVM process for a job. Called by {@link WorkerAgent} when
+ * Runs in the Worker JVM. Spawns a separate child JVM process (the "job process")
+ * for a job JAR and waits for it to finish. Called by {@link WorkerAgent} when
  * a job is pulled from the coordinator.
  *
+ * <p>Inside the job process, {@link com.scheduler.sdk.JobRunner} takes over — it
+ * runs the tasks sequentially and POSTs status updates back to WorkerAgent via HTTP.
+ * JobExecutor does not communicate with the job process directly; it only manages
+ * the OS process lifecycle (spawn, read stdout, wait for exit).
+ *
  * <pre>
- * WorkerAgent ──► JobExecutor ──spawns──► Child JVM (java -jar)
- *                                          └─ JobRunner runs tasks
- *                                          └─ reports status via HTTP to StatusCallbackServer
+ *                  Worker JVM                          Job process (child JVM)
+ *                  ──────────                          ───────────────────────
+ * WorkerAgent ──► JobExecutor ──spawns──► java -jar ──► JobRunner.run(tasks)
+ *                  (manages process)                     (runs tasks, POSTs
+ *                                                         status via HTTP)
  * </pre>
  *
  * <p>If {@code mainClass} is set:

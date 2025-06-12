@@ -10,16 +10,27 @@ import java.net.http.HttpResponse;
 import java.util.List;
 
 /**
- * Entry point for job processes. Runs tasks sequentially and reports
- * per-task status to the worker via local HTTP callback.
+ * Runs inside the job process (the child JVM spawned by JobExecutor on the worker).
+ * Job authors call this from their JAR's {@code main()} to run tasks sequentially.
+ * Each task's status is reported back to WorkerAgent via HTTP POST.
  *
- * <p>The worker spawns the job process with system properties:
+ * <pre>
+ *  Job process (child JVM)                     Worker JVM
+ *  ───────────────────────                     ──────────
+ *  main() {
+ *    JobRunner.run(tasks)
+ *      ├─ task.execute()
+ *      └─ POST /task-status ──HTTP──► WorkerAgent (task status server)
+ *  }
+ * </pre>
+ *
+ * <p>JobExecutor passes two system properties when spawning the job process:
  * <ul>
- *   <li>{@code scheduler.callback.url} — worker's local HTTP server URL</li>
+ *   <li>{@code scheduler.callback.url} — WorkerAgent's task status HTTP server URL</li>
  *   <li>{@code scheduler.job.id} — the job execution ID</li>
  * </ul>
  *
- * <p>Usage:
+ * <p>Usage (inside a job JAR):
  * <pre>
  * public class MyJob {
  *     public static void main(String[] args) {

@@ -62,7 +62,7 @@
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
                 <configuration>
-                    <mainClass>com.scheduler.worker.WorkerMain</mainClass>
+                    <mainClass>com.scheduler.worker.WorkerAgent</mainClass>
                 </configuration>
             </plugin>
         </plugins>

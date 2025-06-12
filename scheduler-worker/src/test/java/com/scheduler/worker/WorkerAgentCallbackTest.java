@@ -19,21 +19,22 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-class StatusCallbackServerTest {
+class WorkerAgentCallbackTest {
 
-    private StatusCallbackServer server;
+    private WorkerAgent agent;
     private List<TaskStatusUpdate> receivedUpdates;
 
     @BeforeEach
     void setUp() throws IOException {
         receivedUpdates = Collections.synchronizedList(new ArrayList<>());
-        server = new StatusCallbackServer(0, receivedUpdates::add);
-        server.start();
+        // coordinatorHost/port don't matter — we only test the HTTP callback, no gRPC RPCs
+        agent = new WorkerAgent("localhost", 1, "localhost", 1);
+        agent.onTaskStatus(receivedUpdates::add);
     }
 
     @AfterEach
-    void tearDown() {
-        server.close();
+    void tearDown() throws Exception {
+        agent.close();
     }
 
     @Test
@@ -42,7 +43,7 @@ class StatusCallbackServerTest {
         TaskStatusUpdate update = new TaskStatusUpdate("job-1", 0, "extract", TaskStatus.RUNNING, null);
 
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + server.getPort() + "/task-status"))
+                .uri(URI.create("http://localhost:" + agent.taskStatusPort() + "/task-status"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(update.toJson()))
                 .build();
@@ -57,7 +58,7 @@ class StatusCallbackServerTest {
 
     @Test
     void receiveFromJobRunner() {
-        String callbackUrl = "http://localhost:" + server.getPort();
+        String callbackUrl = "http://localhost:" + agent.taskStatusPort();
 
         JobRunner.run(List.of(
                 new SimpleTask("step-1"),
@@ -71,7 +72,6 @@ class StatusCallbackServerTest {
         assertEquals(TaskStatus.RUNNING, receivedUpdates.get(2).status());
         assertEquals("step-2", receivedUpdates.get(2).taskName());
         assertEquals(TaskStatus.COMPLETED, receivedUpdates.get(3).status());
-        // all updates carry the same job id
         assertTrue(receivedUpdates.stream().allMatch(u -> "job-42".equals(u.jobId())));
     }
 
@@ -79,7 +79,7 @@ class StatusCallbackServerTest {
     void rejectNonPost() throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + server.getPort() + "/task-status"))
+                .uri(URI.create("http://localhost:" + agent.taskStatusPort() + "/task-status"))
                 .GET()
                 .build();
         HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());

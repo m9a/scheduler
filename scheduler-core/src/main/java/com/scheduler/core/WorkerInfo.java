@@ -6,7 +6,6 @@ import java.util.Objects;
 public record WorkerInfo(
         String id,
         String hostname,
-        int port,
         int capacity,
         Instant registeredAt,
         Instant lastHeartbeat
@@ -18,6 +17,6 @@ public record WorkerInfo(
     }
 
     public WorkerInfo withLastHeartbeat(Instant lastHeartbeat) {
-        return new WorkerInfo(id, hostname, port, capacity, registeredAt, lastHeartbeat);
+        return new WorkerInfo(id, hostname, capacity, registeredAt, lastHeartbeat);
     }
 }

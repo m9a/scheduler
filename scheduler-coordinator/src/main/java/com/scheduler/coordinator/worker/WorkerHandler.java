@@ -40,12 +40,11 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> responseObserver) {
         String workerId = UUID.randomUUID().toString();
-        log.info("Received registerWorker from hostname={}, port={}, capacity={}, assigned workerId={}",
-                request.getHostname(), request.getPort(), request.getCapacity(), workerId);
+        log.info("Received registerWorker from hostname={}, capacity={}, assigned workerId={}",
+                request.getHostname(), request.getCapacity(), workerId);
         WorkerInfo worker = new WorkerInfo(
                 workerId,
                 request.getHostname(),
-                request.getPort(),
                 request.getCapacity(),
                 Instant.now(),
                 Instant.now()

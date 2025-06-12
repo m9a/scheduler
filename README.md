@@ -61,18 +61,24 @@ scheduler/
 
 ### Worker architecture
 
+There are two JVM processes involved in running a job:
+
+| Term | Where it runs | What it does |
+|------|---------------|--------------|
+| **JobExecutor** | Worker JVM (`scheduler-worker`) | Spawns the job process and waits for it to exit. Manages the OS process lifecycle only — does not communicate with the job process directly. |
+| **JobRunner** | Job process (`job-sdk`) | Runs inside the spawned child JVM. Executes tasks sequentially and POSTs status updates back to WorkerAgent via HTTP. |
+| **"job process"** | Child JVM | The child JVM that JobExecutor spawns (`java -jar`). JobRunner runs inside it. |
+
 ```
 Worker JVM
-├── WorkerAgent                registers, pulls jobs, streams status to coordinator via gRPC
-├── StatusCallbackServer       local HTTP server, receives status from job processes
-├── TaskStatusReporter         forwards updates to coordinator via gRPC stream
-└── JobExecutor                spawns one child JVM per job
+├── WorkerAgent                receives status from JobRunner (via HTTP),
+│                              forwards to coordinator (via gRPC)
+├── TaskStatusReporter         converts SDK updates to proto and streams via gRPC
+└── JobExecutor                spawns the job process (child JVM), reads its stdout
 ```
 
-When the worker pulls a job, `JobExecutor` spawns a child JVM process (`java -jar <jarPath>`). Inside that child process, the job author's code uses `JobRunner` from the `job-sdk` to run tasks as sequential stages. The two processes communicate via HTTP:
-
 ```
-Worker JVM                                    Job JVM (child process)
+Worker JVM                                    Job process (child JVM)
 ─────────────────────────────────             ─────────────────────────────────
                                               main() {
 JobExecutor                                     JobRunner.run(List.of(
@@ -84,7 +90,7 @@ JobExecutor                                     JobRunner.run(List.of(
 
                                               JobRunner runs each task:
                                                 1. POST /task-status {RUNNING}
-StatusCallbackServer ◄── HTTP POST ─────────    2. task.execute()
+WorkerAgent ◄──────── HTTP POST ───────────    2. task.execute()
   │                                             3. POST /task-status {COMPLETED}
   │  receives TaskStatusUpdate                     ... next task ...
   │
@@ -105,11 +111,11 @@ JobManagerImpl
   └─ task FAILED    → skip remaining, job→FAILED
 ```
 
-The worker passes two system properties to the child process:
-- `scheduler.callback.url` — the worker's `StatusCallbackServer` URL
+JobExecutor passes two system properties when spawning the job process:
+- `scheduler.callback.url` — WorkerAgent's task status HTTP server URL
 - `scheduler.job.id` — the job execution ID
 
-The child process never talks to the coordinator directly. All status reporting goes through the worker.
+The job process never talks to the coordinator directly. All status reporting goes through WorkerAgent.
 
 ### Message exchange
 
@@ -184,7 +190,7 @@ Client                          Coordinator                         Worker
 ### How a request flows
 
 1. Client sends a `SubmitJobRequest` over gRPC
-2. `ClientHandler` receives the proto message
+2. `UserClientHandler` receives the proto message
 3. `ProtoMapper.toDomain()` converts the proto request into domain objects (`Job`, `Task`)
 4. `JobManager.submit()` creates a `JobExecution` with `TaskExecution` entries and queues it
 5. `ProtoMapper.toProto()` converts the `JobExecution` back to a proto `Job` message for the response

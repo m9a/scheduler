@@ -14,11 +14,12 @@ import java.util.concurrent.TimeUnit;
  * Streams task status updates from the worker to the coordinator over gRPC.
  * Created by {@link WorkerAgent#openTaskStatusStream()}.
  *
+ * <p>WorkerAgent receives {@link TaskStatusUpdate} from JobRunner (via HTTP),
+ * then passes them here to be converted to proto and streamed to the coordinator.
+ *
  * <pre>
- * StatusCallbackServer ──► TaskStatusReporter ──gRPC stream──► Coordinator (WorkerHandler)
- *   (receives from           (converts SDK                      (ReportTaskStatus RPC)
- *    job process)              TaskStatusUpdate
- *                              to proto)
+ * JobRunner ──HTTP──► WorkerAgent ──► TaskStatusReporter ──gRPC stream──► Coordinator
+ * (job process)       (receives update)  (converts to proto)               (WorkerHandler)
  * </pre>
  */
 public class TaskStatusReporter {

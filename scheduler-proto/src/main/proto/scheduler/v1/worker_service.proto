@@ -9,8 +9,7 @@ import "scheduler/v1/common.proto";
 
 message RegisterWorkerRequest {
   string hostname = 1;
-  int32 port = 2;
-  int32 capacity = 3;
+  int32 capacity = 2;
 }
 
 message RegisterWorkerResponse {

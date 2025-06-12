@@ -3,7 +3,8 @@ package com.scheduler.sdk;
 import java.util.Objects;
 
 /**
- * Status update sent from the job process to the worker's local HTTP server.
+ * Status update sent from JobRunner (in the job process) to WorkerAgent (in the worker JVM)
+ * via HTTP POST to {@code /task-status}.
  */
 public record TaskStatusUpdate(String jobId, int taskIndex, String taskName, TaskStatus status, String errorMessage) {
 
