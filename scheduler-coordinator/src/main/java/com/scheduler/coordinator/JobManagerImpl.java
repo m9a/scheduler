@@ -1,7 +1,6 @@
 package com.scheduler.coordinator;
 
 import com.scheduler.core.*;
-import com.scheduler.core.api.JobManager;
 import com.scheduler.core.exception.JobNotFoundException;
 
 import org.slf4j.Logger;
@@ -16,32 +15,28 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
- * In-memory implementation of {@link JobManager}. Manages job lifecycle state.
+ * Manages job lifecycle state in memory.
+ * Tasks are created lazily as status updates arrive from the worker.
  *
  * <pre>
- * UserClientHandler ──► submit(), getJob()
- * WorkerHandler ──► claimNextJob(), updateTaskStatus()
+ * UserRequestHandler ──► submit(), getJob()
+ * WorkerHandler ──► claimNextJob(), updateTaskStatus(), finalizeJob()
  * </pre>
  */
-class JobManagerImpl implements JobManager {
+public class JobManagerImpl {
 
     private static final Logger log = LoggerFactory.getLogger(JobManagerImpl.class);
 
-    private final ConcurrentHashMap<String, JobExecution> jobs = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, JobState> jobs = new ConcurrentHashMap<>();
     private final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
 
-    @Override
-    public JobExecution submit(Job job) {
-        List<TaskExecution> taskExecutions = new ArrayList<>();
-        for (int i = 0; i < job.tasks().size(); i++) {
-            taskExecutions.add(new TaskExecution(UUID.randomUUID().toString(), i));
-        }
 
-        JobExecution execution = new JobExecution(
+    public JobState submit(Job job) {
+        JobState execution = new JobState(
                 UUID.randomUUID().toString(),
                 job,
                 JobStatus.QUEUED,
-                taskExecutions,
+                new ArrayList<>(),
                 Instant.now(),
                 null, null, null
         );
@@ -51,23 +46,23 @@ class JobManagerImpl implements JobManager {
         return execution;
     }
 
-    @Override
-    public JobExecution getJob(String jobId) {
-        JobExecution job = jobs.get(jobId);
+
+    public JobState getJob(String jobId) {
+        JobState job = jobs.get(jobId);
         if (job == null) {
             throw new JobNotFoundException(jobId);
         }
         return job;
     }
 
-    @Override
-    public Optional<JobExecution> claimNextJob(String workerId) {
+
+    public Optional<JobState> claimNextJob(String workerId) {
         String jobId = queue.poll();
         if (jobId == null) {
             return Optional.empty();
         }
 
-        JobExecution job = jobs.get(jobId);
+        JobState job = jobs.get(jobId);
         if (job == null) {
             throw new IllegalStateException("Job %s in queue but not in map".formatted(jobId));
         }
@@ -76,52 +71,64 @@ class JobManagerImpl implements JobManager {
                     "Job %s in queue but has status %s".formatted(jobId, job.status()));
         }
 
-        JobExecution claimed = job.withStatus(JobStatus.STARTING);
+        JobState claimed = job.withStatus(JobStatus.STARTING);
         jobs.put(jobId, claimed);
         return Optional.of(claimed);
     }
 
-    @Override
-    public synchronized void updateTaskStatus(String jobId, int taskIndex, TaskStatus status, String errorMessage) {
-        JobExecution execution = getJob(jobId);
-        List<TaskExecution> taskExecutions = execution.taskExecutions();
 
-        if (taskIndex < 0 || taskIndex >= taskExecutions.size()) {
-            throw new IllegalArgumentException(
-                    "Task index %d out of range for job %s (has %d tasks)".formatted(taskIndex, jobId, taskExecutions.size()));
+    public synchronized void updateTaskStatus(String jobId, int taskIndex, String taskName,
+                                              TaskStatus status, String errorMessage) {
+        JobState job = getJob(jobId);
+        List<TaskState> taskStates = job.taskStates();
+
+        // Lazily create TaskState entries as they arrive
+        while (taskIndex >= taskStates.size()) {
+            int nextIndex = taskStates.size();
+            taskStates.add(new TaskState(UUID.randomUUID().toString(), nextIndex, taskName));
         }
 
-        TaskExecution task = taskExecutions.get(taskIndex);
+        TaskState task = taskStates.get(taskIndex);
         task.setStatus(status);
 
         if (status == TaskStatus.RUNNING) {
             task.setStartedAt(Instant.now());
-            if (execution.status() == JobStatus.STARTING) {
-                JobExecution running = execution.withStatus(JobStatus.RUNNING).withStartedAt(Instant.now());
+            if (job.status() == JobStatus.STARTING) {
+                JobState running = job.withStatus(JobStatus.RUNNING).withStartedAt(Instant.now());
                 jobs.put(jobId, running);
                 log.info("Job {} is now RUNNING", jobId);
             }
         } else if (status == TaskStatus.COMPLETED) {
             task.setCompletedAt(Instant.now());
-            boolean allCompleted = taskExecutions.stream()
-                    .allMatch(t -> t.status() == TaskStatus.COMPLETED);
-            if (allCompleted) {
-                JobExecution completed = execution.withStatus(JobStatus.COMPLETED).withCompletedAt(Instant.now());
-                jobs.put(jobId, completed);
-                log.info("Job {} COMPLETED", jobId);
-            }
         } else if (status == TaskStatus.FAILED) {
             task.setCompletedAt(Instant.now());
             task.setErrorMessage(errorMessage);
-            for (TaskExecution remaining : taskExecutions) {
-                if (remaining.status() == TaskStatus.PENDING) {
-                    remaining.setStatus(TaskStatus.SKIPPED);
-                }
-            }
-            JobExecution failed = execution.withStatus(JobStatus.FAILED).withCompletedAt(Instant.now())
+            JobState failed = job.withStatus(JobStatus.FAILED).withCompletedAt(Instant.now())
                     .withErrorMessage(errorMessage);
             jobs.put(jobId, failed);
             log.info("Job {} FAILED at task {}: {}", jobId, taskIndex, errorMessage);
+        }
+    }
+
+
+    public synchronized void finalizeJob(String jobId) {
+        JobState execution = getJob(jobId);
+
+        if (execution.status().isTerminal()) {
+            return;
+        }
+
+        boolean allCompleted = !execution.taskStates().isEmpty()
+                && execution.taskStates().stream().allMatch(t -> t.status() == TaskStatus.COMPLETED);
+        if (allCompleted) {
+            JobState completed = execution.withStatus(JobStatus.COMPLETED).withCompletedAt(Instant.now());
+            jobs.put(jobId, completed);
+            log.info("Job {} COMPLETED", jobId);
+        } else {
+            JobState failed = execution.withStatus(JobStatus.FAILED).withCompletedAt(Instant.now())
+                    .withErrorMessage("Process terminated before all tasks completed");
+            jobs.put(jobId, failed);
+            log.info("Job {} FAILED: process terminated before all tasks completed", jobId);
         }
     }
 }

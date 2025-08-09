@@ -14,6 +14,8 @@
         <module>scheduler-proto</module>
         <module>job-sdk</module>
         <module>scheduler-coordinator</module>
+        <module>job-annotations</module>
+        <module>sample-job</module>
         <module>scheduler-worker</module>
     </modules>
 
@@ -47,6 +49,16 @@
             <dependency>
                 <groupId>com.scheduler</groupId>
                 <artifactId>job-sdk</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.scheduler</groupId>
+                <artifactId>scheduler-coordinator</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.scheduler</groupId>
+                <artifactId>job-annotations</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

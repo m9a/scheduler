@@ -2,10 +2,10 @@ package com.scheduler.coordinator.worker;
 
 import com.scheduler.coordinator.ProtoMapper;
 
-import com.scheduler.core.JobExecution;
+import com.scheduler.core.JobState;
 import com.scheduler.core.WorkerInfo;
-import com.scheduler.core.api.JobManager;
-import com.scheduler.proto.v1.*;
+import com.scheduler.coordinator.JobManagerImpl;
+import com.scheduler.proto.coordinator.*;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,9 +20,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * and stream task status updates.
  *
  * <pre>
- * Worker ──gRPC──► WorkerHandler ──► JobManager
+ * Worker ──gRPC──► WorkerHandler ──► JobManagerImpl
  *                  (RegisterWorker)   (claimNextJob)
- *                  (PullJob)          (updateTaskStatus)
+ *                  (PullJob)          (updateTaskStatus, finalizeJob)
  *                  (ReportTaskStatus)
  * </pre>
  */
@@ -31,9 +31,9 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     private static final Logger log = LoggerFactory.getLogger(WorkerHandler.class);
 
     private final ConcurrentHashMap<String, WorkerInfo> workers = new ConcurrentHashMap<>();
-    private final JobManager jobManager;
+    private final JobManagerImpl jobManager;
 
-    public WorkerHandler(JobManager jobManager) {
+    public WorkerHandler(JobManagerImpl jobManager) {
         this.jobManager = jobManager;
     }
 
@@ -60,7 +60,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void pullJob(PullJobRequest request, StreamObserver<PullJobResponse> responseObserver) {
         log.info("Received pullJob from workerId={}", request.getWorkerId());
-        Optional<JobExecution> claimed = jobManager.claimNextJob(request.getWorkerId());
+        Optional<JobState> claimed = jobManager.claimNextJob(request.getWorkerId());
 
         PullJobResponse.Builder builder = PullJobResponse.newBuilder();
         if (claimed.isPresent()) {
@@ -77,14 +77,20 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public StreamObserver<ReportTaskStatusRequest> reportTaskStatus(StreamObserver<ReportTaskStatusResponse> responseObserver) {
         return new StreamObserver<>() {
+            private volatile String jobId;
+
             @Override
             public void onNext(ReportTaskStatusRequest request) {
-                log.info("Received task status update: jobId={}, taskIndex={}, status={}{}",
-                        request.getJobId(), request.getTaskIndex(), request.getStatus(),
+                if (jobId == null) {
+                    jobId = request.getJobId();
+                }
+                log.info("Received task status update: jobId={}, taskIndex={}, taskName={}, status={}{}",
+                        request.getJobId(), request.getTaskIndex(), request.getTaskName(), request.getStatus(),
                         request.getErrorMessage().isEmpty() ? "" : ", error=" + request.getErrorMessage());
                 jobManager.updateTaskStatus(
                         request.getJobId(),
                         request.getTaskIndex(),
+                        request.getTaskName(),
                         ProtoMapper.toDomain(request.getStatus()),
                         request.getErrorMessage().isEmpty() ? null : request.getErrorMessage()
                 );
@@ -93,10 +99,16 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
             @Override
             public void onError(Throwable t) {
                 log.error("ReportTaskStatus stream error: {}", t.getMessage());
+                if (jobId != null) {
+                    jobManager.finalizeJob(jobId);
+                }
             }
 
             @Override
             public void onCompleted() {
+                if (jobId != null) {
+                    jobManager.finalizeJob(jobId);
+                }
                 responseObserver.onNext(ReportTaskStatusResponse.getDefaultInstance());
                 responseObserver.onCompleted();
             }

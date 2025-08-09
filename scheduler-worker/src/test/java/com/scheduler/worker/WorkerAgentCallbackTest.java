@@ -1,7 +1,8 @@
 package com.scheduler.worker;
 
-import com.scheduler.sdk.JobRunner;
+import com.scheduler.sdk.JobProcess;
 import com.scheduler.sdk.Task;
+import com.scheduler.sdk.TaskContext;
 import com.scheduler.sdk.TaskStatus;
 import com.scheduler.sdk.TaskStatusUpdate;
 import org.junit.jupiter.api.AfterEach;
@@ -43,7 +44,7 @@ class WorkerAgentCallbackTest {
         TaskStatusUpdate update = new TaskStatusUpdate("job-1", 0, "extract", TaskStatus.RUNNING, null);
 
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + agent.taskStatusPort() + "/task-status"))
+                .uri(URI.create(agent.workerAgentUrl() + "/task-status"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(update.toJson()))
                 .build();
@@ -57,10 +58,10 @@ class WorkerAgentCallbackTest {
     }
 
     @Test
-    void receiveFromJobRunner() {
-        String callbackUrl = "http://localhost:" + agent.taskStatusPort();
+    void receiveFromJobProcess() {
+        String callbackUrl = agent.workerAgentUrl();
 
-        JobRunner.run(List.of(
+        JobProcess.run(List.of(
                 new SimpleTask("step-1"),
                 new SimpleTask("step-2")
         ), "job-42", callbackUrl);
@@ -69,6 +70,9 @@ class WorkerAgentCallbackTest {
         assertEquals(TaskStatus.RUNNING, receivedUpdates.get(0).status());
         assertEquals("step-1", receivedUpdates.get(0).taskName());
         assertEquals(TaskStatus.COMPLETED, receivedUpdates.get(1).status());
+        assertTrue(receivedUpdates.get(1).durationMs() >= 0);
+        assertNotNull(receivedUpdates.get(1).output());
+        assertTrue(receivedUpdates.get(1).output().contains("Executing task!"));
         assertEquals(TaskStatus.RUNNING, receivedUpdates.get(2).status());
         assertEquals("step-2", receivedUpdates.get(2).taskName());
         assertEquals(TaskStatus.COMPLETED, receivedUpdates.get(3).status());
@@ -79,7 +83,7 @@ class WorkerAgentCallbackTest {
     void rejectNonPost() throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + agent.taskStatusPort() + "/task-status"))
+                .uri(URI.create(agent.workerAgentUrl() + "/task-status"))
                 .GET()
                 .build();
         HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
@@ -95,7 +99,7 @@ class WorkerAgentCallbackTest {
         }
 
         @Override
-        public void execute() {
+        public void execute(TaskContext ctx) {
             System.out.println("Executing task!");
         }
     }

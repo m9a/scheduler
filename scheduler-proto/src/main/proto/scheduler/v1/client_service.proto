@@ -7,15 +7,10 @@ option java_package = "com.scheduler.proto.v1";
 
 import "scheduler/v1/common.proto";
 
-message TaskDefinition {
-  string name = 1;
-}
-
 message SubmitJobRequest {
   string name = 1;
   string jar_path = 2;
   string main_class = 3;
-  repeated TaskDefinition tasks = 4;
   int32 priority = 5;
 }
 
