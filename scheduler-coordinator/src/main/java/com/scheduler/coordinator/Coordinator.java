@@ -1,7 +1,6 @@
 package com.scheduler.coordinator;
 
-import com.scheduler.core.api.JobManager;
-import com.scheduler.coordinator.client.UserClientHandler;
+import com.scheduler.coordinator.client.UserRequestHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -18,8 +17,8 @@ public class Coordinator {
     public static void main(String[] args) throws IOException, InterruptedException {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_PORT;
 
-        JobManager jobManager = new JobManagerImpl();
-        UserClientHandler clientHandler = new UserClientHandler(jobManager);
+        JobManagerImpl jobManager = new JobManagerImpl();
+        UserRequestHandler clientHandler = new UserRequestHandler(jobManager);
         WorkerHandler workerHandler = new WorkerHandler(jobManager);
 
         Server server = ServerBuilder.forPort(port)

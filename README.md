@@ -42,7 +42,7 @@ scheduler/
 ├── scheduler-proto/         (protobuf/gRPC definitions + generated code)
 ├── job-sdk/                 (Task interface, JobRunner — framework for job JARs)
 ├── scheduler-coordinator/   (gRPC server, job state management, wiring)
-│   ├── client/              (UserClientHandler — handles user/client RPCs)
+│   ├── client/              (UserRequestHandler — handles user/client RPCs)
 │   └── worker/              (WorkerHandler — handles worker RPCs)
 └── scheduler-worker/        (gRPC client, job execution, process management)
 ```
@@ -50,14 +50,19 @@ scheduler/
 ## Architecture
 
 ```
-┌──────────┐         gRPC          ┌─────────────────┐         gRPC          ┌────────┐
-│  Client  │ ───────────────────►  │   Coordinator   │  ◄─────────────────── │ Worker │
-└──────────┘   ClientService       └─────────────────┘    WorkerService      └────────┘
-               (submit, query)      (job queue + state)   (pull, report)
+┌──────────┐       gRPC        ┌─────────────────┐       gRPC        ┌──────────────┐      child JVM     ┌─────────────┐
+│  Client  │ ────────────────► │   Coordinator   │ ◄──────────────── │  WorkerAgent │ ──────────────────► │ Job Process │
+└──────────┘  ClientService    └─────────────────┘   WorkerService   └──────────────┘                    └─────────────┘
+              (submit, query)   (job queue + state)  (pull, report)     │          ▲                        │
+                                                                       │          │  HTTP POST /task-status │
+                                                                       │          └────────────────────────┘
+                                                                       │           (JobRunner reports status)
+                                                                       └── JobExecutor spawns java -cp ... Harness
 ```
 
-- **Client → Coordinator**: Clients submit jobs and query status via the `ClientService` gRPC service.
-- **Worker → Coordinator**: Workers pull available jobs and report task progress via the `WorkerService` gRPC service.
+- **Client → Coordinator**: Clients submit jobs and query status via `ClientService` gRPC.
+- **Worker → Coordinator**: Workers register, pull jobs, and stream task status via `WorkerService` gRPC.
+- **Worker → Job Process**: WorkerAgent spawns a child JVM via JobExecutor. The job process runs JobRunner, which POSTs task status back to WorkerAgent over HTTP. WorkerAgent forwards these to the coordinator via gRPC.
 
 ### Worker architecture
 
@@ -120,61 +125,67 @@ The job process never talks to the coordinator directly. All status reporting go
 ### Message exchange
 
 ```
-Client                          Coordinator                         Worker
-  │                                 │                                  │
-  │  SubmitJobRequest               │                                  │
-  │  (name, jarPath, tasks,         │                                  │
-  │   mainClass, priority)          │                                  │
-  │ ──────────────────────────────► │                                  │
-  │                                 │  stores JobExecution(QUEUED)     │
-  │  SubmitJobResponse              │                                  │
-  │  (Job with id, status)          │                                  │
-  │ ◄────────────────────────────── │                                  │
-  │                                 │                                  │
-  │                                 │          RegisterWorkerRequest   │
-  │                                 │          (hostname, capacity)    │
-  │                                 │ ◄──────────────────────────────  │
-  │                                 │          RegisterWorkerResponse  │
-  │                                 │          (worker_id)             │
-  │                                 │ ──────────────────────────────►  │
-  │                                 │                                  │
-  │                                 │              PullJobRequest      │
-  │                                 │              (worker_id)         │
-  │                                 │ ◄──────────────────────────────  │
-  │                                 │  claims job → STARTING           │
-  │                                 │              PullJobResponse     │
-  │                                 │              (Job or empty)      │
-  │                                 │ ──────────────────────────────►  │
-  │                                 │                                  │
-  │                                 │                  Worker spawns   │
-  │                                 │                  java -jar       │
-  │                                 │                  process         │
-  │                                 │                                  │
-  │                                 │         ReportTaskStatus         │
-  │                                 │         (job_id, task_index,     │
-  │                                 │          RUNNING)                │
-  │                                 │ ◄──────────────────────────────  │
-  │                                 │         ReportTaskStatus         │
-  │                                 │         (job_id, task_index,     │
-  │                                 │          COMPLETED)              │
-  │                                 │ ◄──────────────────────────────  │
-  │                                 │         ... next task ...        │
-  │                                 │ ◄──────────────────────────────  │
-  │                                 │  all tasks done → job COMPLETED  │
-  │                                 │                                  │
-  │  GetJobStatusRequest            │                                  │
-  │  (job_id)                       │                                  │
-  │ ──────────────────────────────► │                                  │
-  │  GetJobStatusResponse           │                                  │
-  │  (Job with status, timestamps)  │                                  │
-  │ ◄────────────────────────────── │                                  │
-  │                                 │                                  │
-  │                                 │              Heartbeat           │
-  │                                 │              (worker_id)         │
-  │                                 │ ◄──────────────────────────────  │
-  │                                 │              HeartbeatResponse   │
-  │                                 │              (should_drain)      │
-  │                                 │ ──────────────────────────────►  │
+Client                    Coordinator                     WorkerAgent              Job Process
+  │                          │                               │                        │
+  │  SubmitJobRequest        │                               │                        │
+  │  (name, jarPath, tasks,  │                               │                        │
+  │   mainClass, priority)   │                               │                        │
+  │ ────────────────────────►│                               │                        │
+  │                          │  stores JobExecution(QUEUED)   │                        │
+  │  SubmitJobResponse       │                               │                        │
+  │  (Job with id, status)   │                               │                        │
+  │ ◄────────────────────────┤                               │                        │
+  │                          │                               │                        │
+  │                          │     RegisterWorkerRequest     │                        │
+  │                          │     (hostname, capacity)      │                        │
+  │                          │◄──────────────────────────────┤                        │
+  │                          │     RegisterWorkerResponse    │                        │
+  │                          │     (worker_id)               │                        │
+  │                          │──────────────────────────────►│                        │
+  │                          │                               │                        │
+  │                          │         PullJobRequest        │                        │
+  │                          │         (worker_id)           │                        │
+  │                          │◄──────────────────────────────┤                        │
+  │                          │  claims job → STARTING        │                        │
+  │                          │         PullJobResponse       │                        │
+  │                          │         (Job or empty)        │                        │
+  │                          │──────────────────────────────►│                        │
+  │                          │                               │                        │
+  │                          │                               │ spawn child JVM ──────►│
+  │                          │                               │   java -cp ... Harness │
+  │                          │                               │                        │
+  │                          │                               │  HTTP POST /task-status│
+  │                          │                               │◄───────────────────────┤
+  │                          │                               │  {RUNNING, taskIndex}  │
+  │                          │  gRPC ReportTaskStatus        │                        │
+  │                          │  (job_id, task_index, RUNNING)│                        │
+  │                          │◄──────────────────────────────┤                        │
+  │                          │  job STARTING → RUNNING       │                        │
+  │                          │                               │                        │
+  │                          │                               │  HTTP POST /task-status│
+  │                          │                               │◄───────────────────────┤
+  │                          │                               │  {COMPLETED, taskIndex}│
+  │                          │  gRPC ReportTaskStatus        │                        │
+  │                          │  (job_id, task_index,         │                        │
+  │                          │   COMPLETED)                  │                        │
+  │                          │◄──────────────────────────────┤                        │
+  │                          │         ... next task ...     │◄──────────────────────►│
+  │                          │◄──────────────────────────────┤                        │
+  │                          │  all tasks done → COMPLETED   │                        │
+  │                          │                               │                        │
+  │  GetJobStatusRequest     │                               │                        │
+  │  (job_id)                │                               │                        │
+  │ ────────────────────────►│                               │                        │
+  │  GetJobStatusResponse    │                               │                        │
+  │  (Job with COMPLETED)    │                               │                        │
+  │ ◄────────────────────────┤                               │                        │
+  │                          │                               │                        │
+  │                          │         Heartbeat             │                        │
+  │                          │         (worker_id)           │                        │
+  │                          │◄──────────────────────────────┤                        │
+  │                          │         HeartbeatResponse     │                        │
+  │                          │         (should_drain)        │                        │
+  │                          │──────────────────────────────►│                        │
 ```
 
 **ClientService** (implemented):
@@ -187,13 +198,16 @@ Client                          Coordinator                         Worker
 - `ReportTaskStatus` — client-streaming, worker streams task progress updates
 - `Heartbeat` — unary, periodic liveness check
 
-### How a request flows
+### How a job flows end-to-end
 
-1. Client sends a `SubmitJobRequest` over gRPC
-2. `UserClientHandler` receives the proto message
-3. `ProtoMapper.toDomain()` converts the proto request into domain objects (`Job`, `Task`)
-4. `JobManager.submit()` creates a `JobExecution` with `TaskExecution` entries and queues it
-5. `ProtoMapper.toProto()` converts the `JobExecution` back to a proto `Job` message for the response
+1. Client sends `SubmitJobRequest` → `UserRequestHandler` → `JobManager.submit()` → job QUEUED
+2. Worker calls `RegisterWorker` → `WorkerHandler` assigns a worker ID
+3. Worker calls `PullJob` → `WorkerHandler` → `JobManager.claimNextJob()` → job STARTING
+4. WorkerAgent spawns child JVM via `JobExecutor` (`java -cp ... Harness payload`)
+5. Job process runs `JobRunner`, which executes tasks and POSTs status to WorkerAgent via HTTP
+6. WorkerAgent forwards each status update to coordinator via gRPC `ReportTaskStatus` stream
+7. `WorkerHandler` calls `JobManager.updateTaskStatus()` — transitions job through RUNNING → COMPLETED
+8. Client calls `GetJobStatus` → `UserRequestHandler` → `JobManager.getJob()` → final state
 
 ### Protobuf messages
 

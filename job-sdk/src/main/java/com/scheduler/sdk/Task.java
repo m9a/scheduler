@@ -7,7 +7,10 @@ package com.scheduler.sdk;
  * <pre>
  * public class ExtractTask implements Task {
  *     public String name() { return "extract"; }
- *     public void execute() { ... }
+ *     public void execute(TaskContext ctx) {
+ *         ctx.progress(0.5, "halfway");
+ *         // ... do work ...
+ *     }
  * }
  * </pre>
  */
@@ -15,5 +18,5 @@ public interface Task {
 
     String name();
 
-    void execute() throws Exception;
+    void execute(TaskContext ctx) throws Exception;
 }

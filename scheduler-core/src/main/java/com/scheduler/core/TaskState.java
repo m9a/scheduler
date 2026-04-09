@@ -3,24 +3,27 @@ package com.scheduler.core;
 import java.time.Instant;
 import java.util.Objects;
 
-public class TaskExecution {
+public class TaskState {
 
     private final String id;
     private final int taskIndex;
+    private final String taskName;
     private TaskStatus status;
     private Instant startedAt;
     private Instant completedAt;
     private String errorMessage;
     private Integer exitCode;
 
-    public TaskExecution(String id, int taskIndex) {
+    public TaskState(String id, int taskIndex, String taskName) {
         this.id = Objects.requireNonNull(id, "Task ID must not be null");
         this.taskIndex = taskIndex;
+        this.taskName = Objects.requireNonNull(taskName, "Task name must not be null");
         this.status = TaskStatus.PENDING;
     }
 
     public String id() { return id; }
     public int taskIndex() { return taskIndex; }
+    public String taskName() { return taskName; }
     public TaskStatus status() { return status; }
     public Instant startedAt() { return startedAt; }
     public Instant completedAt() { return completedAt; }

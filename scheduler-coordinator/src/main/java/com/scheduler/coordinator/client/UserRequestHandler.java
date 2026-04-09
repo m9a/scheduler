@@ -2,9 +2,9 @@ package com.scheduler.coordinator.client;
 
 import com.scheduler.coordinator.ProtoMapper;
 
-import com.scheduler.core.JobExecution;
+import com.scheduler.core.JobState;
 import com.scheduler.core.exception.JobNotFoundException;
-import com.scheduler.core.api.JobManager;
+import com.scheduler.coordinator.JobManagerImpl;
 import com.scheduler.proto.v1.*;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -15,26 +15,26 @@ import org.slf4j.LoggerFactory;
  * Handles gRPC RPCs from external clients (CLI, UI, etc.).
  *
  * <pre>
- * Client ──gRPC──► UserClientHandler ──► JobManager
- *                  (SubmitJob)        (submit, getJob)
+ * Client ──gRPC──► UserRequestHandler ──► JobManagerImpl
+ *                  (SubmitJob)           (submit, getJob)
  *                  (GetJobStatus)
  * </pre>
  */
-public class UserClientHandler extends ClientServiceGrpc.ClientServiceImplBase {
+public class UserRequestHandler extends ClientServiceGrpc.ClientServiceImplBase {
 
-    private static final Logger log = LoggerFactory.getLogger(UserClientHandler.class);
+    private static final Logger log = LoggerFactory.getLogger(UserRequestHandler.class);
 
-    private final JobManager jobManager;
+    private final JobManagerImpl jobManager;
 
-    public UserClientHandler(JobManager jobManager) {
+    public UserRequestHandler(JobManagerImpl jobManager) {
         this.jobManager = jobManager;
     }
 
     @Override
     public void submitJob(SubmitJobRequest request, StreamObserver<SubmitJobResponse> responseObserver) {
-        log.info("Received submitJob name={}, jarPath={}, tasks={}", request.getName(), request.getJarPath(), request.getTasksCount());
+        log.info("Received submitJob name={}, jarPath={}", request.getName(), request.getJarPath());
         try {
-            JobExecution execution = jobManager.submit(ProtoMapper.toDomain(request));
+            JobState execution = jobManager.submit(ProtoMapper.toDomain(request));
             log.info("Job submitted: jobId={}, name={}", execution.id(), execution.job().name());
             responseObserver.onNext(SubmitJobResponse.newBuilder()
                     .setJob(ProtoMapper.toProto(execution))
@@ -52,7 +52,7 @@ public class UserClientHandler extends ClientServiceGrpc.ClientServiceImplBase {
     public void getJobStatus(GetJobStatusRequest request, StreamObserver<GetJobStatusResponse> responseObserver) {
         log.info("Received getJobStatus jobId={}", request.getJobId());
         try {
-            JobExecution execution = jobManager.getJob(request.getJobId());
+            JobState execution = jobManager.getJob(request.getJobId());
             responseObserver.onNext(GetJobStatusResponse.newBuilder()
                     .setJob(ProtoMapper.toProto(execution))
                     .build());

@@ -1,6 +1,6 @@
 package com.scheduler.worker;
 
-import com.scheduler.proto.v1.ReportTaskStatusRequest;
+import com.scheduler.proto.coordinator.ReportTaskStatusRequest;
 import com.scheduler.proto.v1.TaskStatus;
 import com.scheduler.sdk.TaskStatusUpdate;
 import io.grpc.stub.StreamObserver;
@@ -14,11 +14,11 @@ import java.util.concurrent.TimeUnit;
  * Streams task status updates from the worker to the coordinator over gRPC.
  * Created by {@link WorkerAgent#openTaskStatusStream()}.
  *
- * <p>WorkerAgent receives {@link TaskStatusUpdate} from JobRunner (via HTTP),
+ * <p>WorkerAgent receives {@link TaskStatusUpdate} from JobProcess (via HTTP),
  * then passes them here to be converted to proto and streamed to the coordinator.
  *
  * <pre>
- * JobRunner ──HTTP──► WorkerAgent ──► TaskStatusReporter ──gRPC stream──► Coordinator
+ * JobProcess ──HTTP──► WorkerAgent ──► TaskStatusReporter ──gRPC stream──► Coordinator
  * (job process)       (receives update)  (converts to proto)               (WorkerHandler)
  * </pre>
  */
@@ -40,6 +40,7 @@ public class TaskStatusReporter {
         ReportTaskStatusRequest.Builder builder = ReportTaskStatusRequest.newBuilder()
                 .setJobId(update.jobId())
                 .setTaskIndex(update.taskIndex())
+                .setTaskName(update.taskName())
                 .setStatus(toProto(update.status()));
         if (update.errorMessage() != null) {
             builder.setErrorMessage(update.errorMessage());
