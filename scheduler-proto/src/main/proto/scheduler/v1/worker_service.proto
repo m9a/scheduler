@@ -6,6 +6,7 @@ option java_multiple_files = true;
 option java_package = "com.scheduler.proto.coordinator";
 
 import "scheduler/v1/common.proto";
+import "scheduler/v1/job_message.proto";
 
 message RegisterWorkerRequest {
   string hostname = 1;
@@ -24,15 +25,7 @@ message PullJobResponse {
   scheduler.v1.Job job = 1; // empty if no job available
 }
 
-message ReportTaskStatusRequest {
-  string job_id = 1;
-  int32 task_index = 2;
-  scheduler.v1.TaskStatus status = 3;
-  string error_message = 4;
-  string task_name = 5;
-}
-
-message ReportTaskStatusResponse {
+message StatusUpdateResponse {
 }
 
 message HeartbeatRequest {
@@ -44,11 +37,11 @@ message HeartbeatResponse {
 }
 
 // WorkerService is the coordinator-side gRPC service that workers connect to.
-// Workers call these RPCs to register themselves, pull jobs for execution,
-// stream task status updates back, and send heartbeats.
+// Workers call these RPCs to register, pull jobs, stream status updates
+// (both job-level and task-level), and send heartbeats.
 service WorkerService {
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc PullJob(PullJobRequest) returns (PullJobResponse);
-  rpc ReportTaskStatus(stream ReportTaskStatusRequest) returns (ReportTaskStatusResponse);
+  rpc ReportStatus(stream scheduler.v1.StatusUpdate) returns (StatusUpdateResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }

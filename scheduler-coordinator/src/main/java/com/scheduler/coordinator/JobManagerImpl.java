@@ -7,38 +7,49 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
- * Manages job lifecycle state in memory.
- * Tasks are created lazily as status updates arrive from the worker.
+ * Passive state store for job lifecycle. The worker owns the full job lifecycle
+ * (start, monitor, kill, report) — this class applies whatever the worker sends.
  *
  * <pre>
  * UserRequestHandler ──► submit(), getJob()
- * WorkerHandler ──► claimNextJob(), updateTaskStatus(), finalizeJob()
+ * WorkerHandler      ──► claimNextJob(), handleStatusUpdate(), failJobsForWorker()
  * </pre>
  */
 public class JobManagerImpl {
 
     private static final Logger log = LoggerFactory.getLogger(JobManagerImpl.class);
 
+    // All submitted jobs by ID. Written by submit(), claimNextJob() (status → STARTING),
+    // handleStatusUpdate() (status changes), and failJobsForWorker() (status → FAILED).
     private final ConcurrentHashMap<String, JobState> jobs = new ConcurrentHashMap<>();
+
+    // FIFO of job IDs waiting to be claimed. submit() enqueues, claimNextJob() dequeues.
+    // Once polled, a job never re-enters the queue.
     private final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
 
+    // Maps jobId → workerId for all in-flight (non-terminal) jobs.
+    // claimNextJob() inserts, handleStatusUpdate() and failJobsForWorker() remove
+    // when the job reaches a terminal state. Used by the heartbeat monitor to find
+    // which jobs to fail when a worker dies.
+    private final ConcurrentHashMap<String, String> jobWorker = new ConcurrentHashMap<>();
 
-    public JobState submit(Job job) {
+
+    public JobState submit(String jobId, Job job) {
         JobState execution = new JobState(
-                UUID.randomUUID().toString(),
+                jobId,
                 job,
                 JobStatus.QUEUED,
-                new ArrayList<>(),
+                new LinkedHashMap<>(),
                 Instant.now(),
-                null, null, null
+                null, null, null, null
         );
 
         jobs.put(execution.id(), execution);
@@ -71,64 +82,109 @@ public class JobManagerImpl {
                     "Job %s in queue but has status %s".formatted(jobId, job.status()));
         }
 
-        JobState claimed = job.withStatus(JobStatus.STARTING);
+        JobState claimed = job.claim();
         jobs.put(jobId, claimed);
+        jobWorker.put(jobId, workerId);
         return Optional.of(claimed);
     }
 
 
-    public synchronized void updateTaskStatus(String jobId, int taskIndex, String taskName,
-                                              TaskStatus status, String errorMessage) {
+    /**
+     * Applies a status update from the worker. A single update can carry a job-level
+     * change, a task-level change, or both:
+     *
+     * <ul>
+     *   <li><b>Job-level only</b> (jobStatus set, taskStatus null) — transitions the job
+     *       via named methods (e.g. start(), complete(), fail()).</li>
+     *   <li><b>Task-level only</b> (jobStatus null, taskStatus set) — creates the task
+     *       entry if first seen, then applies the task status via named methods.</li>
+     *   <li><b>Both</b> — applies the job transition first, then the task update.</li>
+     * </ul>
+     *
+     * <p>Updates for jobs already in a terminal state are silently dropped — this
+     * handles late-arriving messages from workers after the heartbeat monitor has
+     * already failed the job.
+     */
+    public synchronized void handleStatusUpdate(String jobId,
+                                                 JobStatus jobStatus,
+                                                 FailureReason failureReason, String failureDetail,
+                                                 int taskIndex, String taskName,
+                                                 TaskStatus taskStatus, String errorMessage) {
         JobState job = getJob(jobId);
-        List<TaskState> taskStates = job.taskStates();
 
-        // Lazily create TaskState entries as they arrive
-        while (taskIndex >= taskStates.size()) {
-            int nextIndex = taskStates.size();
-            taskStates.add(new TaskState(UUID.randomUUID().toString(), nextIndex, taskName));
+        if (job.status().isTerminal()) {
+            log.warn("Ignoring status update for terminal job: jobId={}, jobStatus={}, taskIndex={}, taskStatus={}",
+                    jobId, jobStatus, taskIndex, taskStatus);
+            return;
         }
 
-        TaskState task = taskStates.get(taskIndex);
-        task.setStatus(status);
+        if (jobStatus != null && job.status() != jobStatus) {
+            job = applyJobStatus(jobId, job, jobStatus, failureReason, failureDetail);
+        }
 
-        if (status == TaskStatus.RUNNING) {
-            task.setStartedAt(Instant.now());
-            if (job.status() == JobStatus.STARTING) {
-                JobState running = job.withStatus(JobStatus.RUNNING).withStartedAt(Instant.now());
-                jobs.put(jobId, running);
-                log.info("Job {} is now RUNNING", jobId);
-            }
-        } else if (status == TaskStatus.COMPLETED) {
-            task.setCompletedAt(Instant.now());
-        } else if (status == TaskStatus.FAILED) {
-            task.setCompletedAt(Instant.now());
-            task.setErrorMessage(errorMessage);
-            JobState failed = job.withStatus(JobStatus.FAILED).withCompletedAt(Instant.now())
-                    .withErrorMessage(errorMessage);
-            jobs.put(jobId, failed);
-            log.info("Job {} FAILED at task {}: {}", jobId, taskIndex, errorMessage);
+        if (taskStatus != null) {
+            applyTaskStatus(job, taskIndex, taskName, taskStatus, errorMessage);
+        }
+    }
+
+    private JobState applyJobStatus(String jobId, JobState job, JobStatus jobStatus,
+                                     FailureReason failureReason, String failureDetail) {
+        JobState updated = switch (jobStatus) {
+            case RUNNING -> job.start();
+            case COMPLETED -> job.complete();
+            case FAILED -> job.fail(failureReason, failureDetail);
+            case KILLED -> job.kill(failureReason, failureDetail);
+            case CANCELLED -> job.cancel();
+            default -> throw new IllegalArgumentException("Unexpected job status update: " + jobStatus);
+        };
+        if (jobStatus.isTerminal()) {
+            jobWorker.remove(jobId);
+        }
+        jobs.put(jobId, updated);
+        String reasonMessage = failureReason != null ? ": " + failureReason.toMessage(failureDetail) : "";
+        log.info("Job {} is now {}{}", jobId, jobStatus, reasonMessage);
+        return updated;
+    }
+
+    private void applyTaskStatus(JobState job, int taskIndex, String taskName,
+                                  TaskStatus taskStatus, String errorMessage) {
+        TaskState task = job.taskStates().computeIfAbsent(taskIndex,
+                idx -> new TaskState(UUID.randomUUID().toString(), idx, "task-" + idx));
+        switch (taskStatus) {
+            case RUNNING -> task.start(taskName);
+            case COMPLETED -> task.complete(taskName);
+            case FAILED -> task.fail(taskName, errorMessage);
+            case SKIPPED -> task.skip(taskName);
+            default -> throw new IllegalArgumentException("Unexpected task status update: " + taskStatus);
         }
     }
 
 
-    public synchronized void finalizeJob(String jobId) {
-        JobState execution = getJob(jobId);
-
-        if (execution.status().isTerminal()) {
-            return;
-        }
-
-        boolean allCompleted = !execution.taskStates().isEmpty()
-                && execution.taskStates().stream().allMatch(t -> t.status() == TaskStatus.COMPLETED);
-        if (allCompleted) {
-            JobState completed = execution.withStatus(JobStatus.COMPLETED).withCompletedAt(Instant.now());
-            jobs.put(jobId, completed);
-            log.info("Job {} COMPLETED", jobId);
-        } else {
-            JobState failed = execution.withStatus(JobStatus.FAILED).withCompletedAt(Instant.now())
-                    .withErrorMessage("Process terminated before all tasks completed");
+    /**
+     * Fails all non-terminal jobs assigned to the given worker.
+     * Called by the heartbeat monitor when a worker stops sending heartbeats.
+     * Synchronized on the same lock as handleStatusUpdate so a late status
+     * update and a heartbeat-triggered failure can't race.
+     */
+    public synchronized int failJobsForWorker(String workerId, FailureReason reason) {
+        int count = 0;
+        for (Map.Entry<String, String> entry : jobWorker.entrySet()) {
+            if (!entry.getValue().equals(workerId)) {
+                continue;
+            }
+            String jobId = entry.getKey();
+            JobState job = jobs.get(jobId);
+            if (job == null || job.status().isTerminal()) {
+                jobWorker.remove(jobId);
+                continue;
+            }
+            JobState failed = job.fail(reason, null);
             jobs.put(jobId, failed);
-            log.info("Job {} FAILED: process terminated before all tasks completed", jobId);
+            jobWorker.remove(jobId);
+            log.info("Failed job due to dead worker: jobId={}, workerId={}, reason={}",
+                    jobId, workerId, reason.message());
+            count++;
         }
+        return count;
     }
 }

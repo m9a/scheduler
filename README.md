@@ -1,251 +1,189 @@
 # Distributed Job Scheduler
 
-A distributed job management system. A job is a single JAR containing sequential task stages. A coordinator accepts jobs, workers pull and execute them, and report status back via gRPC.
+A distributed job scheduler where each job is a Docker container running sequential task stages. A coordinator accepts jobs from clients, workers pull and execute them in containers, and report status back via gRPC.
 
 ## Domain Model
 
-### Job and Task
+A **Job** is an immutable definition: a Docker image (`artifactUri`), key-value params, a priority, and optional input files.
 
-A **Job** is a unit of work defined by a JAR path and an ordered list of tasks:
-- `Job(name, jarPath, mainClass, tasks, priority)` — immutable definition
-- `Task(name)` — a named stage within a job
+```
+Job(name, artifactUri, params, priority, inputFiles)
+```
 
-All tasks in a job share the same JAR and main class. The JAR implements a framework (scheduler-sdk) that defines the tasks as sequential stages. Tasks are not independent programs — they are stages that run within a single JVM process, where earlier stages may produce data consumed by later stages.
+Runtime state is tracked separately:
 
-### Execution state
+- `JobState(id, job, status, taskStates, timestamps, reason)` — mutable runtime state of a submitted job
+- `TaskState(id, taskIndex, taskName, status, timestamps, errorMessage, exitCode)` — mutable runtime state of a task within a job
+- `InputFile(name, uri)` — an input file resolved to an object store URI
 
-- `JobExecution(id, job, status, taskExecutions, timestamps, errorMessage)` — runtime state of a submitted job
-- `TaskExecution(id, taskIndex, status, timestamps, errorMessage, exitCode)` — runtime state of a task within a job
+The job does not declare its tasks upfront. Tasks are created lazily by the coordinator when the SDK first reports each task's status at runtime.
 
-### Job lifecycle
+## Job Lifecycle
+
+### JobStatus
 
 ```
 QUEUED → STARTING → RUNNING → COMPLETED
                   ↘         ↘
                  FAILED    FAILED
                   ↘         ↘
-                CANCELLED  CANCELLED
+                KILLED    KILLED
+                  ↘         ↘
+               CANCELLED  CANCELLED
 ```
 
-- **QUEUED** — submitted, waiting in the queue
-- **STARTING** — claimed by a worker, not yet executing
-- **RUNNING** — worker is actively executing tasks
-- **COMPLETED** — all tasks finished successfully
-- **FAILED** — a task failed, remaining tasks skipped
-- **CANCELLED** — cancelled by client
+| Status | Description |
+|--------|-------------|
+| QUEUED | Submitted, waiting in the priority queue |
+| STARTING | Claimed by a worker, container not yet running |
+| RUNNING | At least one task has started executing |
+| COMPLETED | All tasks finished successfully |
+| FAILED | A task failed or the container exited non-zero |
+| KILLED | Job process timed out, destroyed forcibly |
+| CANCELLED | Cancelled by client |
+
+### TaskStatus
+
+```
+PENDING → RUNNING → COMPLETED
+                  ↘
+                 FAILED
+
+PENDING → SKIPPED  (remaining tasks after a failure)
+```
+
+| Status | Description |
+|--------|-------------|
+| PENDING | Not yet started |
+| RUNNING | Currently executing |
+| COMPLETED | Finished successfully |
+| FAILED | Threw an exception or errored out |
+| SKIPPED | Skipped because a prior task failed |
 
 ## Module Structure
 
-```
-scheduler/
-├── scheduler-core/          (domain records, JobManager interface, exceptions)
-├── scheduler-proto/         (protobuf/gRPC definitions + generated code)
-├── job-sdk/                 (Task interface, JobRunner — framework for job JARs)
-├── scheduler-coordinator/   (gRPC server, job state management, wiring)
-│   ├── client/              (UserRequestHandler — handles user/client RPCs)
-│   └── worker/              (WorkerHandler — handles worker RPCs)
-└── scheduler-worker/        (gRPC client, job execution, process management)
-```
+| Module | Purpose |
+|--------|---------|
+| `scheduler-core` | Domain records (`Job`, `JobState`, `TaskState`, `InputFile`, `ObjectStore`), enums, exceptions. Zero infrastructure dependencies. |
+| `scheduler-proto` | Protobuf/gRPC definitions + generated code. Proto files in `src/main/proto/scheduler/v1/`. |
+| `scheduler-coordinator` | gRPC server, `JobManagerImpl`, `ProtoMapper`, wiring. Sub-packages: `client/` (UserRequestHandler), `worker/` (WorkerHandler). |
+| `scheduler-worker` | WorkerAgent main loop, Docker process spawning, status forwarding, file staging. |
+
+The **scheduler-sdk** lives in a [separate repository](../scheduler-sdk). It provides the `Task` interface and `JobProcess` runtime for both Java and Python job containers.
 
 ## Architecture
 
 ```
-┌──────────┐       gRPC        ┌─────────────────┐       gRPC        ┌──────────────┐      child JVM     ┌─────────────┐
-│  Client  │ ────────────────► │   Coordinator   │ ◄──────────────── │  WorkerAgent │ ──────────────────► │ Job Process │
-└──────────┘  ClientService    └─────────────────┘   WorkerService   └──────────────┘                    └─────────────┘
+┌──────────┐       gRPC        ┌─────────────────┐       gRPC        ┌──────────────┐     docker run     ┌─────────────────┐
+│  Client  │ ────────────────► │   Coordinator   │ ◄──────────────── │  WorkerAgent │ ──────────────────► │ Docker container │
+└──────────┘  ClientService    └─────────────────┘   WorkerService   └──────────────┘                    └─────────────────┘
               (submit, query)   (job queue + state)  (pull, report)     │          ▲                        │
-                                                                       │          │  HTTP POST /task-status │
-                                                                       │          └────────────────────────┘
-                                                                       │           (JobRunner reports status)
-                                                                       └── JobExecutor spawns java -cp ... Harness
+                                       │                               │          │  WebSocket (binary proto) │
+                                       │                               │          └────────────────────────┘
+                                    MinIO                              │           (SDK reports task status)
+                                 (object store)                        │
+                                                                       └── WorkerAgent spawns: docker run --rm <image>
 ```
 
 - **Client → Coordinator**: Clients submit jobs and query status via `ClientService` gRPC.
-- **Worker → Coordinator**: Workers register, pull jobs, and stream task status via `WorkerService` gRPC.
-- **Worker → Job Process**: WorkerAgent spawns a child JVM via JobExecutor. The job process runs JobRunner, which POSTs task status back to WorkerAgent over HTTP. WorkerAgent forwards these to the coordinator via gRPC.
+- **Worker → Coordinator**: Workers register, pull jobs, and stream status via `WorkerService` gRPC.
+- **Worker → Docker container**: WorkerAgent runs `docker run` with volume mounts for input/output. The container runs the SDK, which sends binary proto status updates to WorkerAgent over WebSocket. WorkerAgent forwards these to the coordinator via gRPC.
 
-### Worker architecture
+## How a Job Runs
 
-There are two JVM processes involved in running a job:
-
-| Term | Where it runs | What it does |
-|------|---------------|--------------|
-| **JobExecutor** | Worker JVM (`scheduler-worker`) | Spawns the job process and waits for it to exit. Manages the OS process lifecycle only — does not communicate with the job process directly. |
-| **JobRunner** | Job process (`job-sdk`) | Runs inside the spawned child JVM. Executes tasks sequentially and POSTs status updates back to WorkerAgent via HTTP. |
-| **"job process"** | Child JVM | The child JVM that JobExecutor spawns (`java -jar`). JobRunner runs inside it. |
-
-```
-Worker JVM
-├── WorkerAgent                receives status from JobRunner (via HTTP),
-│                              forwards to coordinator (via gRPC)
-├── TaskStatusReporter         converts SDK updates to proto and streams via gRPC
-└── JobExecutor                spawns the job process (child JVM), reads its stdout
-```
-
-```
-Worker JVM                                    Job process (child JVM)
-─────────────────────────────────             ─────────────────────────────────
-                                              main() {
-JobExecutor                                     JobRunner.run(List.of(
-  └─ spawns: java                                   new ExtractTask(),
-       -Dscheduler.callback.url=...                 new TransformTask(),
-       -Dscheduler.job.id=...                       new LoadTask()
-       -jar job.jar  ──────────────────────►    ));
-                                              }
-
-                                              JobRunner runs each task:
-                                                1. POST /task-status {RUNNING}
-WorkerAgent ◄──────── HTTP POST ───────────    2. task.execute()
-  │                                             3. POST /task-status {COMPLETED}
-  │  receives TaskStatusUpdate                     ... next task ...
-  │
-  ▼
-TaskStatusReporter
-  │
-  │  converts to ReportTaskStatusRequest
-  │  and streams via gRPC
-  ▼
-Coordinator (WorkerHandler)
-  │
-  │  calls JobManager.updateTaskStatus()
-  │  transitions job/task state
-  ▼
-JobManagerImpl
-  └─ task RUNNING   → job STARTING→RUNNING
-  └─ task COMPLETED → (if all done) job→COMPLETED
-  └─ task FAILED    → skip remaining, job→FAILED
-```
-
-JobExecutor passes two system properties when spawning the job process:
-- `scheduler.callback.url` — WorkerAgent's task status HTTP server URL
-- `scheduler.job.id` — the job execution ID
-
-The job process never talks to the coordinator directly. All status reporting goes through WorkerAgent.
-
-### Message exchange
-
-```
-Client                    Coordinator                     WorkerAgent              Job Process
-  │                          │                               │                        │
-  │  SubmitJobRequest        │                               │                        │
-  │  (name, jarPath, tasks,  │                               │                        │
-  │   mainClass, priority)   │                               │                        │
-  │ ────────────────────────►│                               │                        │
-  │                          │  stores JobExecution(QUEUED)   │                        │
-  │  SubmitJobResponse       │                               │                        │
-  │  (Job with id, status)   │                               │                        │
-  │ ◄────────────────────────┤                               │                        │
-  │                          │                               │                        │
-  │                          │     RegisterWorkerRequest     │                        │
-  │                          │     (hostname, capacity)      │                        │
-  │                          │◄──────────────────────────────┤                        │
-  │                          │     RegisterWorkerResponse    │                        │
-  │                          │     (worker_id)               │                        │
-  │                          │──────────────────────────────►│                        │
-  │                          │                               │                        │
-  │                          │         PullJobRequest        │                        │
-  │                          │         (worker_id)           │                        │
-  │                          │◄──────────────────────────────┤                        │
-  │                          │  claims job → STARTING        │                        │
-  │                          │         PullJobResponse       │                        │
-  │                          │         (Job or empty)        │                        │
-  │                          │──────────────────────────────►│                        │
-  │                          │                               │                        │
-  │                          │                               │ spawn child JVM ──────►│
-  │                          │                               │   java -cp ... Harness │
-  │                          │                               │                        │
-  │                          │                               │  HTTP POST /task-status│
-  │                          │                               │◄───────────────────────┤
-  │                          │                               │  {RUNNING, taskIndex}  │
-  │                          │  gRPC ReportTaskStatus        │                        │
-  │                          │  (job_id, task_index, RUNNING)│                        │
-  │                          │◄──────────────────────────────┤                        │
-  │                          │  job STARTING → RUNNING       │                        │
-  │                          │                               │                        │
-  │                          │                               │  HTTP POST /task-status│
-  │                          │                               │◄───────────────────────┤
-  │                          │                               │  {COMPLETED, taskIndex}│
-  │                          │  gRPC ReportTaskStatus        │                        │
-  │                          │  (job_id, task_index,         │                        │
-  │                          │   COMPLETED)                  │                        │
-  │                          │◄──────────────────────────────┤                        │
-  │                          │         ... next task ...     │◄──────────────────────►│
-  │                          │◄──────────────────────────────┤                        │
-  │                          │  all tasks done → COMPLETED   │                        │
-  │                          │                               │                        │
-  │  GetJobStatusRequest     │                               │                        │
-  │  (job_id)                │                               │                        │
-  │ ────────────────────────►│                               │                        │
-  │  GetJobStatusResponse    │                               │                        │
-  │  (Job with COMPLETED)    │                               │                        │
-  │ ◄────────────────────────┤                               │                        │
-  │                          │                               │                        │
-  │                          │         Heartbeat             │                        │
-  │                          │         (worker_id)           │                        │
-  │                          │◄──────────────────────────────┤                        │
-  │                          │         HeartbeatResponse     │                        │
-  │                          │         (should_drain)        │                        │
-  │                          │──────────────────────────────►│                        │
-```
-
-**ClientService** (implemented):
-- `SubmitJob` — unary RPC, client sends job definition with jar path and task list
-- `GetJobStatus` — unary RPC, client queries by job id
-
-**WorkerService** (implemented: RegisterWorker, PullJob, ReportTaskStatus; not yet: Heartbeat):
-- `RegisterWorker` — unary, worker announces itself
-- `PullJob` — unary, worker requests next available job
-- `ReportTaskStatus` — client-streaming, worker streams task progress updates
-- `Heartbeat` — unary, periodic liveness check
-
-### How a job flows end-to-end
-
-1. Client sends `SubmitJobRequest` → `UserRequestHandler` → `JobManager.submit()` → job QUEUED
+1. Client sends `SubmitJobRequest` → `UserRequestHandler` → resolves input files (inline content uploaded to MinIO, URIs validated) → `JobManager.submit()` → job QUEUED
 2. Worker calls `RegisterWorker` → `WorkerHandler` assigns a worker ID
 3. Worker calls `PullJob` → `WorkerHandler` → `JobManager.claimNextJob()` → job STARTING
-4. WorkerAgent spawns child JVM via `JobExecutor` (`java -cp ... Harness payload`)
-5. Job process runs `JobRunner`, which executes tasks and POSTs status to WorkerAgent via HTTP
-6. WorkerAgent forwards each status update to coordinator via gRPC `ReportTaskStatus` stream
-7. `WorkerHandler` calls `JobManager.updateTaskStatus()` — transitions job through RUNNING → COMPLETED
-8. Client calls `GetJobStatus` → `UserRequestHandler` → `JobManager.getJob()` → final state
+4. WorkerAgent stages input files from MinIO to `/tmp/jobs/<jobId>/input/`
+5. WorkerAgent opens a gRPC status stream to the coordinator
+6. WorkerAgent spawns: `docker run --rm -v input:/workspace/input:ro -v output:/workspace/output -e EXECUTION_PAYLOAD=<base64> <artifactUri>`
+7. Inside the container, the SDK (`JobProcess.run()`) executes tasks sequentially, sending binary proto `StatusUpdate` messages to WorkerAgent's WebSocket server for each task (RUNNING → COMPLETED/FAILED)
+8. WorkerAgent forwards each status update to the coordinator via the gRPC stream. On the first RUNNING task, it also sends a job-level RUNNING update.
+9. When the container exits, WorkerAgent interprets the exit code (see Failure Handling) and sends a terminal job status
+10. WorkerAgent uploads output files from `/tmp/jobs/<jobId>/output/` and `stdout.log` to MinIO
+11. WorkerAgent cleans up temp directories, closes the gRPC stream, and loops back to step 3
 
-### Protobuf messages
+## Failure Handling
 
-Proto definitions live in `scheduler-proto/src/main/proto/scheduler/v1/`.
+### Exit codes
 
-| File | Purpose |
-|------|---------|
-| `common.proto` | Shared types: `Job`, `Task`, `JobStatus`, `TaskStatus` |
-| `client_service.proto` | `ClientService` RPCs and messages (`SubmitJobRequest`, `GetJobStatusRequest`, `TaskDefinition`) |
-| `worker_service.proto` | `WorkerService` RPCs and messages (`RegisterWorkerRequest`, `PullJobRequest`, `ReportTaskStatusRequest`, `HeartbeatRequest`) |
+| Exit code | Interpretation |
+|-----------|---------------|
+| 0 | Job COMPLETED — all tasks succeeded |
+| -1 | Job KILLED — process timed out (configurable, default 10 min), destroyed with `destroyForcibly()` |
+| Any other | Job FAILED — "Job process exited with code N" |
 
-`TaskDefinition` is the input message for defining tasks when submitting a job (just a name). `Task` in `common.proto` is the full representation returned in responses (includes id, sequence number, status).
+If `spawnJobProcess` throws `IOException` (container failed to start) or `InterruptedException`, the job is marked FAILED with the exception message.
 
-### Proto ↔ domain mapping
+### Task failure
 
-The domain model (`scheduler-core`) has no dependency on protobuf. `ProtoMapper` in `scheduler-coordinator` translates between the two:
+When a task throws an exception, the SDK marks it FAILED and returns immediately — remaining tasks are never started. The container exits, WorkerAgent sees the non-zero exit code and marks the job FAILED.
 
-| Direction | From | To |
-|-----------|------|----|
-| Inbound | `SubmitJobRequest` (proto) | `Job` (domain) |
-| Outbound | `JobExecution` (domain) | `Job` (proto) |
-| Outbound | `JobStatus` (domain enum) | `JobStatus` (proto enum) |
-| Outbound | `TaskStatus` (domain enum) | `TaskStatus` (proto enum) |
-| Inbound | `TaskStatus` (proto enum) | `TaskStatus` (domain enum) |
+### Timeout
 
-### Regenerating proto code
+The timeout is configurable via the `WorkerAgent` constructor (`jobExecutionTimeout`, default `Duration.ofMinutes(10)`). When the timeout expires, `process.waitFor()` returns false and the process is killed with `destroyForcibly()`.
 
-When you modify `.proto` files, regenerate the Java classes:
+### Worker crash
 
-```bash
-mvn compile -pl scheduler-proto
+WorkerAgent sends periodic heartbeats to the coordinator. If a worker stops sending heartbeats (crash, network partition), the coordinator's heartbeat monitor detects the dead worker and fails all its in-flight jobs with `HEARTBEAT_LOST`.
+
+### Coordinator idempotency
+
+The coordinator ignores status updates for jobs already in a terminal state (COMPLETED, FAILED, KILLED, CANCELLED). Duplicate RUNNING updates are also safe — `canTransitionTo` rejects same-state transitions.
+
+## Input/Output Files
+
+### Input files
+
+Clients attach input files to `SubmitJobRequest` in two ways:
+
+- **Inline content** (`bytes content`) — the coordinator uploads the bytes to MinIO under `jobs/<jobId>/input/<name>` and stores the resulting URI
+- **URI reference** (`string uri`) — the coordinator validates the URI exists in MinIO and passes it through
+
+By the time an `InputFile` reaches the domain layer, it always has a URI — inline content is a transport concern resolved at the RPC boundary.
+
+WorkerAgent downloads all input files to `/tmp/jobs/<jobId>/input/` and mounts that directory read-only into the container at `/workspace/input`.
+
+### Output files
+
+The container writes output to `/workspace/output` (mounted read-write). After the container exits, WorkerAgent uploads everything under that directory to MinIO at `jobs/<jobId>/output/`. The stdout log is uploaded to `jobs/<jobId>/logs/stdout.log`.
+
+Clients retrieve outputs via `ListJobFiles` and `GetJobOutput` (server-streaming for large files).
+
+### ObjectStore
+
+`ObjectStore` is a thin wrapper around `S3Client` for MinIO. Used by both coordinator (upload inline input files, serve output downloads) and worker (download inputs, upload outputs and logs).
+
+## SDK
+
+The SDK lives in the [scheduler-sdk](../scheduler-sdk) repository and supports both Java and Python.
+
+**Java**: Job authors implement `Task` and call `JobProcess.run()` from their container's main method:
+
+```java
+public class MyEtlJob {
+    public static void main(String[] args) {
+        JobProcess.run(List.of(
+            new ExtractTask(),
+            new TransformTask(),
+            new LoadTask()
+        ));
+    }
+}
 ```
 
-This runs the `protobuf-maven-plugin` which invokes `protoc` to generate Java message classes and gRPC service stubs into `scheduler-proto/target/generated-sources/protobuf/`. Your IDE should pick these up automatically — if not, mark `target/generated-sources/protobuf/java` and `target/generated-sources/protobuf/grpc-java` as Generated Sources Roots.
+Each `Task` receives a `TaskContext` with `progress(fraction, message)` and `metric(name, value)` for structured reporting. The SDK reads the `EXECUTION_PAYLOAD` environment variable (base64-encoded JSON with `workerAgentUrl`, `jobId`, `params`) set by WorkerAgent.
+
+**Python**: The `py-sdk` provides an equivalent `job_runner` module.
+
+## Blocking Execution
+
+WorkerAgent runs one job at a time — `executeJob` blocks on `process.waitFor()` until the container exits. To run multiple jobs concurrently, the main loop would need to submit `executeJob` calls to a thread pool and multiplex the task status HTTP handler by job ID.
 
 ## Build
 
 ```bash
-mvn compile    # compile all modules
-mvn test       # run tests
+mvn compile                      # compile all modules
+mvn test                         # run tests
+mvn compile -pl scheduler-proto  # regenerate proto code after .proto changes
 ```

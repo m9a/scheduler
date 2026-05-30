@@ -1,5 +1,7 @@
 package com.scheduler.coordinator;
 
+import com.scheduler.core.FailureReason;
+import com.scheduler.core.InputFile;
 import com.scheduler.core.Job;
 import com.scheduler.core.JobState;
 import com.scheduler.core.JobStatus;
@@ -7,16 +9,19 @@ import com.scheduler.core.TaskState;
 import com.scheduler.core.TaskStatus;
 import com.scheduler.proto.v1.SubmitJobRequest;
 
+import java.util.List;
+
 public final class ProtoMapper {
 
     private ProtoMapper() {}
 
-    public static Job toDomain(SubmitJobRequest request) {
+    public static Job toDomain(SubmitJobRequest request, List<InputFile> resolvedInputFiles) {
         return new Job(
                 request.getName(),
-                request.getJarPath(),
-                request.getMainClass().isEmpty() ? null : request.getMainClass(),
-                request.getPriority()
+                request.getArtifactUri(),
+                request.getParamsMap(),
+                request.getPriority(),
+                resolvedInputFiles
         );
     }
 
@@ -24,14 +29,15 @@ public final class ProtoMapper {
         com.scheduler.proto.v1.Job.Builder builder = com.scheduler.proto.v1.Job.newBuilder()
                 .setId(execution.id())
                 .setName(execution.job().name())
-                .setJarPath(execution.job().jarPath())
+                .setArtifactUri(execution.job().artifactUri())
+                .putAllParams(execution.job().params())
                 .setStatus(toProto(execution.status()))
-                .addAllTasks(execution.taskStates().stream().map(ProtoMapper::toProto).toList())
-                .setPriority(execution.job().priority());
-
-        if (execution.job().mainClass() != null) {
-            builder.setMainClass(execution.job().mainClass());
-        }
+                .addAllTasks(execution.taskStates().values().stream().map(ProtoMapper::toProto).toList())
+                .setPriority(execution.job().priority())
+                .addAllInputFiles(execution.job().inputFiles().stream()
+                        .map(f -> com.scheduler.proto.v1.InputFile.newBuilder()
+                                .setName(f.name()).setUri(f.uri()).build())
+                        .toList());
 
         if (execution.createdAt() != null) {
             builder.setCreatedAtMillis(execution.createdAt().toEpochMilli());
@@ -42,8 +48,10 @@ public final class ProtoMapper {
         if (execution.completedAt() != null) {
             builder.setCompletedAtMillis(execution.completedAt().toEpochMilli());
         }
-        if (execution.errorMessage() != null) {
-            builder.setErrorMessage(execution.errorMessage());
+        if (execution.failureReason() != null) {
+            builder.setFailureReason(toProto(execution.failureReason()));
+            builder.setFailureDetail(execution.failureDetail() != null ? execution.failureDetail() : "");
+            builder.setErrorMessage(execution.failureReason().toMessage(execution.failureDetail()));
         }
         return builder.build();
     }
@@ -64,7 +72,21 @@ public final class ProtoMapper {
             case RUNNING -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_RUNNING;
             case COMPLETED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_COMPLETED;
             case FAILED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_FAILED;
+            case KILLED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_KILLED;
             case CANCELLED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_CANCELLED;
+        };
+    }
+
+    public static JobStatus toDomain(com.scheduler.proto.v1.JobStatus status) {
+        return switch (status) {
+            case JOB_STATUS_QUEUED -> JobStatus.QUEUED;
+            case JOB_STATUS_STARTING -> JobStatus.STARTING;
+            case JOB_STATUS_RUNNING -> JobStatus.RUNNING;
+            case JOB_STATUS_COMPLETED -> JobStatus.COMPLETED;
+            case JOB_STATUS_FAILED -> JobStatus.FAILED;
+            case JOB_STATUS_KILLED -> JobStatus.KILLED;
+            case JOB_STATUS_CANCELLED -> JobStatus.CANCELLED;
+            default -> throw new IllegalArgumentException("Unknown job status: " + status);
         };
     }
 
@@ -86,6 +108,25 @@ public final class ProtoMapper {
             case TASK_STATUS_FAILED -> TaskStatus.FAILED;
             case TASK_STATUS_SKIPPED -> TaskStatus.SKIPPED;
             default -> throw new IllegalArgumentException("Unknown task status: " + status);
+        };
+    }
+
+    public static com.scheduler.proto.v1.FailureReason toProto(FailureReason reason) {
+        return switch (reason) {
+            case HEARTBEAT_LOST -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_HEARTBEAT_LOST;
+            case PROCESS_TIMEOUT -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_PROCESS_TIMEOUT;
+            case PROCESS_EXITED -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_PROCESS_EXITED;
+            case PROCESS_START_FAILED -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_PROCESS_START_FAILED;
+        };
+    }
+
+    public static FailureReason toDomain(com.scheduler.proto.v1.FailureReason reason) {
+        return switch (reason) {
+            case FAILURE_REASON_HEARTBEAT_LOST -> FailureReason.HEARTBEAT_LOST;
+            case FAILURE_REASON_PROCESS_TIMEOUT -> FailureReason.PROCESS_TIMEOUT;
+            case FAILURE_REASON_PROCESS_EXITED -> FailureReason.PROCESS_EXITED;
+            case FAILURE_REASON_PROCESS_START_FAILED -> FailureReason.PROCESS_START_FAILED;
+            default -> throw new IllegalArgumentException("Unknown failure reason: " + reason);
         };
     }
 }

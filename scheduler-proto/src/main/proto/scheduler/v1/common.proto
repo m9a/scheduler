@@ -13,6 +13,7 @@ enum JobStatus {
   JOB_STATUS_COMPLETED = 4;
   JOB_STATUS_FAILED = 5;
   JOB_STATUS_CANCELLED = 6;
+  JOB_STATUS_KILLED = 7;
 }
 
 enum TaskStatus {
@@ -22,6 +23,14 @@ enum TaskStatus {
   TASK_STATUS_COMPLETED = 3;
   TASK_STATUS_FAILED = 4;
   TASK_STATUS_SKIPPED = 5;
+}
+
+enum FailureReason {
+  FAILURE_REASON_UNSPECIFIED = 0;
+  FAILURE_REASON_HEARTBEAT_LOST = 1;
+  FAILURE_REASON_PROCESS_TIMEOUT = 2;
+  FAILURE_REASON_PROCESS_EXITED = 3;
+  FAILURE_REASON_PROCESS_START_FAILED = 4;
 }
 
 message Task {
@@ -34,8 +43,11 @@ message Task {
 message Job {
   string id = 1;
   string name = 2;
-  string jar_path = 3;
-  string main_class = 4;
+
+  // Docker image reference (e.g., registry.example.com/job:v1).
+  string artifact_uri = 3;
+
+  reserved 4;
   JobStatus status = 5;
   repeated Task tasks = 6;
   int32 priority = 7;
@@ -43,4 +55,26 @@ message Job {
   int64 started_at_millis = 9;
   int64 completed_at_millis = 10;
   string error_message = 11;
+  map<string, string> params = 12;
+  repeated InputFile input_files = 13;
+  FailureReason failure_reason = 14;
+  string failure_detail = 15;
+}
+
+message InputFile {
+  string name = 1;
+  oneof source {
+    string uri = 2;
+    bytes content = 3;
+  }
+}
+
+message OutputFile {
+  string name = 1;
+  int64 size_bytes = 2;
+}
+
+message FileHeader {
+  string name = 1;
+  int64 size_bytes = 2;
 }
