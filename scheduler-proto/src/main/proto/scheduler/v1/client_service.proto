@@ -9,9 +9,15 @@ import "scheduler/v1/common.proto";
 
 message SubmitJobRequest {
   string name = 1;
-  string jar_path = 2;
-  string main_class = 3;
+
+  // Docker image reference (e.g., registry.example.com/job:v1).
+  string artifact_uri = 2;
+
+  reserved 3;
+  map<string, string> params = 4;
   int32 priority = 5;
+  repeated InputFile input_files = 6;
+  reserved 7;
 }
 
 message SubmitJobResponse {
@@ -26,7 +32,29 @@ message GetJobStatusResponse {
   Job job = 1;
 }
 
+message ListJobFilesRequest {
+  string job_id = 1;
+}
+
+message ListJobFilesResponse {
+  repeated OutputFile files = 1;
+}
+
+message GetJobOutputRequest {
+  string job_id = 1;
+  string path = 2;
+}
+
+message GetJobOutputResponse {
+  oneof data {
+    FileHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
 service ClientService {
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
   rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  rpc ListJobFiles(ListJobFilesRequest) returns (ListJobFilesResponse);
+  rpc GetJobOutput(GetJobOutputRequest) returns (stream GetJobOutputResponse);
 }

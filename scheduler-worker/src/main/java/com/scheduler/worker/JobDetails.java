@@ -8,13 +8,12 @@ import java.util.Objects;
  */
 record JobDetails(
         String jobId,
-        String jarPath,
-        String mainClass,
+        String artifactUri,
         String payload
 ) {
 
     public JobDetails {
         Objects.requireNonNull(jobId);
-        Objects.requireNonNull(jarPath);
+        Objects.requireNonNull(artifactUri);
     }
 }

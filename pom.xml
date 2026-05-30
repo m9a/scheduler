@@ -12,10 +12,7 @@
     <modules>
         <module>scheduler-core</module>
         <module>scheduler-proto</module>
-        <module>job-sdk</module>
         <module>scheduler-coordinator</module>
-        <module>job-annotations</module>
-        <module>sample-job</module>
         <module>scheduler-worker</module>
     </modules>
 
@@ -31,6 +28,8 @@
         <junit.version>5.10.2</junit.version>
         <mockito.version>5.11.0</mockito.version>
         <tomcat-annotations.version>6.0.53</tomcat-annotations.version>
+        <jackson.version>2.17.0</jackson.version>
+        <aws.sdk.version>2.25.27</aws.sdk.version>
     </properties>
 
     <dependencyManagement>
@@ -48,17 +47,7 @@
             </dependency>
             <dependency>
                 <groupId>com.scheduler</groupId>
-                <artifactId>job-sdk</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.scheduler</groupId>
                 <artifactId>scheduler-coordinator</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.scheduler</groupId>
-                <artifactId>job-annotations</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
@@ -94,6 +83,20 @@
                 <groupId>ch.qos.logback</groupId>
                 <artifactId>logback-classic</artifactId>
                 <version>${logback.version}</version>
+            </dependency>
+
+            <!-- JSON -->
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+
+            <!-- S3 (MinIO-compatible) -->
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>s3</artifactId>
+                <version>${aws.sdk.version}</version>
             </dependency>
 
             <!-- Testing -->

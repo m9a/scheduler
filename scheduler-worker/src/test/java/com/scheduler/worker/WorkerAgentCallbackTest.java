@@ -1,10 +1,6 @@
 package com.scheduler.worker;
 
-import com.scheduler.sdk.JobProcess;
-import com.scheduler.sdk.Task;
-import com.scheduler.sdk.TaskContext;
-import com.scheduler.sdk.TaskStatus;
-import com.scheduler.sdk.TaskStatusUpdate;
+import com.scheduler.proto.v1.TaskStatus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -12,25 +8,27 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class WorkerAgentCallbackTest {
 
     private WorkerAgent agent;
-    private List<TaskStatusUpdate> receivedUpdates;
+    private List<StatusUpdate> receivedUpdates;
 
     @BeforeEach
     void setUp() throws IOException {
         receivedUpdates = Collections.synchronizedList(new ArrayList<>());
-        // coordinatorHost/port don't matter — we only test the HTTP callback, no gRPC RPCs
-        agent = new WorkerAgent("localhost", 1, "localhost", 1);
-        agent.onTaskStatus(receivedUpdates::add);
+        agent = new WorkerAgent("localhost", 1, "localhost", 1, null);
+        agent.onStatusUpdate(receivedUpdates::add);
     }
 
     @AfterEach
@@ -40,67 +38,60 @@ class WorkerAgentCallbackTest {
 
     @Test
     void receiveUpdate() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
-        TaskStatusUpdate update = new TaskStatusUpdate("job-1", 0, "extract", TaskStatus.RUNNING, null);
+        byte[] proto = com.scheduler.proto.job.StatusUpdate.newBuilder()
+                .setJobId("job-1")
+                .setTaskIndex(0)
+                .setTaskName("extract")
+                .setTaskStatus(TaskStatus.TASK_STATUS_RUNNING)
+                .build()
+                .toByteArray();
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(agent.workerAgentUrl() + "/task-status"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(update.toJson()))
-                .build();
-        HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
+        sendWebSocketBinary(agent.workerAgentUrl(), prefixed(WorkerAgent.TYPE_TAG_STATUS, proto));
 
-        assertEquals(200, response.statusCode());
         assertEquals(1, receivedUpdates.size());
         assertEquals("job-1", receivedUpdates.get(0).jobId());
         assertEquals("extract", receivedUpdates.get(0).taskName());
-        assertEquals(TaskStatus.RUNNING, receivedUpdates.get(0).status());
+        assertEquals("RUNNING", receivedUpdates.get(0).taskStatus());
     }
 
-    @Test
-    void receiveFromJobProcess() {
-        String callbackUrl = agent.workerAgentUrl();
-
-        JobProcess.run(List.of(
-                new SimpleTask("step-1"),
-                new SimpleTask("step-2")
-        ), "job-42", callbackUrl);
-
-        assertEquals(4, receivedUpdates.size());
-        assertEquals(TaskStatus.RUNNING, receivedUpdates.get(0).status());
-        assertEquals("step-1", receivedUpdates.get(0).taskName());
-        assertEquals(TaskStatus.COMPLETED, receivedUpdates.get(1).status());
-        assertTrue(receivedUpdates.get(1).durationMs() >= 0);
-        assertNotNull(receivedUpdates.get(1).output());
-        assertTrue(receivedUpdates.get(1).output().contains("Executing task!"));
-        assertEquals(TaskStatus.RUNNING, receivedUpdates.get(2).status());
-        assertEquals("step-2", receivedUpdates.get(2).taskName());
-        assertEquals(TaskStatus.COMPLETED, receivedUpdates.get(3).status());
-        assertTrue(receivedUpdates.stream().allMatch(u -> "job-42".equals(u.jobId())));
+    /** Prepends a one-byte type tag to a proto payload, matching the SDK wire format. */
+    private static byte[] prefixed(byte typeTag, byte[] proto) {
+        byte[] framed = new byte[proto.length + 1];
+        framed[0] = typeTag;
+        System.arraycopy(proto, 0, framed, 1, proto.length);
+        return framed;
     }
 
-    @Test
-    void rejectNonPost() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(agent.workerAgentUrl() + "/task-status"))
-                .GET()
-                .build();
-        HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
+    /**
+     * Opens a WebSocket connection, sends a single binary message, then closes.
+     * Blocks until the server has processed the message.
+     */
+    private static void sendWebSocketBinary(String wsUrl, byte[] data) throws Exception {
+        CountDownLatch opened = new CountDownLatch(1);
+        CountDownLatch closed = new CountDownLatch(1);
 
-        assertEquals(405, response.statusCode());
-        assertTrue(receivedUpdates.isEmpty());
-    }
+        WebSocket ws = HttpClient.newHttpClient().newWebSocketBuilder()
+                .buildAsync(URI.create(wsUrl), new WebSocket.Listener() {
+                    @Override
+                    public void onOpen(WebSocket webSocket) {
+                        opened.countDown();
+                        WebSocket.Listener.super.onOpen(webSocket);
+                    }
 
-    private record SimpleTask(String taskName) implements Task {
-        @Override
-        public String name() {
-            return taskName;
-        }
+                    @Override
+                    public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+                        closed.countDown();
+                        return null;
+                    }
+                }).join();
 
-        @Override
-        public void execute(TaskContext ctx) {
-            System.out.println("Executing task!");
-        }
+        assertTrue(opened.await(5, TimeUnit.SECONDS), "WebSocket should open within 5s");
+        ws.sendBinary(ByteBuffer.wrap(data), true).join();
+
+        // Brief pause to let the server process the message before closing
+        Thread.sleep(100);
+
+        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
+        assertTrue(closed.await(5, TimeUnit.SECONDS), "WebSocket should close within 5s");
     }
 }

@@ -7,7 +7,7 @@ public class TaskState {
 
     private final String id;
     private final int taskIndex;
-    private final String taskName;
+    private String taskName;
     private TaskStatus status;
     private Instant startedAt;
     private Instant completedAt;
@@ -30,7 +30,42 @@ public class TaskState {
     public String errorMessage() { return errorMessage; }
     public Integer exitCode() { return exitCode; }
 
-    public void setStatus(TaskStatus newStatus) {
+    public void start(String taskName) {
+        transition(TaskStatus.RUNNING);
+        if (taskName != null) {
+            this.taskName = taskName;
+        }
+        this.startedAt = Instant.now();
+    }
+
+    public void complete(String taskName) {
+        transition(TaskStatus.COMPLETED);
+        if (taskName != null) {
+            this.taskName = taskName;
+        }
+        this.completedAt = Instant.now();
+    }
+
+    public void fail(String taskName, String errorMessage) {
+        transition(TaskStatus.FAILED);
+        if (taskName != null) {
+            this.taskName = taskName;
+        }
+        this.completedAt = Instant.now();
+        if (errorMessage != null) {
+            this.errorMessage = errorMessage;
+        }
+    }
+
+    public void skip(String taskName) {
+        transition(TaskStatus.SKIPPED);
+        if (taskName != null) {
+            this.taskName = taskName;
+        }
+        this.completedAt = Instant.now();
+    }
+
+    private void transition(TaskStatus newStatus) {
         if (!status.canTransitionTo(newStatus)) {
             throw new IllegalStateException(
                     "Cannot transition task %d from %s to %s".formatted(taskIndex, status, newStatus));
@@ -38,8 +73,5 @@ public class TaskState {
         this.status = newStatus;
     }
 
-    public void setStartedAt(Instant startedAt) { this.startedAt = startedAt; }
-    public void setCompletedAt(Instant completedAt) { this.completedAt = completedAt; }
-    public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
     public void setExitCode(Integer exitCode) { this.exitCode = exitCode; }
 }

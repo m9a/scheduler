@@ -9,18 +9,19 @@ public enum JobStatus {
     RUNNING,
     COMPLETED,
     FAILED,
+    KILLED,
     CANCELLED;
 
-    private static final Set<JobStatus> TERMINAL = Set.of(COMPLETED, FAILED, CANCELLED);
+    private static final Set<JobStatus> TERMINAL = Set.of(COMPLETED, FAILED, KILLED, CANCELLED);
 
     public boolean canTransitionTo(JobStatus target) {
         if (this == target) return false;
         return switch (this) {
             case SUBMITTED -> target == QUEUED;
             case QUEUED -> target == STARTING || target == CANCELLED;
-            case STARTING -> target == RUNNING || target == FAILED || target == CANCELLED;
-            case RUNNING -> target == COMPLETED || target == FAILED || target == CANCELLED;
-            case COMPLETED, FAILED, CANCELLED -> false;
+            case STARTING -> target == RUNNING || target == FAILED || target == KILLED || target == CANCELLED;
+            case RUNNING -> target == COMPLETED || target == FAILED || target == KILLED || target == CANCELLED;
+            case COMPLETED, FAILED, KILLED, CANCELLED -> false;
         };
     }
 
