@@ -5,10 +5,9 @@ import com.scheduler.coordinator.JobManagerImpl;
 import com.scheduler.coordinator.client.UserRequestHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
+import com.scheduler.client.SchedulerClient;
 import com.scheduler.proto.v1.*;
 import com.google.protobuf.ByteString;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.junit.jupiter.api.*;
@@ -104,8 +103,7 @@ class IntegrationTest {
     private static ObjectStore objectStore;
 
     private static Server coordinatorServer;
-    private static ManagedChannel clientChannel;
-    private static ClientServiceGrpc.ClientServiceBlockingStub clientStub;
+    private static SchedulerClient client;
     private static WorkerAgent workerAgent;
     private static Thread workerThread;
     private static String trainingJobId;
@@ -143,40 +141,33 @@ class IntegrationTest {
     @Test
     @Order(1)
     void testJavaDockerJob() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-java-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-job:latest")
-                .putAllParams(Map.of("region", "us", "batchSize", "100"))
-                .build());
+        Job submitted = client.submitJob("docker-java-job",
+                REGISTRY_PREFIX + "/sample-job:latest",
+                Map.of("region", "us", "batchSize", "100"));
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
-        assertTrue(finalJob.getStartedAtMillis() > 0, "Expected startedAt to be set");
-        assertTrue(finalJob.getCompletedAtMillis() > 0, "Expected completedAt to be set");
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
+        assertTrue(completed.getStartedAtMillis() > 0, "Expected startedAt to be set");
+        assertTrue(completed.getCompletedAtMillis() > 0, "Expected completedAt to be set");
     }
 
     @Test
     @Order(2)
     void testPythonDockerJob() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-python-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-py-job:latest")
-                .putAllParams(Map.of("region", "eu", "batch_size", "500"))
-                .build());
+        Job submitted = client.submitJob("docker-python-job",
+                REGISTRY_PREFIX + "/sample-py-job:latest",
+                Map.of("region", "eu", "batch_size", "500"));
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
     }
 
     @Test
@@ -188,7 +179,7 @@ class IntegrationTest {
             csv.append(i).append(",").append(Math.sin(i * 0.1)).append("\n");
         }
 
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
+        SubmitJobResponse submitResponse = client.submitJob(SubmitJobRequest.newBuilder()
                 .setName("docker-pytorch-job")
                 .setArtifactUri(REGISTRY_PREFIX + "/sample-pytorch-job:latest")
                 .putAllParams(Map.of("epochs", "5", "hidden_size", "16"))
@@ -204,26 +195,22 @@ class IntegrationTest {
         assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
 
         // PyTorch install + training takes longer than the simple jobs
-        JobStatus finalStatus = pollUntilTerminal(jobId, 120, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(120));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
 
         // Verify task states: both completed with real names from the @task decorators
-        assertEquals(2, finalJob.getTasksCount());
-        for (Task task : finalJob.getTasksList()) {
+        assertEquals(2, completed.getTasksCount());
+        for (Task task : completed.getTasksList()) {
             assertEquals(TaskStatus.TASK_STATUS_COMPLETED, task.getStatus());
             assertFalse(task.getName().startsWith("task-"),
                     "Expected real task name, got " + task.getName());
         }
 
         // Verify model.pt exists in output files
-        ListJobFilesResponse filesResponse = clientStub.listJobFiles(
-                ListJobFilesRequest.newBuilder().setJobId(jobId).build());
-        boolean hasModel = filesResponse.getFilesList().stream()
+        List<OutputFile> files = client.listJobFiles(jobId);
+        boolean hasModel = files.stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
-        assertTrue(hasModel, "Expected model.pt in output files, got: " + filesResponse.getFilesList());
+        assertTrue(hasModel, "Expected model.pt in output files, got: " + files);
     }
 
     @Test
@@ -231,7 +218,7 @@ class IntegrationTest {
     void testInferenceDockerJob() throws Exception {
         assertNotNull(trainingJobId, "pytorchDockerJob must run first to produce trainingJobId");
 
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
+        SubmitJobResponse submitResponse = client.submitJob(SubmitJobRequest.newBuilder()
                 .setName("docker-inference-job")
                 .setArtifactUri(REGISTRY_PREFIX + "/sample-inference-job:latest")
                 .putAllParams(Map.of(
@@ -288,16 +275,14 @@ class IntegrationTest {
         assertEquals(200, shutdownConn.getResponseCode(), "Expected 200 from /shutdown");
 
         // The server exits, task completes, job finishes normally
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
 
         // Verify predictions.jsonl was uploaded to the object store
-        ListJobFilesResponse filesResponse = clientStub.listJobFiles(
-                ListJobFilesRequest.newBuilder().setJobId(jobId).build());
-        boolean hasPredictions = filesResponse.getFilesList().stream()
+        List<OutputFile> files = client.listJobFiles(jobId);
+        boolean hasPredictions = files.stream()
                 .anyMatch(f -> f.getName().endsWith("predictions.jsonl"));
-        assertTrue(hasPredictions, "Expected predictions.jsonl in output files, got: "
-                + filesResponse.getFilesList());
+        assertTrue(hasPredictions, "Expected predictions.jsonl in output files, got: " + files);
     }
 
     /**
@@ -310,39 +295,33 @@ class IntegrationTest {
     @Order(5)
     @SuppressWarnings("unchecked")
     void testLightningTrainingJob() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-lightning-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-py-training-job:latest")
-                .putAllParams(Map.of("epochs", "2", "batch_size", "128"))
-                .build());
+        Job submitted = client.submitJob("docker-lightning-job",
+                REGISTRY_PREFIX + "/sample-py-training-job:latest",
+                Map.of("epochs", "2", "batch_size", "128"));
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
 
         // Lightning + MNIST download + training — needs a generous timeout
-        JobStatus finalStatus = pollUntilTerminal(jobId, 300, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus,
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(300));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus(),
                 "Lightning training job should complete successfully");
 
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
-
         // All three tasks should have completed: train, test, export
-        assertEquals(3, finalJob.getTasksCount(), "Expected 3 tasks");
-        assertEquals("train", finalJob.getTasks(0).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(0).getStatus());
-        assertEquals("test", finalJob.getTasks(1).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(1).getStatus());
-        assertEquals("export", finalJob.getTasks(2).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(2).getStatus());
+        assertEquals(3, completed.getTasksCount(), "Expected 3 tasks");
+        assertEquals("train", completed.getTasks(0).getName());
+        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(0).getStatus());
+        assertEquals("test", completed.getTasks(1).getName());
+        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(1).getStatus());
+        assertEquals("export", completed.getTasks(2).getName());
+        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(2).getStatus());
 
         // Verify model.pt was exported and uploaded
-        ListJobFilesResponse filesResponse = clientStub.listJobFiles(
-                ListJobFilesRequest.newBuilder().setJobId(jobId).build());
-        boolean hasModel = filesResponse.getFilesList().stream()
+        List<OutputFile> files = client.listJobFiles(jobId);
+        boolean hasModel = files.stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
-        assertTrue(hasModel, "Expected model.pt in output files, got: " + filesResponse.getFilesList());
+        assertTrue(hasModel, "Expected model.pt in output files, got: " + files);
 
         // Verify MLflow experiment exists
         ObjectMapper mapper = new ObjectMapper();
@@ -394,19 +373,14 @@ class IntegrationTest {
     @Test
     @Order(6)
     void testTaskFailureJava() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-java-failing-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-failing-job:latest")
-                .build());
+        Job submitted = client.submitJob("docker-java-failing-job",
+                REGISTRY_PREFIX + "/sample-failing-job:latest", Map.of());
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
+        Job finalJob = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_FAILED, finalJob.getStatus());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, finalJob.getFailureReason());
         assertFalse(finalJob.getErrorMessage().isEmpty(), "Expected error_message for backward compat");
 
@@ -423,19 +397,14 @@ class IntegrationTest {
     @Test
     @Order(7)
     void testTaskFailurePython() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-python-failing-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-py-failing-job:latest")
-                .build());
+        Job submitted = client.submitJob("docker-python-failing-job",
+                REGISTRY_PREFIX + "/sample-py-failing-job:latest", Map.of());
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
+        Job finalJob = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_FAILED, finalJob.getStatus());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, finalJob.getFailureReason());
         assertFalse(finalJob.getErrorMessage().isEmpty(), "Expected error_message for backward compat");
 
@@ -472,12 +441,12 @@ class IntegrationTest {
                 .build()
                 .start();
 
-        ManagedChannel hbClientChannel = ManagedChannelBuilder
-                .forAddress("localhost", hbServer.getPort())
-                .usePlaintext()
+        SchedulerClient hbClient = SchedulerClient.builder()
+                .host("localhost")
+                .port(hbServer.getPort())
+                .deadline(Duration.ofSeconds(30))
+                .maxRetries(0)
                 .build();
-        ClientServiceGrpc.ClientServiceBlockingStub hbClientStub =
-                ClientServiceGrpc.newBlockingStub(hbClientChannel);
 
         // Worker that blocks the spawn so the job stays in-flight while we kill heartbeats
         TestableWorkerAgent hbWorker = new TestableWorkerAgent("localhost", hbServer.getPort());
@@ -489,11 +458,8 @@ class IntegrationTest {
 
         String jobId;
         try {
-            SubmitJobResponse submitResponse = hbClientStub.submitJob(SubmitJobRequest.newBuilder()
-                    .setName("heartbeat-loss-test")
-                    .setArtifactUri("test-image:latest")
-                    .build());
-            jobId = submitResponse.getJob().getId();
+            Job submitted = hbClient.submitJob("heartbeat-loss-test", "test-image:latest", Map.of());
+            jobId = submitted.getId();
 
             Thread hbWorkerThread = new Thread(hbWorker::run);
             hbWorkerThread.setDaemon(true);
@@ -502,9 +468,8 @@ class IntegrationTest {
             // Wait for the job to be claimed (status becomes STARTING)
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             while (System.nanoTime() < deadline) {
-                GetJobStatusResponse resp = hbClientStub.getJobStatus(
-                        GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-                if (resp.getJob().getStatus() != JobStatus.JOB_STATUS_QUEUED) {
+                Job polled = hbClient.getJobStatus(jobId);
+                if (polled.getStatus() != JobStatus.JOB_STATUS_QUEUED) {
                     break;
                 }
                 Thread.sleep(100);
@@ -517,9 +482,7 @@ class IntegrationTest {
             deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             Job job = null;
             while (System.nanoTime() < deadline) {
-                GetJobStatusResponse resp = hbClientStub.getJobStatus(
-                        GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-                job = resp.getJob();
+                job = hbClient.getJobStatus(jobId);
                 if (job.getStatus() == JobStatus.JOB_STATUS_FAILED) {
                     break;
                 }
@@ -538,7 +501,7 @@ class IntegrationTest {
             hbWorkerThread.join(5000);
         } finally {
             hbWorkerHandler.shutdownHeartbeatMonitor();
-            hbClientChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            hbClient.close();
             hbServer.shutdown().awaitTermination(5, TimeUnit.SECONDS);
         }
     }
@@ -745,11 +708,12 @@ class IntegrationTest {
                 .build()
                 .start();
 
-        clientChannel = ManagedChannelBuilder
-                .forAddress("localhost", coordinatorServer.getPort())
-                .usePlaintext()
+        client = SchedulerClient.builder()
+                .host("localhost")
+                .port(coordinatorServer.getPort())
+                .deadline(Duration.ofSeconds(30))
+                .maxRetries(0)
                 .build();
-        clientStub = ClientServiceGrpc.newBlockingStub(clientChannel);
 
         // hostname = host.docker.internal so containers can POST status back to the host
         workerAgent = new WorkerAgent("localhost", coordinatorServer.getPort(), "host.docker.internal", 1,
@@ -773,8 +737,8 @@ class IntegrationTest {
 
     private static void shutdownCoordinator() {
         try {
-            if (clientChannel != null) {
-                clientChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            if (client != null) {
+                client.close();
             }
             if (coordinatorServer != null) {
                 coordinatorServer.shutdown().awaitTermination(5, TimeUnit.SECONDS);
@@ -829,34 +793,13 @@ class IntegrationTest {
 
     // -- polling --
 
-    private JobStatus pollUntilTerminal(String jobId, long timeout, TimeUnit unit) throws InterruptedException {
-        long deadline = System.nanoTime() + unit.toNanos(timeout);
-        JobStatus status = JobStatus.JOB_STATUS_UNSPECIFIED;
-
-        while (System.nanoTime() < deadline) {
-            GetJobStatusResponse response = clientStub.getJobStatus(
-                    GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-            status = response.getJob().getStatus();
-
-            if (status == JobStatus.JOB_STATUS_COMPLETED || status == JobStatus.JOB_STATUS_FAILED
-                    || status == JobStatus.JOB_STATUS_KILLED) {
-                return status;
-            }
-            Thread.sleep(500);
-        }
-
-        fail("Job did not reach terminal status within timeout. Last status: " + status);
-        return status;
-    }
-
     private void pollUntilRunning(String jobId, long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
         JobStatus status = JobStatus.JOB_STATUS_UNSPECIFIED;
 
         while (System.nanoTime() < deadline) {
-            GetJobStatusResponse response = clientStub.getJobStatus(
-                    GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-            status = response.getJob().getStatus();
+            Job job = client.getJobStatus(jobId);
+            status = job.getStatus();
 
             if (status == JobStatus.JOB_STATUS_RUNNING) {
                 return;
