@@ -42,28 +42,32 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * End-to-end integration test. Builds real Docker images from the scheduler-sdk
- * examples, pushes them to a local registry, then runs the full client →
- * coordinator → worker → container pipeline.
+ * End-to-end integration test. Brings up infrastructure via docker-compose
+ * (MinIO, PostgreSQL, MLflow) and a local Docker registry, builds real images
+ * from scheduler-sdk, then runs the full client → coordinator → worker →
+ * container pipeline.
  *
  * <pre>
  * @BeforeAll — infrastructure:
- *   registry:2          (local Docker registry for job images)
- *   MinIO               (S3-compatible object store for input/output files)
- *   Coordinator         (gRPC server: UserRequestHandler + WorkerHandler)
- *   WorkerAgent         (background thread, connects to coordinator)
+ *   docker-compose.test.yml:
+ *     ├── MinIO      (:9000, :9001)  S3-compatible object store
+ *     ├── PostgreSQL  (:5432)        MLflow backend store
+ *     └── MLflow      (:5000)        experiment tracking
+ *   registry:2       (:5050)         local Docker registry on scheduler-net
+ *   Coordinator      (gRPC, ephemeral port)
+ *   WorkerAgent      (background thread, connects to coordinator)
  *
  *   docker build + push from scheduler-sdk:
  *     |-- sample-job               (Java)
  *     |-- sample-py-job            (Python)
  *     |-- sample-pytorch-job       (PyTorch training)
- *     |-- sample-py-training-job   (Lightning + auto metrics)
+ *     |-- sample-py-training-job   (Lightning + MLflow metrics)
  *     '-- sample-inference-job     (HTTP inference server)
  *
  * Test flow:
  *   ClientStub --SubmitJob--&gt; Coordinator --PullJob--&gt; WorkerAgent
  *                                                          |
- *     docker run --name job-{id} -v input:ro -v output ... image
+ *     docker run --name job-{id} --network scheduler-net ...
  *                                                          |
  *     Container --POST /task-status--&gt; WorkerAgent --gRPC--&gt; Coordinator
  *                                                          |
@@ -72,14 +76,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *     WorkerAgent uploads /workspace/output --&gt; MinIO (object store)
  *
  * Test ordering:
- *   1. testJavaDockerJob       — batch job, 3 tasks
- *   2. testPythonDockerJob     — batch job, 3 tasks
- *   3. testPytorchDockerJob    — trains LSTM, uploads model.pt
- *   4. testInferenceDockerJob  — loads model.pt, serves HTTP, verifies predictions
- *   5. testLightningTrainingJob — Lightning MNIST, verifies auto metric reporting in logs
- *   6. testTaskFailureJava     — Java job where second task throws
- *   7. testTaskFailurePython   — Python job where second task raises
- *   8. testWorkerHeartbeatLost — coordinator detects dead worker, fails job
+ *   1. testJavaDockerJob        — batch job, 3 tasks
+ *   2. testPythonDockerJob      — batch job, 3 tasks
+ *   3. testPytorchDockerJob     — trains LSTM, uploads model.pt
+ *   4. testInferenceDockerJob   — loads model.pt, serves HTTP, verifies predictions
+ *   5. testLightningTrainingJob — Lightning MNIST, verifies MLflow metrics
+ *   6. testTaskFailureJava      — Java job where second task throws
+ *   7. testTaskFailurePython    — Python job where second task raises
+ *   8. testWorkerHeartbeatLost  — coordinator detects dead worker, fails job
  * </pre>
  *
  * Skips transparently when Docker is unavailable — no POM config needed.
@@ -88,12 +92,15 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class IntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
-    private static final String REGISTRY_PREFIX = "localhost:5000";
+    private static final String REGISTRY_PREFIX = "localhost:5050";
 
     private static final Path SDK_REPO_PATH = Path.of("../../scheduler-sdk");
+    private static final Path COMPOSE_FILE = Path.of("../../scheduler/docker-compose.test.yml");
+
+    private static final String MINIO_URL = "http://localhost:9000";
+    private static final String MLFLOW_URL = "http://localhost:5000";
 
     private static String registryContainerName;
-    private static String minioContainerName;
     private static ObjectStore objectStore;
 
     private static Server coordinatorServer;
@@ -116,8 +123,9 @@ class IntegrationTest {
         log.info("Using scheduler-sdk at {}", SDK_REPO_PATH);
 
         assertSdkPrerequisites();
+        startComposeStack();
         startRegistry();
-        startMinIO();
+        createSchedulerBucket();
         buildAndPushImages();
         startCoordinatorAndWorker();
     }
@@ -127,8 +135,8 @@ class IntegrationTest {
         removeJobContainers();
         stopWorker();
         shutdownCoordinator();
-        removeMinIO();
         removeRegistry();
+        stopComposeStack();
         removeTestImages();
     }
 
@@ -293,19 +301,14 @@ class IntegrationTest {
     }
 
     /**
-     * Submits a Lightning training job (MNIST, 3 epochs) with three tasks:
-     * train → test → export. Verifies all tasks complete, and that the exported
-     * model.pt is uploaded to object storage.
-     *
-     * <p>Metric updates from the SchedulerCallback are visible in the worker logs
-     * (look for "Received metrics from job=").
-     *
-     * <p>TODO: once metrics are wired through the coordinator, assert that
-     * GetJobMetrics returns the expected epoch/phase/metric entries instead of
-     * just checking the logs.
+     * Submits a Lightning training job (MNIST, 2 epochs) with three tasks:
+     * train → test → export. Verifies all tasks complete, that the exported
+     * model.pt is uploaded to object storage, and that training metrics
+     * (train_loss, val_loss, val_acc, test_loss, test_acc) are logged in MLflow.
      */
     @Test
     @Order(5)
+    @SuppressWarnings("unchecked")
     void testLightningTrainingJob() throws Exception {
         SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
                 .setName("docker-lightning-job")
@@ -340,6 +343,52 @@ class IntegrationTest {
         boolean hasModel = filesResponse.getFilesList().stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
         assertTrue(hasModel, "Expected model.pt in output files, got: " + filesResponse.getFilesList());
+
+        // Verify MLflow experiment exists
+        ObjectMapper mapper = new ObjectMapper();
+        HttpURLConnection expConn = (HttpURLConnection) URI.create(
+                MLFLOW_URL + "/api/2.0/mlflow/experiments/get-by-name?experiment_name=mnist-lightning"
+        ).toURL().openConnection();
+        expConn.setConnectTimeout(5000);
+        expConn.setReadTimeout(5000);
+        assertEquals(200, expConn.getResponseCode(), "MLflow experiment 'mnist-lightning' should exist");
+        String expBody = new String(expConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, Object> expJson = mapper.readValue(expBody, Map.class);
+        Map<String, Object> experiment = (Map<String, Object>) expJson.get("experiment");
+        String experimentId = (String) experiment.get("experiment_id");
+        assertNotNull(experimentId, "Expected experiment_id");
+
+        // Search for runs in this experiment
+        HttpURLConnection runConn = (HttpURLConnection) URI.create(
+                MLFLOW_URL + "/api/2.0/mlflow/runs/search"
+        ).toURL().openConnection();
+        runConn.setRequestMethod("POST");
+        runConn.setRequestProperty("Content-Type", "application/json");
+        runConn.setDoOutput(true);
+        String searchBody = mapper.writeValueAsString(Map.of("experiment_ids", List.of(experimentId)));
+        try (OutputStream os = runConn.getOutputStream()) {
+            os.write(searchBody.getBytes(StandardCharsets.UTF_8));
+        }
+        assertEquals(200, runConn.getResponseCode(), "MLflow run search should succeed");
+        String runBody = new String(runConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, Object> runJson = mapper.readValue(runBody, Map.class);
+        List<Map<String, Object>> runs = (List<Map<String, Object>>) runJson.get("runs");
+        assertFalse(runs.isEmpty(), "Expected at least one MLflow run");
+
+        // Verify training metrics were logged
+        Map<String, Object> firstRun = runs.get(0);
+        Map<String, Object> data = (Map<String, Object>) firstRun.get("data");
+        List<Map<String, Object>> metrics = (List<Map<String, Object>>) data.get("metrics");
+        assertNotNull(metrics, "Expected metrics in run data");
+
+        List<String> metricKeys = new ArrayList<>();
+        for (Map<String, Object> m : metrics) {
+            metricKeys.add((String) m.get("key"));
+        }
+        for (String expected : List.of("train_loss", "val_loss", "val_acc", "test_loss", "test_acc")) {
+            assertTrue(metricKeys.contains(expected),
+                    "Expected metric '" + expected + "' in MLflow run, got: " + metricKeys);
+        }
     }
 
     @Test
@@ -507,7 +556,7 @@ class IntegrationTest {
         private volatile SpawnBehavior spawnBehavior;
 
         TestableWorkerAgent(String coordinatorHost, int coordinatorPort) throws IOException {
-            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10));
+            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10), null, null);
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {
@@ -564,68 +613,57 @@ class IntegrationTest {
                 "sample-failing-job JAR not found at " + failingJobJar + " — run 'mvn package -pl sample-failing-job -am' in the SDK repo first");
     }
 
-    private static void startRegistry() throws Exception {
-        registryContainerName = "test-registry-" + ProcessHandle.current().pid();
-        runCommand("docker", "run", "-d", "-p", "5000:5000", "--name", registryContainerName, "registry:2");
+    private static void startComposeStack() throws Exception {
+        log.info("Starting docker-compose stack from {}", COMPOSE_FILE.toAbsolutePath());
+        runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(), "up", "-d");
 
-        // Wait for registry to be ready
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() < deadline) {
-            try {
-                HttpURLConnection conn = (HttpURLConnection) URI.create("http://localhost:5000/v2/").toURL().openConnection();
-                conn.setConnectTimeout(1000);
-                conn.setReadTimeout(1000);
-                if (conn.getResponseCode() == 200) {
-                    log.info("Registry ready at localhost:5000");
-                    return;
-                }
-            } catch (IOException ignored) {
-            }
-            Thread.sleep(500);
-        }
-        fail("Registry did not become ready within 30 seconds");
+        boolean minioReady = pollUrl(MINIO_URL + "/minio/health/ready", 60);
+        assertTrue(minioReady, "MinIO did not become ready");
+
+        // MLflow installs psycopg2-binary + boto3 on first start
+        boolean mlflowReady = pollUrl(MLFLOW_URL + "/health", 120);
+        assertTrue(mlflowReady, "MLflow did not become ready");
+
+        log.info("Docker-compose stack ready");
     }
 
-    private static void startMinIO() throws Exception {
-        minioContainerName = "test-minio-" + ProcessHandle.current().pid();
-        runCommand("docker", "run", "-d", "-p", "0:9000", "--name", minioContainerName,
-                "-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin",
-                "minio/minio", "server", "/data");
-
-        int minioPort = parseHostPort(minioContainerName, 9000);
-        log.info("MinIO container started on port {}", minioPort);
-
-        // Poll until MinIO is ready
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() < deadline) {
-            try {
-                HttpURLConnection conn = (HttpURLConnection) URI.create(
-                        "http://localhost:" + minioPort + "/minio/health/ready").toURL().openConnection();
-                conn.setConnectTimeout(1000);
-                conn.setReadTimeout(1000);
-                if (conn.getResponseCode() == 200) {
-                    log.info("MinIO ready at localhost:{}", minioPort);
-                    break;
-                }
-            } catch (IOException ignored) {
-            }
-            if (System.nanoTime() >= deadline) {
-                fail("MinIO did not become ready within 30 seconds");
-            }
-            Thread.sleep(500);
+    private static void stopComposeStack() {
+        try {
+            runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(), "down", "-v");
+        } catch (Exception e) {
+            log.warn("Failed to stop compose stack: {}", e.getMessage());
         }
+    }
 
+    private static void startRegistry() throws Exception {
+        registryContainerName = "test-registry-" + ProcessHandle.current().pid();
+        runCommand("docker", "run", "-d", "-p", "5050:5000",
+                "--network", "scheduler-net",
+                "--name", registryContainerName, "registry:2");
+
+        boolean ready = pollUrl("http://localhost:5050/v2/", 30);
+        assertTrue(ready, "Registry did not become ready");
+        log.info("Registry ready at localhost:5050");
+    }
+
+    private static void createSchedulerBucket() {
         S3Client s3 = S3Client.builder()
-                .endpointOverride(URI.create("http://localhost:" + minioPort))
+                .endpointOverride(URI.create(MINIO_URL))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create("minioadmin", "minioadmin")))
                 .region(Region.US_EAST_1)
                 .forcePathStyle(true)
                 .build();
 
-        s3.createBucket(CreateBucketRequest.builder().bucket("scheduler").build());
+        // minio-init in docker-compose may have already created the bucket
+        try {
+            s3.createBucket(CreateBucketRequest.builder().bucket("scheduler").build());
+            log.info("Created 'scheduler' bucket");
+        } catch (Exception e) {
+            log.info("Bucket 'scheduler' already exists: {}", e.getMessage());
+        }
+
         objectStore = new ObjectStore(s3, "scheduler");
-        log.info("Created 'scheduler' bucket in MinIO");
     }
 
     /**
@@ -715,7 +753,7 @@ class IntegrationTest {
 
         // hostname = host.docker.internal so containers can POST status back to the host
         workerAgent = new WorkerAgent("localhost", coordinatorServer.getPort(), "host.docker.internal", 1,
-                objectStore, Duration.ofSeconds(120));
+                objectStore, Duration.ofSeconds(120), "scheduler-net", "http://mlflow:5000");
         workerThread = new Thread(workerAgent::run);
         workerThread.start();
     }
@@ -752,12 +790,6 @@ class IntegrationTest {
         }
     }
 
-    private static void removeMinIO() {
-        if (minioContainerName != null) {
-            runQuietly("docker", "rm", "-f", "-v", minioContainerName);
-        }
-    }
-
     private static void removeRegistry() {
         if (registryContainerName != null) {
             runQuietly("docker", "rm", "-f", "-v", registryContainerName);
@@ -784,9 +816,12 @@ class IntegrationTest {
             runQuietly("docker", "rmi", "-f", image);
         }
 
-        // Infrastructure images
+        // Infrastructure images (registry is standalone, the rest are from docker-compose)
         runQuietly("docker", "rmi", "-f", "registry:2");
         runQuietly("docker", "rmi", "-f", "minio/minio");
+        runQuietly("docker", "rmi", "-f", "minio/mc");
+        runQuietly("docker", "rmi", "-f", "postgres:16");
+        runQuietly("docker", "rmi", "-f", "ghcr.io/mlflow/mlflow:v2.16.0");
 
         // Prune dangling images (intermediate build layers)
         runQuietly("docker", "image", "prune", "-f");
@@ -855,6 +890,28 @@ class IntegrationTest {
         }
 
         fail("Inference server did not become healthy within timeout");
+    }
+
+    // -- URL polling helpers (used by startComposeStack / startRegistry) --
+
+    private static boolean pollUrl(String url, int timeoutSeconds) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        while (System.nanoTime() < deadline) {
+            try {
+                if (httpGet(url) == 200) return true;
+            } catch (Exception ignored) {
+            }
+            try { Thread.sleep(1000); } catch (InterruptedException e) { return false; }
+        }
+        return false;
+    }
+
+    private static int httpGet(String url) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        conn.setConnectTimeout(2000);
+        conn.setReadTimeout(2000);
+        conn.setRequestMethod("GET");
+        return conn.getResponseCode();
     }
 
     // -- command helpers --
