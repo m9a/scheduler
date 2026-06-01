@@ -187,3 +187,28 @@ mvn compile                      # compile all modules
 mvn test                         # run tests
 mvn compile -pl scheduler-proto  # regenerate proto code after .proto changes
 ```
+
+## Proto JAR
+
+`scheduler-proto` is the single source of truth for all protobuf definitions and generated gRPC stubs. It is consumed by both the scheduler infrastructure (as a sibling module) and the [scheduler-sdk](../scheduler-sdk) `scheduler-client` module (as a Maven dependency from local `~/.m2`).
+
+```
+scheduler-proto (source of truth)
+  │  mvn install → ~/.m2/repository
+  │
+  ├── scheduler-coordinator  (sibling module, resolved by reactor)
+  └── scheduler-client       (separate repo, resolved from ~/.m2)
+```
+
+After changing any `.proto` file, republish to local Maven:
+
+```bash
+mvn install -pl scheduler-proto
+```
+
+Then rebuild downstream consumers:
+
+```bash
+cd ../scheduler-sdk
+mvn compile -pl scheduler-client
+```
