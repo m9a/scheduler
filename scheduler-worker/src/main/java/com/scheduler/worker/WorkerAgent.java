@@ -86,12 +86,15 @@ public class WorkerAgent implements AutoCloseable {
     private final String hostname;
     private final int capacity;
     private final Duration jobExecutionTimeout;
+    private final String dockerNetwork;
+    private final String mlflowTrackingUri;
     private volatile boolean running;
     private String workerId;
     private ScheduledExecutorService heartbeatExecutor;
 
     public WorkerAgent(String coordinatorHost, int coordinatorPort, String hostname, int capacity,
-                       ObjectStore objectStore, Duration jobExecutionTimeout) throws IOException {
+                       ObjectStore objectStore, Duration jobExecutionTimeout,
+                       String dockerNetwork, String mlflowTrackingUri) throws IOException {
         this.channel = ManagedChannelBuilder.forAddress(coordinatorHost, coordinatorPort)
                 .usePlaintext()
                 .build();
@@ -101,6 +104,8 @@ public class WorkerAgent implements AutoCloseable {
         this.capacity = capacity;
         this.objectStore = objectStore;
         this.jobExecutionTimeout = jobExecutionTimeout;
+        this.dockerNetwork = dockerNetwork;
+        this.mlflowTrackingUri = mlflowTrackingUri;
         // Bind to all NICs so Docker containers on the bridge network can reach
         // this server via the host's real hostname (passed in workerAgentUrl).
         this.wsServer = new JobWebSocketServer(new InetSocketAddress("0.0.0.0", 0));
@@ -116,7 +121,8 @@ public class WorkerAgent implements AutoCloseable {
 
     public WorkerAgent(String coordinatorHost, int coordinatorPort, String hostname, int capacity,
                        ObjectStore objectStore) throws IOException {
-        this(coordinatorHost, coordinatorPort, hostname, capacity, objectStore, DEFAULT_JOB_EXECUTION_TIMEOUT);
+        this(coordinatorHost, coordinatorPort, hostname, capacity, objectStore,
+                DEFAULT_JOB_EXECUTION_TIMEOUT, null, null);
     }
 
     /**
@@ -287,7 +293,7 @@ public class WorkerAgent implements AutoCloseable {
      */
     int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
                         Map<String, String> params) throws IOException, InterruptedException {
-        List<String> command = buildCommand(details, inputDir, outputDir, params);
+        List<String> command = buildCommand(details, inputDir, outputDir, params, dockerNetwork, mlflowTrackingUri);
         log.info("Starting job process: {}", String.join(" ", command));
 
         ProcessBuilder pb = new ProcessBuilder(command)
@@ -336,13 +342,20 @@ public class WorkerAgent implements AutoCloseable {
     }
 
     static List<String> buildCommand(JobDetails details, Path inputDir, Path outputDir,
-                                      Map<String, String> params) {
+                                      Map<String, String> params, String dockerNetwork,
+                                      String mlflowTrackingUri) {
         List<String> command = new ArrayList<>();
         command.add("docker");
         command.add("run");
         command.add("--rm");
         command.add("--name");
         command.add("job-" + details.jobId());
+
+        if (dockerNetwork != null) {
+            command.add("--network");
+            command.add(dockerNetwork);
+        }
+
         command.add("-v");
         command.add(inputDir.toAbsolutePath() + ":/workspace/input:ro");
         command.add("-v");
@@ -356,6 +369,12 @@ public class WorkerAgent implements AutoCloseable {
 
         command.add("-e");
         command.add("EXECUTION_PAYLOAD=" + details.payload());
+
+        if (mlflowTrackingUri != null) {
+            command.add("-e");
+            command.add("MLFLOW_TRACKING_URI=" + mlflowTrackingUri);
+        }
+
         command.add(details.artifactUri());
         return command;
     }
@@ -618,9 +637,13 @@ public class WorkerAgent implements AutoCloseable {
         String hostname = args.length > 2 ? args[2] : "localhost";
         int capacity = args.length > 3 ? Integer.parseInt(args[3]) : 1;
 
+        String dockerNetwork = System.getProperty("docker.network");
+        String mlflowTrackingUri = System.getProperty("mlflow.trackingUri");
+
         ObjectStore objectStore = createObjectStore();
 
-        WorkerAgent agent = new WorkerAgent(coordinatorHost, coordinatorPort, hostname, capacity, objectStore);
+        WorkerAgent agent = new WorkerAgent(coordinatorHost, coordinatorPort, hostname, capacity,
+                objectStore, DEFAULT_JOB_EXECUTION_TIMEOUT, dockerNetwork, mlflowTrackingUri);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutting down worker");
             try {

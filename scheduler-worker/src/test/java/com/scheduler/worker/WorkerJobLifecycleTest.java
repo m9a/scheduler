@@ -43,7 +43,7 @@ class WorkerJobLifecycleTest {
         private volatile SpawnBehavior spawnBehavior;
 
         TestableWorkerAgent(String coordinatorHost, int coordinatorPort) throws IOException {
-            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10));
+            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10), null, null);
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {

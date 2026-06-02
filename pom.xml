@@ -50,6 +50,11 @@
                 <artifactId>scheduler-coordinator</artifactId>
                 <version>${project.version}</version>
             </dependency>
+            <dependency>
+                <groupId>com.scheduler</groupId>
+                <artifactId>scheduler-client</artifactId>
+                <version>${project.version}</version>
+            </dependency>
 
             <!-- gRPC -->
             <dependency>

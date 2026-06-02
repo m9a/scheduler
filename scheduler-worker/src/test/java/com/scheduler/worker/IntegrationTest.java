@@ -5,10 +5,9 @@ import com.scheduler.coordinator.JobManagerImpl;
 import com.scheduler.coordinator.client.UserRequestHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
+import com.scheduler.client.SchedulerClient;
 import com.scheduler.proto.v1.*;
 import com.google.protobuf.ByteString;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.junit.jupiter.api.*;
@@ -42,28 +41,32 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * End-to-end integration test. Builds real Docker images from the scheduler-sdk
- * examples, pushes them to a local registry, then runs the full client →
- * coordinator → worker → container pipeline.
+ * End-to-end integration test. Brings up infrastructure via docker-compose
+ * (MinIO, PostgreSQL, MLflow) and a local Docker registry, builds real images
+ * from scheduler-sdk, then runs the full client → coordinator → worker →
+ * container pipeline.
  *
  * <pre>
  * @BeforeAll — infrastructure:
- *   registry:2          (local Docker registry for job images)
- *   MinIO               (S3-compatible object store for input/output files)
- *   Coordinator         (gRPC server: UserRequestHandler + WorkerHandler)
- *   WorkerAgent         (background thread, connects to coordinator)
+ *   docker-compose.test.yml:
+ *     ├── MinIO      (:9000, :9001)  S3-compatible object store
+ *     ├── PostgreSQL  (:5432)        MLflow backend store
+ *     └── MLflow      (:5000)        experiment tracking
+ *   registry:2       (:5050)         local Docker registry on scheduler-net
+ *   Coordinator      (gRPC, ephemeral port)
+ *   WorkerAgent      (background thread, connects to coordinator)
  *
  *   docker build + push from scheduler-sdk:
  *     |-- sample-job               (Java)
  *     |-- sample-py-job            (Python)
  *     |-- sample-pytorch-job       (PyTorch training)
- *     |-- sample-py-training-job   (Lightning + auto metrics)
+ *     |-- sample-py-training-job   (Lightning + MLflow metrics)
  *     '-- sample-inference-job     (HTTP inference server)
  *
  * Test flow:
  *   ClientStub --SubmitJob--&gt; Coordinator --PullJob--&gt; WorkerAgent
  *                                                          |
- *     docker run --name job-{id} -v input:ro -v output ... image
+ *     docker run --name job-{id} --network scheduler-net ...
  *                                                          |
  *     Container --POST /task-status--&gt; WorkerAgent --gRPC--&gt; Coordinator
  *                                                          |
@@ -72,14 +75,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *     WorkerAgent uploads /workspace/output --&gt; MinIO (object store)
  *
  * Test ordering:
- *   1. testJavaDockerJob       — batch job, 3 tasks
- *   2. testPythonDockerJob     — batch job, 3 tasks
- *   3. testPytorchDockerJob    — trains LSTM, uploads model.pt
- *   4. testInferenceDockerJob  — loads model.pt, serves HTTP, verifies predictions
- *   5. testLightningTrainingJob — Lightning MNIST, verifies auto metric reporting in logs
- *   6. testTaskFailureJava     — Java job where second task throws
- *   7. testTaskFailurePython   — Python job where second task raises
- *   8. testWorkerHeartbeatLost — coordinator detects dead worker, fails job
+ *   1. testJavaDockerJob        — batch job, 3 tasks
+ *   2. testPythonDockerJob      — batch job, 3 tasks
+ *   3. testPytorchDockerJob     — trains LSTM, uploads model.pt
+ *   4. testInferenceDockerJob   — loads model.pt, serves HTTP, verifies predictions
+ *   5. testLightningTrainingJob — Lightning MNIST, verifies MLflow metrics
+ *   6. testTaskFailureJava      — Java job where second task throws
+ *   7. testTaskFailurePython    — Python job where second task raises
+ *   8. testWorkerHeartbeatLost  — coordinator detects dead worker, fails job
  * </pre>
  *
  * Skips transparently when Docker is unavailable — no POM config needed.
@@ -88,17 +91,19 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class IntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
-    private static final String REGISTRY_PREFIX = "localhost:5000";
+    private static final String REGISTRY_PREFIX = "localhost:5050";
 
     private static final Path SDK_REPO_PATH = Path.of("../../scheduler-sdk");
+    private static final Path COMPOSE_FILE = Path.of("../../scheduler/docker-compose.test.yml");
+
+    private static final String MINIO_URL = "http://localhost:9000";
+    private static final String MLFLOW_URL = "http://localhost:5000";
 
     private static String registryContainerName;
-    private static String minioContainerName;
     private static ObjectStore objectStore;
 
     private static Server coordinatorServer;
-    private static ManagedChannel clientChannel;
-    private static ClientServiceGrpc.ClientServiceBlockingStub clientStub;
+    private static SchedulerClient client;
     private static WorkerAgent workerAgent;
     private static Thread workerThread;
     private static String trainingJobId;
@@ -116,8 +121,9 @@ class IntegrationTest {
         log.info("Using scheduler-sdk at {}", SDK_REPO_PATH);
 
         assertSdkPrerequisites();
+        startComposeStack();
         startRegistry();
-        startMinIO();
+        createSchedulerBucket();
         buildAndPushImages();
         startCoordinatorAndWorker();
     }
@@ -127,48 +133,41 @@ class IntegrationTest {
         removeJobContainers();
         stopWorker();
         shutdownCoordinator();
-        removeMinIO();
         removeRegistry();
+        stopComposeStack();
         removeTestImages();
     }
 
     @Test
     @Order(1)
     void testJavaDockerJob() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-java-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-job:latest")
-                .putAllParams(Map.of("region", "us", "batchSize", "100"))
-                .build());
+        Job submitted = client.submitJob("docker-java-job",
+                REGISTRY_PREFIX + "/sample-job:latest",
+                Map.of("region", "us", "batchSize", "100"));
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
-        assertTrue(finalJob.getStartedAtMillis() > 0, "Expected startedAt to be set");
-        assertTrue(finalJob.getCompletedAtMillis() > 0, "Expected completedAt to be set");
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
+        assertTrue(completed.getStartedAtMillis() > 0, "Expected startedAt to be set");
+        assertTrue(completed.getCompletedAtMillis() > 0, "Expected completedAt to be set");
     }
 
     @Test
     @Order(2)
     void testPythonDockerJob() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-python-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-py-job:latest")
-                .putAllParams(Map.of("region", "eu", "batch_size", "500"))
-                .build());
+        Job submitted = client.submitJob("docker-python-job",
+                REGISTRY_PREFIX + "/sample-py-job:latest",
+                Map.of("region", "eu", "batch_size", "500"));
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
     }
 
     @Test
@@ -180,7 +179,7 @@ class IntegrationTest {
             csv.append(i).append(",").append(Math.sin(i * 0.1)).append("\n");
         }
 
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
+        SubmitJobResponse submitResponse = client.submitJob(SubmitJobRequest.newBuilder()
                 .setName("docker-pytorch-job")
                 .setArtifactUri(REGISTRY_PREFIX + "/sample-pytorch-job:latest")
                 .putAllParams(Map.of("epochs", "5", "hidden_size", "16"))
@@ -196,26 +195,22 @@ class IntegrationTest {
         assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
 
         // PyTorch install + training takes longer than the simple jobs
-        JobStatus finalStatus = pollUntilTerminal(jobId, 120, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(120));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
 
         // Verify task states: both completed with real names from the @task decorators
-        assertEquals(2, finalJob.getTasksCount());
-        for (Task task : finalJob.getTasksList()) {
+        assertEquals(2, completed.getTasksCount());
+        for (Task task : completed.getTasksList()) {
             assertEquals(TaskStatus.TASK_STATUS_COMPLETED, task.getStatus());
             assertFalse(task.getName().startsWith("task-"),
                     "Expected real task name, got " + task.getName());
         }
 
         // Verify model.pt exists in output files
-        ListJobFilesResponse filesResponse = clientStub.listJobFiles(
-                ListJobFilesRequest.newBuilder().setJobId(jobId).build());
-        boolean hasModel = filesResponse.getFilesList().stream()
+        List<OutputFile> files = client.listJobFiles(jobId);
+        boolean hasModel = files.stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
-        assertTrue(hasModel, "Expected model.pt in output files, got: " + filesResponse.getFilesList());
+        assertTrue(hasModel, "Expected model.pt in output files, got: " + files);
     }
 
     @Test
@@ -223,7 +218,7 @@ class IntegrationTest {
     void testInferenceDockerJob() throws Exception {
         assertNotNull(trainingJobId, "pytorchDockerJob must run first to produce trainingJobId");
 
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
+        SubmitJobResponse submitResponse = client.submitJob(SubmitJobRequest.newBuilder()
                 .setName("docker-inference-job")
                 .setArtifactUri(REGISTRY_PREFIX + "/sample-inference-job:latest")
                 .putAllParams(Map.of(
@@ -280,84 +275,112 @@ class IntegrationTest {
         assertEquals(200, shutdownConn.getResponseCode(), "Expected 200 from /shutdown");
 
         // The server exits, task completes, job finishes normally
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus);
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
 
         // Verify predictions.jsonl was uploaded to the object store
-        ListJobFilesResponse filesResponse = clientStub.listJobFiles(
-                ListJobFilesRequest.newBuilder().setJobId(jobId).build());
-        boolean hasPredictions = filesResponse.getFilesList().stream()
+        List<OutputFile> files = client.listJobFiles(jobId);
+        boolean hasPredictions = files.stream()
                 .anyMatch(f -> f.getName().endsWith("predictions.jsonl"));
-        assertTrue(hasPredictions, "Expected predictions.jsonl in output files, got: "
-                + filesResponse.getFilesList());
+        assertTrue(hasPredictions, "Expected predictions.jsonl in output files, got: " + files);
     }
 
     /**
-     * Submits a Lightning training job (MNIST, 3 epochs) with three tasks:
-     * train → test → export. Verifies all tasks complete, and that the exported
-     * model.pt is uploaded to object storage.
-     *
-     * <p>Metric updates from the SchedulerCallback are visible in the worker logs
-     * (look for "Received metrics from job=").
-     *
-     * <p>TODO: once metrics are wired through the coordinator, assert that
-     * GetJobMetrics returns the expected epoch/phase/metric entries instead of
-     * just checking the logs.
+     * Submits a Lightning training job (MNIST, 2 epochs) with three tasks:
+     * train → test → export. Verifies all tasks complete, that the exported
+     * model.pt is uploaded to object storage, and that training metrics
+     * (train_loss, val_loss, val_acc, test_loss, test_acc) are logged in MLflow.
      */
     @Test
     @Order(5)
+    @SuppressWarnings("unchecked")
     void testLightningTrainingJob() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-lightning-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-py-training-job:latest")
-                .putAllParams(Map.of("epochs", "2", "batch_size", "128"))
-                .build());
+        Job submitted = client.submitJob("docker-lightning-job",
+                REGISTRY_PREFIX + "/sample-py-training-job:latest",
+                Map.of("epochs", "2", "batch_size", "128"));
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
 
         // Lightning + MNIST download + training — needs a generous timeout
-        JobStatus finalStatus = pollUntilTerminal(jobId, 300, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, finalStatus,
+        Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(300));
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus(),
                 "Lightning training job should complete successfully");
 
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
-
         // All three tasks should have completed: train, test, export
-        assertEquals(3, finalJob.getTasksCount(), "Expected 3 tasks");
-        assertEquals("train", finalJob.getTasks(0).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(0).getStatus());
-        assertEquals("test", finalJob.getTasks(1).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(1).getStatus());
-        assertEquals("export", finalJob.getTasks(2).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(2).getStatus());
+        assertEquals(3, completed.getTasksCount(), "Expected 3 tasks");
+        assertEquals("train", completed.getTasks(0).getName());
+        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(0).getStatus());
+        assertEquals("test", completed.getTasks(1).getName());
+        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(1).getStatus());
+        assertEquals("export", completed.getTasks(2).getName());
+        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(2).getStatus());
 
         // Verify model.pt was exported and uploaded
-        ListJobFilesResponse filesResponse = clientStub.listJobFiles(
-                ListJobFilesRequest.newBuilder().setJobId(jobId).build());
-        boolean hasModel = filesResponse.getFilesList().stream()
+        List<OutputFile> files = client.listJobFiles(jobId);
+        boolean hasModel = files.stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
-        assertTrue(hasModel, "Expected model.pt in output files, got: " + filesResponse.getFilesList());
+        assertTrue(hasModel, "Expected model.pt in output files, got: " + files);
+
+        // Verify MLflow experiment exists
+        ObjectMapper mapper = new ObjectMapper();
+        HttpURLConnection expConn = (HttpURLConnection) URI.create(
+                MLFLOW_URL + "/api/2.0/mlflow/experiments/get-by-name?experiment_name=mnist-lightning"
+        ).toURL().openConnection();
+        expConn.setConnectTimeout(5000);
+        expConn.setReadTimeout(5000);
+        assertEquals(200, expConn.getResponseCode(), "MLflow experiment 'mnist-lightning' should exist");
+        String expBody = new String(expConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, Object> expJson = mapper.readValue(expBody, Map.class);
+        Map<String, Object> experiment = (Map<String, Object>) expJson.get("experiment");
+        String experimentId = (String) experiment.get("experiment_id");
+        assertNotNull(experimentId, "Expected experiment_id");
+
+        // Search for runs in this experiment
+        HttpURLConnection runConn = (HttpURLConnection) URI.create(
+                MLFLOW_URL + "/api/2.0/mlflow/runs/search"
+        ).toURL().openConnection();
+        runConn.setRequestMethod("POST");
+        runConn.setRequestProperty("Content-Type", "application/json");
+        runConn.setDoOutput(true);
+        String searchBody = mapper.writeValueAsString(Map.of("experiment_ids", List.of(experimentId)));
+        try (OutputStream os = runConn.getOutputStream()) {
+            os.write(searchBody.getBytes(StandardCharsets.UTF_8));
+        }
+        assertEquals(200, runConn.getResponseCode(), "MLflow run search should succeed");
+        String runBody = new String(runConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, Object> runJson = mapper.readValue(runBody, Map.class);
+        List<Map<String, Object>> runs = (List<Map<String, Object>>) runJson.get("runs");
+        assertFalse(runs.isEmpty(), "Expected at least one MLflow run");
+
+        // Verify training metrics were logged
+        Map<String, Object> firstRun = runs.get(0);
+        Map<String, Object> data = (Map<String, Object>) firstRun.get("data");
+        List<Map<String, Object>> metrics = (List<Map<String, Object>>) data.get("metrics");
+        assertNotNull(metrics, "Expected metrics in run data");
+
+        List<String> metricKeys = new ArrayList<>();
+        for (Map<String, Object> m : metrics) {
+            metricKeys.add((String) m.get("key"));
+        }
+        for (String expected : List.of("train_loss", "val_loss", "val_acc", "test_loss", "test_acc")) {
+            assertTrue(metricKeys.contains(expected),
+                    "Expected metric '" + expected + "' in MLflow run, got: " + metricKeys);
+        }
     }
 
     @Test
     @Order(6)
     void testTaskFailureJava() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-java-failing-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-failing-job:latest")
-                .build());
+        Job submitted = client.submitJob("docker-java-failing-job",
+                REGISTRY_PREFIX + "/sample-failing-job:latest", Map.of());
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
+        Job finalJob = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_FAILED, finalJob.getStatus());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, finalJob.getFailureReason());
         assertFalse(finalJob.getErrorMessage().isEmpty(), "Expected error_message for backward compat");
 
@@ -374,19 +397,14 @@ class IntegrationTest {
     @Test
     @Order(7)
     void testTaskFailurePython() throws Exception {
-        SubmitJobResponse submitResponse = clientStub.submitJob(SubmitJobRequest.newBuilder()
-                .setName("docker-python-failing-job")
-                .setArtifactUri(REGISTRY_PREFIX + "/sample-py-failing-job:latest")
-                .build());
+        Job submitted = client.submitJob("docker-python-failing-job",
+                REGISTRY_PREFIX + "/sample-py-failing-job:latest", Map.of());
 
-        String jobId = submitResponse.getJob().getId();
+        String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
 
-        JobStatus finalStatus = pollUntilTerminal(jobId, 60, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, finalStatus);
-
-        Job finalJob = clientStub.getJobStatus(GetJobStatusRequest.newBuilder()
-                .setJobId(jobId).build()).getJob();
+        Job finalJob = client.waitForCompletion(jobId, Duration.ofSeconds(60));
+        assertEquals(JobStatus.JOB_STATUS_FAILED, finalJob.getStatus());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, finalJob.getFailureReason());
         assertFalse(finalJob.getErrorMessage().isEmpty(), "Expected error_message for backward compat");
 
@@ -423,12 +441,12 @@ class IntegrationTest {
                 .build()
                 .start();
 
-        ManagedChannel hbClientChannel = ManagedChannelBuilder
-                .forAddress("localhost", hbServer.getPort())
-                .usePlaintext()
+        SchedulerClient hbClient = SchedulerClient.builder()
+                .host("localhost")
+                .port(hbServer.getPort())
+                .deadline(Duration.ofSeconds(30))
+                .maxRetries(0)
                 .build();
-        ClientServiceGrpc.ClientServiceBlockingStub hbClientStub =
-                ClientServiceGrpc.newBlockingStub(hbClientChannel);
 
         // Worker that blocks the spawn so the job stays in-flight while we kill heartbeats
         TestableWorkerAgent hbWorker = new TestableWorkerAgent("localhost", hbServer.getPort());
@@ -440,11 +458,8 @@ class IntegrationTest {
 
         String jobId;
         try {
-            SubmitJobResponse submitResponse = hbClientStub.submitJob(SubmitJobRequest.newBuilder()
-                    .setName("heartbeat-loss-test")
-                    .setArtifactUri("test-image:latest")
-                    .build());
-            jobId = submitResponse.getJob().getId();
+            Job submitted = hbClient.submitJob("heartbeat-loss-test", "test-image:latest", Map.of());
+            jobId = submitted.getId();
 
             Thread hbWorkerThread = new Thread(hbWorker::run);
             hbWorkerThread.setDaemon(true);
@@ -453,9 +468,8 @@ class IntegrationTest {
             // Wait for the job to be claimed (status becomes STARTING)
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             while (System.nanoTime() < deadline) {
-                GetJobStatusResponse resp = hbClientStub.getJobStatus(
-                        GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-                if (resp.getJob().getStatus() != JobStatus.JOB_STATUS_QUEUED) {
+                Job polled = hbClient.getJobStatus(jobId);
+                if (polled.getStatus() != JobStatus.JOB_STATUS_QUEUED) {
                     break;
                 }
                 Thread.sleep(100);
@@ -468,9 +482,7 @@ class IntegrationTest {
             deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             Job job = null;
             while (System.nanoTime() < deadline) {
-                GetJobStatusResponse resp = hbClientStub.getJobStatus(
-                        GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-                job = resp.getJob();
+                job = hbClient.getJobStatus(jobId);
                 if (job.getStatus() == JobStatus.JOB_STATUS_FAILED) {
                     break;
                 }
@@ -489,7 +501,7 @@ class IntegrationTest {
             hbWorkerThread.join(5000);
         } finally {
             hbWorkerHandler.shutdownHeartbeatMonitor();
-            hbClientChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            hbClient.close();
             hbServer.shutdown().awaitTermination(5, TimeUnit.SECONDS);
         }
     }
@@ -507,7 +519,7 @@ class IntegrationTest {
         private volatile SpawnBehavior spawnBehavior;
 
         TestableWorkerAgent(String coordinatorHost, int coordinatorPort) throws IOException {
-            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10));
+            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10), null, null);
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {
@@ -564,68 +576,57 @@ class IntegrationTest {
                 "sample-failing-job JAR not found at " + failingJobJar + " — run 'mvn package -pl sample-failing-job -am' in the SDK repo first");
     }
 
-    private static void startRegistry() throws Exception {
-        registryContainerName = "test-registry-" + ProcessHandle.current().pid();
-        runCommand("docker", "run", "-d", "-p", "5000:5000", "--name", registryContainerName, "registry:2");
+    private static void startComposeStack() throws Exception {
+        log.info("Starting docker-compose stack from {}", COMPOSE_FILE.toAbsolutePath());
+        runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(), "up", "-d");
 
-        // Wait for registry to be ready
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() < deadline) {
-            try {
-                HttpURLConnection conn = (HttpURLConnection) URI.create("http://localhost:5000/v2/").toURL().openConnection();
-                conn.setConnectTimeout(1000);
-                conn.setReadTimeout(1000);
-                if (conn.getResponseCode() == 200) {
-                    log.info("Registry ready at localhost:5000");
-                    return;
-                }
-            } catch (IOException ignored) {
-            }
-            Thread.sleep(500);
-        }
-        fail("Registry did not become ready within 30 seconds");
+        boolean minioReady = pollUrl(MINIO_URL + "/minio/health/ready", 60);
+        assertTrue(minioReady, "MinIO did not become ready");
+
+        // MLflow installs psycopg2-binary + boto3 on first start
+        boolean mlflowReady = pollUrl(MLFLOW_URL + "/health", 120);
+        assertTrue(mlflowReady, "MLflow did not become ready");
+
+        log.info("Docker-compose stack ready");
     }
 
-    private static void startMinIO() throws Exception {
-        minioContainerName = "test-minio-" + ProcessHandle.current().pid();
-        runCommand("docker", "run", "-d", "-p", "0:9000", "--name", minioContainerName,
-                "-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin",
-                "minio/minio", "server", "/data");
-
-        int minioPort = parseHostPort(minioContainerName, 9000);
-        log.info("MinIO container started on port {}", minioPort);
-
-        // Poll until MinIO is ready
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() < deadline) {
-            try {
-                HttpURLConnection conn = (HttpURLConnection) URI.create(
-                        "http://localhost:" + minioPort + "/minio/health/ready").toURL().openConnection();
-                conn.setConnectTimeout(1000);
-                conn.setReadTimeout(1000);
-                if (conn.getResponseCode() == 200) {
-                    log.info("MinIO ready at localhost:{}", minioPort);
-                    break;
-                }
-            } catch (IOException ignored) {
-            }
-            if (System.nanoTime() >= deadline) {
-                fail("MinIO did not become ready within 30 seconds");
-            }
-            Thread.sleep(500);
+    private static void stopComposeStack() {
+        try {
+            runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(), "down", "-v");
+        } catch (Exception e) {
+            log.warn("Failed to stop compose stack: {}", e.getMessage());
         }
+    }
 
+    private static void startRegistry() throws Exception {
+        registryContainerName = "test-registry-" + ProcessHandle.current().pid();
+        runCommand("docker", "run", "-d", "-p", "5050:5000",
+                "--network", "scheduler-net",
+                "--name", registryContainerName, "registry:2");
+
+        boolean ready = pollUrl("http://localhost:5050/v2/", 30);
+        assertTrue(ready, "Registry did not become ready");
+        log.info("Registry ready at localhost:5050");
+    }
+
+    private static void createSchedulerBucket() {
         S3Client s3 = S3Client.builder()
-                .endpointOverride(URI.create("http://localhost:" + minioPort))
+                .endpointOverride(URI.create(MINIO_URL))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create("minioadmin", "minioadmin")))
                 .region(Region.US_EAST_1)
                 .forcePathStyle(true)
                 .build();
 
-        s3.createBucket(CreateBucketRequest.builder().bucket("scheduler").build());
+        // minio-init in docker-compose may have already created the bucket
+        try {
+            s3.createBucket(CreateBucketRequest.builder().bucket("scheduler").build());
+            log.info("Created 'scheduler' bucket");
+        } catch (Exception e) {
+            log.info("Bucket 'scheduler' already exists: {}", e.getMessage());
+        }
+
         objectStore = new ObjectStore(s3, "scheduler");
-        log.info("Created 'scheduler' bucket in MinIO");
     }
 
     /**
@@ -707,15 +708,16 @@ class IntegrationTest {
                 .build()
                 .start();
 
-        clientChannel = ManagedChannelBuilder
-                .forAddress("localhost", coordinatorServer.getPort())
-                .usePlaintext()
+        client = SchedulerClient.builder()
+                .host("localhost")
+                .port(coordinatorServer.getPort())
+                .deadline(Duration.ofSeconds(30))
+                .maxRetries(0)
                 .build();
-        clientStub = ClientServiceGrpc.newBlockingStub(clientChannel);
 
         // hostname = host.docker.internal so containers can POST status back to the host
         workerAgent = new WorkerAgent("localhost", coordinatorServer.getPort(), "host.docker.internal", 1,
-                objectStore, Duration.ofSeconds(120));
+                objectStore, Duration.ofSeconds(120), "scheduler-net", "http://mlflow:5000");
         workerThread = new Thread(workerAgent::run);
         workerThread.start();
     }
@@ -735,8 +737,8 @@ class IntegrationTest {
 
     private static void shutdownCoordinator() {
         try {
-            if (clientChannel != null) {
-                clientChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            if (client != null) {
+                client.close();
             }
             if (coordinatorServer != null) {
                 coordinatorServer.shutdown().awaitTermination(5, TimeUnit.SECONDS);
@@ -749,12 +751,6 @@ class IntegrationTest {
     private static void removeJobContainers() {
         for (String name : jobContainerNames) {
             runQuietly("docker", "rm", "-f", "-v", name);
-        }
-    }
-
-    private static void removeMinIO() {
-        if (minioContainerName != null) {
-            runQuietly("docker", "rm", "-f", "-v", minioContainerName);
         }
     }
 
@@ -784,9 +780,12 @@ class IntegrationTest {
             runQuietly("docker", "rmi", "-f", image);
         }
 
-        // Infrastructure images
+        // Infrastructure images (registry is standalone, the rest are from docker-compose)
         runQuietly("docker", "rmi", "-f", "registry:2");
         runQuietly("docker", "rmi", "-f", "minio/minio");
+        runQuietly("docker", "rmi", "-f", "minio/mc");
+        runQuietly("docker", "rmi", "-f", "postgres:16");
+        runQuietly("docker", "rmi", "-f", "ghcr.io/mlflow/mlflow:v2.16.0");
 
         // Prune dangling images (intermediate build layers)
         runQuietly("docker", "image", "prune", "-f");
@@ -794,34 +793,13 @@ class IntegrationTest {
 
     // -- polling --
 
-    private JobStatus pollUntilTerminal(String jobId, long timeout, TimeUnit unit) throws InterruptedException {
-        long deadline = System.nanoTime() + unit.toNanos(timeout);
-        JobStatus status = JobStatus.JOB_STATUS_UNSPECIFIED;
-
-        while (System.nanoTime() < deadline) {
-            GetJobStatusResponse response = clientStub.getJobStatus(
-                    GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-            status = response.getJob().getStatus();
-
-            if (status == JobStatus.JOB_STATUS_COMPLETED || status == JobStatus.JOB_STATUS_FAILED
-                    || status == JobStatus.JOB_STATUS_KILLED) {
-                return status;
-            }
-            Thread.sleep(500);
-        }
-
-        fail("Job did not reach terminal status within timeout. Last status: " + status);
-        return status;
-    }
-
     private void pollUntilRunning(String jobId, long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
         JobStatus status = JobStatus.JOB_STATUS_UNSPECIFIED;
 
         while (System.nanoTime() < deadline) {
-            GetJobStatusResponse response = clientStub.getJobStatus(
-                    GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-            status = response.getJob().getStatus();
+            Job job = client.getJobStatus(jobId);
+            status = job.getStatus();
 
             if (status == JobStatus.JOB_STATUS_RUNNING) {
                 return;
@@ -855,6 +833,28 @@ class IntegrationTest {
         }
 
         fail("Inference server did not become healthy within timeout");
+    }
+
+    // -- URL polling helpers (used by startComposeStack / startRegistry) --
+
+    private static boolean pollUrl(String url, int timeoutSeconds) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        while (System.nanoTime() < deadline) {
+            try {
+                if (httpGet(url) == 200) return true;
+            } catch (Exception ignored) {
+            }
+            try { Thread.sleep(1000); } catch (InterruptedException e) { return false; }
+        }
+        return false;
+    }
+
+    private static int httpGet(String url) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        conn.setConnectTimeout(2000);
+        conn.setReadTimeout(2000);
+        conn.setRequestMethod("GET");
+        return conn.getResponseCode();
     }
 
     // -- command helpers --
