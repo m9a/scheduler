@@ -9,6 +9,9 @@ target/
 *.iml
 *.ipr
 
+### Maven Shade ###
+dependency-reduced-pom.xml
+
 ### Claude ###
 CLAUDE.md
 
