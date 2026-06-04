@@ -449,7 +449,7 @@ class IntegrationTest {
                 .build();
 
         // Worker that blocks the spawn so the job stays in-flight while we kill heartbeats
-        TestableWorkerAgent hbWorker = new TestableWorkerAgent("localhost", hbServer.getPort());
+        TestableWorkerAgent hbWorker = new TestableWorkerAgent(testConfig(hbServer.getPort()));
         CountDownLatch spawnBlocked = new CountDownLatch(1);
         hbWorker.setSpawnBehavior((details, url) -> {
             spawnBlocked.await();
@@ -518,8 +518,8 @@ class IntegrationTest {
     static class TestableWorkerAgent extends WorkerAgent {
         private volatile SpawnBehavior spawnBehavior;
 
-        TestableWorkerAgent(String coordinatorHost, int coordinatorPort) throws IOException {
-            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10), null, null);
+        TestableWorkerAgent(WorkerConfig config) throws IOException {
+            super(config, null, Duration.ofSeconds(10));
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {
@@ -716,8 +716,11 @@ class IntegrationTest {
                 .build();
 
         // hostname = host.docker.internal so containers can POST status back to the host
-        workerAgent = new WorkerAgent("localhost", coordinatorServer.getPort(), "host.docker.internal", 1,
-                objectStore, Duration.ofSeconds(120), "scheduler-net", "http://mlflow:5000");
+        WorkerConfig workerConfig = testConfig(coordinatorServer.getPort());
+        workerConfig.getWorker().setHostname("host.docker.internal");
+        workerConfig.getDocker().setNetwork("scheduler-net");
+        workerConfig.getMlflow().setTrackingUri("http://mlflow:5000");
+        workerAgent = new WorkerAgent(workerConfig, objectStore, Duration.ofSeconds(120));
         workerThread = new Thread(workerAgent::run);
         workerThread.start();
     }
@@ -789,6 +792,14 @@ class IntegrationTest {
 
         // Prune dangling images (intermediate build layers)
         runQuietly("docker", "image", "prune", "-f");
+    }
+
+    // -- config --
+
+    private static WorkerConfig testConfig(int coordinatorPort) {
+        WorkerConfig config = WorkerConfig.defaults();
+        config.getCoordinator().setPort(coordinatorPort);
+        return config;
     }
 
     // -- polling --

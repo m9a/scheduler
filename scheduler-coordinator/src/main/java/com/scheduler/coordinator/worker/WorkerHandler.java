@@ -7,6 +7,8 @@ import com.scheduler.core.JobState;
 import com.scheduler.core.JobStatus;
 import com.scheduler.core.TaskStatus;
 import com.scheduler.core.WorkerInfo;
+
+import java.util.HashSet;
 import com.scheduler.coordinator.JobManagerImpl;
 import com.scheduler.proto.coordinator.*;
 import com.scheduler.proto.job.StatusUpdate;
@@ -55,6 +57,9 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                 workerId,
                 request.getHostname(),
                 request.getCapacity(),
+                request.getMemoryMb(),
+                request.getCpuCores(),
+                new HashSet<>(request.getCapabilitiesList()),
                 Instant.now(),
                 Instant.now()
         );
@@ -69,7 +74,15 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void pullJob(PullJobRequest request, StreamObserver<PullJobResponse> responseObserver) {
         log.info("Received pullJob from workerId={}", request.getWorkerId());
-        Optional<JobState> claimed = jobManager.claimNextJob(request.getWorkerId());
+        WorkerInfo worker = workers.get(request.getWorkerId());
+        if (worker == null) {
+            log.warn("Unknown workerId={} in pullJob", request.getWorkerId());
+            responseObserver.onNext(PullJobResponse.getDefaultInstance());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        Optional<JobState> claimed = jobManager.claimNextJob(worker);
 
         PullJobResponse.Builder builder = PullJobResponse.newBuilder();
         if (claimed.isPresent()) {

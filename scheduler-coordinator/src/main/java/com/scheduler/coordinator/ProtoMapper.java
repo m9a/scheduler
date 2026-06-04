@@ -5,10 +5,12 @@ import com.scheduler.core.InputFile;
 import com.scheduler.core.Job;
 import com.scheduler.core.JobState;
 import com.scheduler.core.JobStatus;
+import com.scheduler.core.ResourceRequirements;
 import com.scheduler.core.TaskState;
 import com.scheduler.core.TaskStatus;
 import com.scheduler.proto.v1.SubmitJobRequest;
 
+import java.util.HashSet;
 import java.util.List;
 
 public final class ProtoMapper {
@@ -21,7 +23,8 @@ public final class ProtoMapper {
                 request.getArtifactUri(),
                 request.getParamsMap(),
                 request.getPriority(),
-                resolvedInputFiles
+                resolvedInputFiles,
+                toDomain(request.getResources())
         );
     }
 
@@ -37,7 +40,8 @@ public final class ProtoMapper {
                 .addAllInputFiles(execution.job().inputFiles().stream()
                         .map(f -> com.scheduler.proto.v1.InputFile.newBuilder()
                                 .setName(f.name()).setUri(f.uri()).build())
-                        .toList());
+                        .toList())
+                .setResources(toProto(execution.job().resources()));
 
         if (execution.createdAt() != null) {
             builder.setCreatedAtMillis(execution.createdAt().toEpochMilli());
@@ -128,5 +132,24 @@ public final class ProtoMapper {
             case FAILURE_REASON_PROCESS_START_FAILED -> FailureReason.PROCESS_START_FAILED;
             default -> throw new IllegalArgumentException("Unknown failure reason: " + reason);
         };
+    }
+
+    public static ResourceRequirements toDomain(com.scheduler.proto.v1.ResourceRequirements proto) {
+        if (proto == null || proto.equals(com.scheduler.proto.v1.ResourceRequirements.getDefaultInstance())) {
+            return ResourceRequirements.NONE;
+        }
+        return new ResourceRequirements(
+                proto.getMemoryMb(),
+                proto.getCpuCores(),
+                new HashSet<>(proto.getCapabilitiesList())
+        );
+    }
+
+    public static com.scheduler.proto.v1.ResourceRequirements toProto(ResourceRequirements domain) {
+        return com.scheduler.proto.v1.ResourceRequirements.newBuilder()
+                .setMemoryMb(domain.memoryMb())
+                .setCpuCores(domain.cpuCores())
+                .addAllCapabilities(domain.capabilities())
+                .build();
     }
 }

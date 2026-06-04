@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -85,6 +86,9 @@ public class WorkerAgent implements AutoCloseable {
 
     private final String hostname;
     private final int capacity;
+    private final int memoryMb;
+    private final int cpuCores;
+    private final Set<String> capabilities;
     private final Duration jobExecutionTimeout;
     private final String dockerNetwork;
     private final String mlflowTrackingUri;
@@ -92,7 +96,18 @@ public class WorkerAgent implements AutoCloseable {
     private String workerId;
     private ScheduledExecutorService heartbeatExecutor;
 
+    public WorkerAgent(WorkerConfig config, ObjectStore objectStore,
+                       Duration jobExecutionTimeout) throws IOException {
+        this(config.getCoordinator().getHost(), config.getCoordinator().getPort(),
+                config.getWorker().getHostname(), config.getWorker().getCapacity(),
+                config.getWorker().getMemoryMb(), config.getWorker().getCpuCores(),
+                config.getWorker().getCapabilities(),
+                objectStore, jobExecutionTimeout,
+                config.getDocker().getNetwork(), config.getMlflow().getTrackingUri());
+    }
+
     public WorkerAgent(String coordinatorHost, int coordinatorPort, String hostname, int capacity,
+                       int memoryMb, int cpuCores, Set<String> capabilities,
                        ObjectStore objectStore, Duration jobExecutionTimeout,
                        String dockerNetwork, String mlflowTrackingUri) throws IOException {
         this.channel = ManagedChannelBuilder.forAddress(coordinatorHost, coordinatorPort)
@@ -102,6 +117,9 @@ public class WorkerAgent implements AutoCloseable {
         this.asyncStub = WorkerServiceGrpc.newStub(channel);
         this.hostname = hostname;
         this.capacity = capacity;
+        this.memoryMb = memoryMb;
+        this.cpuCores = cpuCores;
+        this.capabilities = capabilities;
         this.objectStore = objectStore;
         this.jobExecutionTimeout = jobExecutionTimeout;
         this.dockerNetwork = dockerNetwork;
@@ -121,8 +139,8 @@ public class WorkerAgent implements AutoCloseable {
 
     public WorkerAgent(String coordinatorHost, int coordinatorPort, String hostname, int capacity,
                        ObjectStore objectStore) throws IOException {
-        this(coordinatorHost, coordinatorPort, hostname, capacity, objectStore,
-                DEFAULT_JOB_EXECUTION_TIMEOUT, null, null);
+        this(coordinatorHost, coordinatorPort, hostname, capacity,
+                0, 0, Set.of(), objectStore, DEFAULT_JOB_EXECUTION_TIMEOUT, null, null);
     }
 
     /**
@@ -189,10 +207,14 @@ public class WorkerAgent implements AutoCloseable {
             onStatusUpdate(updateHandler);
 
             ExecutionPayload executionPayload = new ExecutionPayload(workerAgentUrl(), job.getId(), job.getParamsMap());
+            int jobMemoryMb = job.hasResources() ? job.getResources().getMemoryMb() : 0;
+            int jobCpuCores = job.hasResources() ? job.getResources().getCpuCores() : 0;
             JobDetails details = new JobDetails(
                     job.getId(),
                     job.getArtifactUri(),
-                    executionPayload.encode()
+                    executionPayload.encode(),
+                    jobMemoryMb,
+                    jobCpuCores
             );
 
             Path logFile = Path.of("/tmp/jobs", job.getId(), "stdout.log");
@@ -367,6 +389,15 @@ public class WorkerAgent implements AutoCloseable {
             command.add("0:" + containerPort);
         }
 
+        if (details.memoryMb() > 0) {
+            command.add("--memory");
+            command.add(details.memoryMb() + "m");
+        }
+        if (details.cpuCores() > 0) {
+            command.add("--cpus");
+            command.add(String.valueOf(details.cpuCores()));
+        }
+
         command.add("-e");
         command.add("EXECUTION_PAYLOAD=" + details.payload());
 
@@ -536,10 +567,14 @@ public class WorkerAgent implements AutoCloseable {
     // ── outbound: gRPC to coordinator ────────────────────────────────────────
 
     public String register(String hostname, int capacity) {
-        log.info("Registering with coordinator: hostname={}, capacity={}", hostname, capacity);
+        log.info("Registering with coordinator: hostname={}, capacity={}, memoryMb={}, cpuCores={}, capabilities={}",
+                hostname, capacity, memoryMb, cpuCores, capabilities);
         RegisterWorkerResponse response = blockingStub.registerWorker(RegisterWorkerRequest.newBuilder()
                 .setHostname(hostname)
                 .setCapacity(capacity)
+                .setMemoryMb(memoryMb)
+                .setCpuCores(cpuCores)
+                .addAllCapabilities(capabilities)
                 .build());
         log.info("Registered with coordinator: workerId={}", response.getWorkerId());
         return response.getWorkerId();
@@ -632,18 +667,18 @@ public class WorkerAgent implements AutoCloseable {
     }
 
     public static void main(String[] args) throws IOException {
-        String coordinatorHost = args.length > 0 ? args[0] : "localhost";
-        int coordinatorPort = args.length > 1 ? Integer.parseInt(args[1]) : 9090;
-        String hostname = args.length > 2 ? args[2] : "localhost";
-        int capacity = args.length > 3 ? Integer.parseInt(args[3]) : 1;
+        WorkerConfig config;
+        if (args.length > 0 && args[0].equals("--config") && args.length > 1) {
+            config = WorkerConfig.load(Path.of(args[1]));
+            log.info("Loaded config from {}", args[1]);
+        } else {
+            config = WorkerConfig.defaults();
+            log.info("No --config provided, using defaults");
+        }
 
-        String dockerNetwork = System.getProperty("docker.network");
-        String mlflowTrackingUri = System.getProperty("mlflow.trackingUri");
+        ObjectStore objectStore = createObjectStore(config.getMinio());
 
-        ObjectStore objectStore = createObjectStore();
-
-        WorkerAgent agent = new WorkerAgent(coordinatorHost, coordinatorPort, hostname, capacity,
-                objectStore, DEFAULT_JOB_EXECUTION_TIMEOUT, dockerNetwork, mlflowTrackingUri);
+        WorkerAgent agent = new WorkerAgent(config, objectStore, DEFAULT_JOB_EXECUTION_TIMEOUT);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutting down worker");
             try {
@@ -656,20 +691,15 @@ public class WorkerAgent implements AutoCloseable {
         agent.run();
     }
 
-    private static ObjectStore createObjectStore() {
-        String endpoint = System.getProperty("minio.endpoint", "http://localhost:9000");
-        String accessKey = System.getProperty("minio.accessKey", "minioadmin");
-        String secretKey = System.getProperty("minio.secretKey", "minioadmin");
-        String bucket = System.getProperty("minio.bucket", "scheduler");
-
+    private static ObjectStore createObjectStore(WorkerConfig.Minio minio) {
         S3Client s3 = S3Client.builder()
-                .endpointOverride(URI.create(endpoint))
+                .endpointOverride(URI.create(minio.getEndpoint()))
                 .credentialsProvider(StaticCredentialsProvider.create(
-                        AwsBasicCredentials.create(accessKey, secretKey)))
+                        AwsBasicCredentials.create(minio.getAccessKey(), minio.getSecretKey())))
                 .region(Region.US_EAST_1)
                 .forcePathStyle(true)
                 .build();
 
-        return new ObjectStore(s3, bucket);
+        return new ObjectStore(s3, minio.getBucket());
     }
 }

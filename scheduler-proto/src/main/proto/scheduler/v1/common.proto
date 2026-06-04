@@ -59,6 +59,7 @@ message Job {
   repeated InputFile input_files = 13;
   FailureReason failure_reason = 14;
   string failure_detail = 15;
+  ResourceRequirements resources = 16;
 }
 
 message InputFile {
@@ -77,4 +78,10 @@ message OutputFile {
 message FileHeader {
   string name = 1;
   int64 size_bytes = 2;
+}
+
+message ResourceRequirements {
+  int32 memory_mb = 1;
+  int32 cpu_cores = 2;
+  repeated string capabilities = 3;
 }

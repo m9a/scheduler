@@ -5,7 +5,9 @@ import com.scheduler.core.exception.JobNotFoundException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -51,7 +53,7 @@ class JobManagerImplTest {
         Job job = new Job("test-job", "my-job:latest", null, 0);
         jobManager.submit("job-1", job);
 
-        Optional<JobState> claimed = jobManager.claimNextJob("worker-1");
+        Optional<JobState> claimed = jobManager.claimNextJob(DEFAULT_WORKER);
 
         assertTrue(claimed.isPresent());
         assertEquals(JobStatus.STARTING, claimed.get().status());
@@ -59,7 +61,7 @@ class JobManagerImplTest {
 
     @Test
     void claimNextJobEmpty() {
-        Optional<JobState> claimed = jobManager.claimNextJob("worker-1");
+        Optional<JobState> claimed = jobManager.claimNextJob(DEFAULT_WORKER);
 
         assertTrue(claimed.isEmpty());
     }
@@ -226,8 +228,8 @@ class JobManagerImplTest {
         Job job2 = new Job("job-b", "img:latest", null, 0);
         jobManager.submit("id-a", job1);
         jobManager.submit("id-b", job2);
-        jobManager.claimNextJob("worker-1");
-        jobManager.claimNextJob("worker-1");
+        jobManager.claimNextJob(DEFAULT_WORKER);
+        jobManager.claimNextJob(DEFAULT_WORKER);
 
         // Move one to RUNNING
         jobManager.handleStatusUpdate("id-b", JobStatus.RUNNING, null, null,
@@ -240,9 +242,67 @@ class JobManagerImplTest {
         assertEquals(JobStatus.FAILED, jobManager.getJob("id-b").status());
     }
 
+    @Test
+    void testClaimMatchesCapabilities() {
+        Job job = new Job("gpu-job", "img:latest", null, 0, null,
+                new ResourceRequirements(0, 0, Set.of("gpu")));
+        jobManager.submit("job-gpu", job);
+
+        WorkerInfo gpuWorker = worker("gpu-worker", 0, 0, Set.of("gpu"));
+        Optional<JobState> claimed = jobManager.claimNextJob(gpuWorker);
+
+        assertTrue(claimed.isPresent());
+        assertEquals("job-gpu", claimed.get().id());
+    }
+
+    @Test
+    void testClaimSkipsUnmatchedCapabilities() {
+        Job gpuJob = new Job("gpu-job", "img:latest", null, 0, null,
+                new ResourceRequirements(0, 0, Set.of("gpu")));
+        Job cpuJob = new Job("cpu-job", "img:latest", null, 0);
+        jobManager.submit("job-gpu", gpuJob);
+        jobManager.submit("job-cpu", cpuJob);
+
+        WorkerInfo cpuWorker = worker("cpu-worker", 0, 0, Set.of());
+        Optional<JobState> claimed = jobManager.claimNextJob(cpuWorker);
+
+        assertTrue(claimed.isPresent());
+        assertEquals("job-cpu", claimed.get().id());
+    }
+
+    @Test
+    void testClaimNoRequirementsMatchesAny() {
+        Job job = new Job("any-job", "img:latest", null, 0);
+        jobManager.submit("job-any", job);
+
+        WorkerInfo worker = worker("w", 0, 0, Set.of());
+        Optional<JobState> claimed = jobManager.claimNextJob(worker);
+
+        assertTrue(claimed.isPresent());
+    }
+
+    @Test
+    void testClaimMemoryInsufficient() {
+        Job job = new Job("big-job", "img:latest", null, 0, null,
+                new ResourceRequirements(4096, 0, Set.of()));
+        jobManager.submit("job-big", job);
+
+        WorkerInfo smallWorker = worker("small", 2048, 0, Set.of());
+        Optional<JobState> claimed = jobManager.claimNextJob(smallWorker);
+
+        assertTrue(claimed.isEmpty());
+    }
+
+    private static WorkerInfo worker(String id, int memoryMb, int cpuCores, Set<String> capabilities) {
+        return new WorkerInfo(id, "localhost", 1, memoryMb, cpuCores, capabilities,
+                Instant.now(), Instant.now());
+    }
+
+    private static final WorkerInfo DEFAULT_WORKER = worker("worker-1", 0, 0, Set.of());
+
     private JobState submitAndClaim(String name) {
         Job job = new Job(name, "my-job:latest", null, 0);
         jobManager.submit("job-" + name, job);
-        return jobManager.claimNextJob("worker-1").orElseThrow();
+        return jobManager.claimNextJob(DEFAULT_WORKER).orElseThrow();
     }
 }
