@@ -9,7 +9,8 @@ public record Job(
         String artifactUri,
         Map<String, String> params,
         int priority,
-        List<InputFile> inputFiles
+        List<InputFile> inputFiles,
+        ResourceRequirements resources
 ) {
 
     public Job {
@@ -21,9 +22,17 @@ public record Job(
         if (inputFiles == null) {
             inputFiles = List.of();
         }
+        if (resources == null) {
+            resources = ResourceRequirements.NONE;
+        }
+    }
+
+    public Job(String name, String artifactUri, Map<String, String> params, int priority,
+               List<InputFile> inputFiles) {
+        this(name, artifactUri, params, priority, inputFiles, ResourceRequirements.NONE);
     }
 
     public Job(String name, String artifactUri, Map<String, String> params, int priority) {
-        this(name, artifactUri, params, priority, List.of());
+        this(name, artifactUri, params, priority, List.of(), ResourceRequirements.NONE);
     }
 }

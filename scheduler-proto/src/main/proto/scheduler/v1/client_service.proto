@@ -18,6 +18,7 @@ message SubmitJobRequest {
   int32 priority = 5;
   repeated InputFile input_files = 6;
   reserved 7;
+  scheduler.v1.ResourceRequirements resources = 8;
 }
 
 message SubmitJobResponse {

@@ -42,8 +42,8 @@ class WorkerJobLifecycleTest {
     static class TestableWorkerAgent extends WorkerAgent {
         private volatile SpawnBehavior spawnBehavior;
 
-        TestableWorkerAgent(String coordinatorHost, int coordinatorPort) throws IOException {
-            super(coordinatorHost, coordinatorPort, "localhost", 1, null, Duration.ofSeconds(10), null, null);
+        TestableWorkerAgent(WorkerConfig config) throws IOException {
+            super(config, null, Duration.ofSeconds(10));
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {
@@ -79,7 +79,7 @@ class WorkerJobLifecycleTest {
                 .build();
         clientStub = ClientServiceGrpc.newBlockingStub(clientChannel);
 
-        worker = new TestableWorkerAgent("localhost", server.getPort());
+        worker = new TestableWorkerAgent(testConfig(server.getPort()));
     }
 
     @AfterEach
@@ -199,7 +199,7 @@ class WorkerJobLifecycleTest {
                 .build();
         clientStub = ClientServiceGrpc.newBlockingStub(clientChannel);
 
-        worker = new TestableWorkerAgent("localhost", server.getPort());
+        worker = new TestableWorkerAgent(testConfig(server.getPort()));
 
         // Block the spawn so the job stays in-flight while we kill the worker
         CountDownLatch spawnBlocked = new CountDownLatch(1);
@@ -238,7 +238,7 @@ class WorkerJobLifecycleTest {
         workerThread.join(5000);
 
         // Recreate worker so tearDown doesn't NPE
-        worker = new TestableWorkerAgent("localhost", server.getPort());
+        worker = new TestableWorkerAgent(testConfig(server.getPort()));
         worker.setSpawnBehavior((details, url) -> 0);
         workerThread = null;
 
@@ -268,6 +268,12 @@ class WorkerJobLifecycleTest {
     }
 
     // -- helpers --
+
+    private static WorkerConfig testConfig(int coordinatorPort) {
+        WorkerConfig config = WorkerConfig.defaults();
+        config.getCoordinator().setPort(coordinatorPort);
+        return config;
+    }
 
     private String submitJob(String name) {
         SubmitJobResponse response = clientStub.submitJob(SubmitJobRequest.newBuilder()

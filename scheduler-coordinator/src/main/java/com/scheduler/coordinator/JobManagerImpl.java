@@ -7,12 +7,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Passive state store for job lifecycle. The worker owns the full job lifecycle
@@ -31,9 +32,10 @@ public class JobManagerImpl {
     // handleStatusUpdate() (status changes), and failJobsForWorker() (status → FAILED).
     private final ConcurrentHashMap<String, JobState> jobs = new ConcurrentHashMap<>();
 
-    // FIFO of job IDs waiting to be claimed. submit() enqueues, claimNextJob() dequeues.
-    // Once polled, a job never re-enters the queue.
-    private final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
+    // Job IDs waiting to be claimed, in submission order. submit() appends,
+    // claimNextJob() iterates to find the first job the worker can satisfy.
+    // Guarded by synchronized(this) — all mutating methods are synchronized.
+    private final LinkedList<String> queue = new LinkedList<>();
 
     // Maps jobId → workerId for all in-flight (non-terminal) jobs.
     // claimNextJob() inserts, handleStatusUpdate() and failJobsForWorker() remove
@@ -42,7 +44,7 @@ public class JobManagerImpl {
     private final ConcurrentHashMap<String, String> jobWorker = new ConcurrentHashMap<>();
 
 
-    public JobState submit(String jobId, Job job) {
+    public synchronized JobState submit(String jobId, Job job) {
         JobState execution = new JobState(
                 jobId,
                 job,
@@ -67,25 +69,37 @@ public class JobManagerImpl {
     }
 
 
-    public Optional<JobState> claimNextJob(String workerId) {
-        String jobId = queue.poll();
-        if (jobId == null) {
-            return Optional.empty();
-        }
+    // TODO: future enhancements for scheduling:
+    //  - Priority queue: use job.priority (stored but currently ignored) to order within the queue
+    //  - Bin packing: prefer workers with smallest sufficient resources
+    //  - CPU/GPU affinity: pin containers to specific cores/devices via --cpuset-cpus / --gpus
+    //  - Fair-share scheduling: per-user/team quotas to prevent starvation
+    //  - Preemption: high-priority jobs evict lower-priority running jobs
+    //  - Resource accounting: track in-use vs available per worker for concurrent execution
+    //  - Auto-scaling: spin up/down workers based on queue depth and demand
+    //  - Coordinator concurrency review: evaluate finer-grained locking for high worker/job counts
+    //  - Microbenchmarks: JMH benchmarks for claimNextJob, handleStatusUpdate, submit
+    //  - Worker/job health checks with retry and backoff
 
-        JobState job = jobs.get(jobId);
-        if (job == null) {
-            throw new IllegalStateException("Job %s in queue but not in map".formatted(jobId));
+    public synchronized Optional<JobState> claimNextJob(WorkerInfo worker) {
+        Iterator<String> it = queue.iterator();
+        while (it.hasNext()) {
+            String jobId = it.next();
+            JobState job = jobs.get(jobId);
+            if (job == null || job.status() != JobStatus.QUEUED) {
+                it.remove();
+                continue;
+            }
+            ResourceRequirements req = job.job().resources();
+            if (req.satisfiedBy(worker.memoryMb(), worker.cpuCores(), worker.capabilities())) {
+                it.remove();
+                JobState claimed = job.claim();
+                jobs.put(jobId, claimed);
+                jobWorker.put(jobId, worker.id());
+                return Optional.of(claimed);
+            }
         }
-        if (job.status() != JobStatus.QUEUED) {
-            throw new IllegalStateException(
-                    "Job %s in queue but has status %s".formatted(jobId, job.status()));
-        }
-
-        JobState claimed = job.claim();
-        jobs.put(jobId, claimed);
-        jobWorker.put(jobId, workerId);
-        return Optional.of(claimed);
+        return Optional.empty();
     }
 
 

@@ -9,11 +9,17 @@ import java.util.Objects;
 record JobDetails(
         String jobId,
         String artifactUri,
-        String payload
+        String payload,
+        int memoryMb,
+        int cpuCores
 ) {
 
     public JobDetails {
         Objects.requireNonNull(jobId);
         Objects.requireNonNull(artifactUri);
+    }
+
+    JobDetails(String jobId, String artifactUri, String payload) {
+        this(jobId, artifactUri, payload, 0, 0);
     }
 }
