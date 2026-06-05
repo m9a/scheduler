@@ -269,8 +269,10 @@ class WorkerJobLifecycleTest {
 
     // -- helpers --
 
-    private static WorkerConfig testConfig(int coordinatorPort) {
-        WorkerConfig config = WorkerConfig.defaults();
+    private static WorkerConfig testConfig(int coordinatorPort) throws IOException {
+        Path configPath = Path.of(WorkerJobLifecycleTest.class.getClassLoader()
+                .getResource("config.yaml").getPath());
+        WorkerConfig config = WorkerConfig.load(configPath);
         config.getCoordinator().setPort(coordinatorPort);
         return config;
     }

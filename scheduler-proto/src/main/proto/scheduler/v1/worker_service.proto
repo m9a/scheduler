@@ -10,9 +10,9 @@ import "scheduler/v1/job_message.proto";
 
 message RegisterWorkerRequest {
   string hostname = 1;
-  int32 capacity = 2;
-  int32 memory_mb = 3;
-  int32 cpu_cores = 4;
+  int32 memory_mb = 2;
+  int32 cpu_cores = 3;
+  bool gpu = 4;
   repeated string capabilities = 5;
 }
 

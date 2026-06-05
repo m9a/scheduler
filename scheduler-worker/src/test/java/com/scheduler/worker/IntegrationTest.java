@@ -717,7 +717,7 @@ class IntegrationTest {
 
         // hostname = host.docker.internal so containers can POST status back to the host
         WorkerConfig workerConfig = testConfig(coordinatorServer.getPort());
-        workerConfig.getWorker().setHostname("host.docker.internal");
+        workerConfig.setHostname("host.docker.internal");
         workerConfig.getDocker().setNetwork("scheduler-net");
         workerConfig.getMlflow().setTrackingUri("http://mlflow:5000");
         workerAgent = new WorkerAgent(workerConfig, objectStore, Duration.ofSeconds(120));
@@ -796,8 +796,10 @@ class IntegrationTest {
 
     // -- config --
 
-    private static WorkerConfig testConfig(int coordinatorPort) {
-        WorkerConfig config = WorkerConfig.defaults();
+    private static WorkerConfig testConfig(int coordinatorPort) throws IOException {
+        Path configPath = Path.of(IntegrationTest.class.getClassLoader()
+                .getResource("config.yaml").getPath());
+        WorkerConfig config = WorkerConfig.load(configPath);
         config.getCoordinator().setPort(coordinatorPort);
         return config;
     }

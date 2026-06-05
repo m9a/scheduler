@@ -7,9 +7,9 @@ import java.util.Set;
 public record WorkerInfo(
         String id,
         String hostname,
-        int capacity,
         int memoryMb,
         int cpuCores,
+        boolean gpu,
         Set<String> capabilities,
         Instant registeredAt,
         Instant lastHeartbeat
@@ -23,13 +23,8 @@ public record WorkerInfo(
         }
     }
 
-    public WorkerInfo(String id, String hostname, int capacity,
-                      Instant registeredAt, Instant lastHeartbeat) {
-        this(id, hostname, capacity, 0, 0, Set.of(), registeredAt, lastHeartbeat);
-    }
-
     public WorkerInfo withLastHeartbeat(Instant lastHeartbeat) {
-        return new WorkerInfo(id, hostname, capacity, memoryMb, cpuCores, capabilities,
+        return new WorkerInfo(id, hostname, memoryMb, cpuCores, gpu, capabilities,
                 registeredAt, lastHeartbeat);
     }
 }

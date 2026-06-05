@@ -1,0 +1,10 @@
+coordinator:
+  host: localhost
+  port: 0
+
+hostname: localhost
+port: 0
+
+resources:
+  memory: 8192
+  cpu: 8

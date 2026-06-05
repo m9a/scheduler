@@ -85,9 +85,9 @@ public class WorkerAgent implements AutoCloseable {
     private final ObjectStore objectStore;
 
     private final String hostname;
-    private final int capacity;
-    private final int memoryMb;
-    private final int cpuCores;
+    private final int memory;
+    private final int cpu;
+    private final boolean gpu;
     private final Set<String> capabilities;
     private final Duration jobExecutionTimeout;
     private final String dockerNetwork;
@@ -98,35 +98,28 @@ public class WorkerAgent implements AutoCloseable {
 
     public WorkerAgent(WorkerConfig config, ObjectStore objectStore,
                        Duration jobExecutionTimeout) throws IOException {
-        this(config.getCoordinator().getHost(), config.getCoordinator().getPort(),
-                config.getWorker().getHostname(), config.getWorker().getCapacity(),
-                config.getWorker().getMemoryMb(), config.getWorker().getCpuCores(),
-                config.getWorker().getCapabilities(),
-                objectStore, jobExecutionTimeout,
-                config.getDocker().getNetwork(), config.getMlflow().getTrackingUri());
-    }
-
-    public WorkerAgent(String coordinatorHost, int coordinatorPort, String hostname, int capacity,
-                       int memoryMb, int cpuCores, Set<String> capabilities,
-                       ObjectStore objectStore, Duration jobExecutionTimeout,
-                       String dockerNetwork, String mlflowTrackingUri) throws IOException {
-        this.channel = ManagedChannelBuilder.forAddress(coordinatorHost, coordinatorPort)
+        this.channel = ManagedChannelBuilder.forAddress(
+                        config.getCoordinator().getHost(), config.getCoordinator().getPort())
                 .usePlaintext()
                 .build();
         this.blockingStub = WorkerServiceGrpc.newBlockingStub(channel);
         this.asyncStub = WorkerServiceGrpc.newStub(channel);
-        this.hostname = hostname;
-        this.capacity = capacity;
-        this.memoryMb = memoryMb;
-        this.cpuCores = cpuCores;
-        this.capabilities = capabilities;
+        this.hostname = config.getHostname();
+        this.memory = config.getResources().getMemory();
+        this.cpu = config.getResources().getCpu();
+        this.gpu = config.getResources().isGpu();
         this.objectStore = objectStore;
         this.jobExecutionTimeout = jobExecutionTimeout;
-        this.dockerNetwork = dockerNetwork;
-        this.mlflowTrackingUri = mlflowTrackingUri;
+        this.dockerNetwork = config.getDocker().getNetwork();
+        this.mlflowTrackingUri = config.getMlflow().getTrackingUri();
+
+        this.capabilities = config.getResources().getCapabilities() == null
+                ? Set.of()
+                : Set.copyOf(config.getResources().getCapabilities());
+
         // Bind to all NICs so Docker containers on the bridge network can reach
         // this server via the host's real hostname (passed in workerAgentUrl).
-        this.wsServer = new JobWebSocketServer(new InetSocketAddress("0.0.0.0", 0));
+        this.wsServer = new JobWebSocketServer(new InetSocketAddress("0.0.0.0", config.getPort()));
         this.wsServer.start();
         try {
             this.wsServer.awaitReady();
@@ -137,11 +130,6 @@ public class WorkerAgent implements AutoCloseable {
         log.info("WebSocket server listening on {}", workerAgentUrl());
     }
 
-    public WorkerAgent(String coordinatorHost, int coordinatorPort, String hostname, int capacity,
-                       ObjectStore objectStore) throws IOException {
-        this(coordinatorHost, coordinatorPort, hostname, capacity,
-                0, 0, Set.of(), objectStore, DEFAULT_JOB_EXECUTION_TIMEOUT, null, null);
-    }
 
     /**
      * Registers with the coordinator and enters the main loop:
@@ -150,13 +138,13 @@ public class WorkerAgent implements AutoCloseable {
      *
      * <p><b>Limitation:</b> runs one job at a time because {@code executeJob} blocks
      * on {@code process.waitFor()}. To run multiple jobs concurrently, submit
-     * {@code executeJob} calls to a thread pool sized to {@code capacity}.
-     * That also requires multiplexing the task status HTTP handler by jobId
-     * instead of replacing it per job.
+     * {@code executeJob} calls to a bounded thread pool. That also requires
+     * multiplexing the task status HTTP handler by jobId instead of replacing
+     * it per job.
      */
     public void run() {
-        workerId = register(hostname, capacity);
-        log.info("Worker running: workerId={}, hostname={}, capacity={}", workerId, hostname, capacity);
+        workerId = register(hostname);
+        log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
         startHeartbeat();
         running = true;
@@ -566,14 +554,14 @@ public class WorkerAgent implements AutoCloseable {
 
     // ── outbound: gRPC to coordinator ────────────────────────────────────────
 
-    public String register(String hostname, int capacity) {
-        log.info("Registering with coordinator: hostname={}, capacity={}, memoryMb={}, cpuCores={}, capabilities={}",
-                hostname, capacity, memoryMb, cpuCores, capabilities);
+    public String register(String hostname) {
+        log.info("Registering with coordinator: hostname={}, memory={}, cpu={}, gpu={}, capabilities={}",
+                hostname, memory, cpu, gpu, capabilities);
         RegisterWorkerResponse response = blockingStub.registerWorker(RegisterWorkerRequest.newBuilder()
                 .setHostname(hostname)
-                .setCapacity(capacity)
-                .setMemoryMb(memoryMb)
-                .setCpuCores(cpuCores)
+                .setMemoryMb(memory)
+                .setCpuCores(cpu)
+                .setGpu(gpu)
                 .addAllCapabilities(capabilities)
                 .build());
         log.info("Registered with coordinator: workerId={}", response.getWorkerId());
@@ -667,14 +655,13 @@ public class WorkerAgent implements AutoCloseable {
     }
 
     public static void main(String[] args) throws IOException {
-        WorkerConfig config;
-        if (args.length > 0 && args[0].equals("--config") && args.length > 1) {
-            config = WorkerConfig.load(Path.of(args[1]));
-            log.info("Loaded config from {}", args[1]);
-        } else {
-            config = WorkerConfig.defaults();
-            log.info("No --config provided, using defaults");
+        if (args.length < 2 || !args[0].equals("--config")) {
+            System.err.println("Usage: java -jar worker.jar --config <path>");
+            System.exit(1);
         }
+
+        WorkerConfig config = WorkerConfig.load(Path.of(args[1]));
+        log.info("Loaded config from {}", args[1]);
 
         ObjectStore objectStore = createObjectStore(config.getMinio());
 

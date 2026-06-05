@@ -7,17 +7,14 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Set;
 
-/**
- * YAML-backed configuration for the worker process.
- * Loaded from a file passed via {@code --config <path>} on the command line.
- */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class WorkerConfig {
 
     private Coordinator coordinator = new Coordinator();
-    private Worker worker = new Worker();
+    private String hostname;
+    private int port;
+    private Resources resources = new Resources();
     private Docker docker = new Docker();
     private Minio minio = new Minio();
     private Mlflow mlflow = new Mlflow();
@@ -27,15 +24,17 @@ public class WorkerConfig {
         return mapper.readValue(path.toFile(), WorkerConfig.class);
     }
 
-    public static WorkerConfig defaults() {
-        return new WorkerConfig();
-    }
-
     public Coordinator getCoordinator() { return coordinator; }
     public void setCoordinator(Coordinator coordinator) { this.coordinator = coordinator; }
 
-    public Worker getWorker() { return worker; }
-    public void setWorker(Worker worker) { this.worker = worker; }
+    public String getHostname() { return hostname; }
+    public void setHostname(String hostname) { this.hostname = hostname; }
+
+    public int getPort() { return port; }
+    public void setPort(int port) { this.port = port; }
+
+    public Resources getResources() { return resources; }
+    public void setResources(Resources resources) { this.resources = resources; }
 
     public Docker getDocker() { return docker; }
     public void setDocker(Docker docker) { this.docker = docker; }
@@ -48,8 +47,8 @@ public class WorkerConfig {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class Coordinator {
-        private String host = "localhost";
-        private int port = 9090;
+        private String host;
+        private int port;
 
         public String getHost() { return host; }
         public void setHost(String host) { this.host = host; }
@@ -58,23 +57,20 @@ public class WorkerConfig {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class Worker {
-        private String hostname = "localhost";
-        private int capacity = 1;
-        private int memoryMb = 0;
-        private int cpuCores = 0;
-        private Set<String> capabilities = Set.of();
+    public static class Resources {
+        private int memory;
+        private int cpu;
+        private boolean gpu;
+        private List<String> capabilities;
 
-        public String getHostname() { return hostname; }
-        public void setHostname(String hostname) { this.hostname = hostname; }
-        public int getCapacity() { return capacity; }
-        public void setCapacity(int capacity) { this.capacity = capacity; }
-        public int getMemoryMb() { return memoryMb; }
-        public void setMemoryMb(int memoryMb) { this.memoryMb = memoryMb; }
-        public int getCpuCores() { return cpuCores; }
-        public void setCpuCores(int cpuCores) { this.cpuCores = cpuCores; }
-        public Set<String> getCapabilities() { return capabilities; }
-        public void setCapabilities(Set<String> capabilities) { this.capabilities = capabilities; }
+        public int getMemory() { return memory; }
+        public void setMemory(int memory) { this.memory = memory; }
+        public int getCpu() { return cpu; }
+        public void setCpu(int cpu) { this.cpu = cpu; }
+        public boolean isGpu() { return gpu; }
+        public void setGpu(boolean gpu) { this.gpu = gpu; }
+        public List<String> getCapabilities() { return capabilities; }
+        public void setCapabilities(List<String> capabilities) { this.capabilities = capabilities; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -87,10 +83,10 @@ public class WorkerConfig {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class Minio {
-        private String endpoint = "http://localhost:9000";
-        private String accessKey = "minioadmin";
-        private String secretKey = "minioadmin";
-        private String bucket = "scheduler";
+        private String endpoint;
+        private String accessKey;
+        private String secretKey;
+        private String bucket;
 
         public String getEndpoint() { return endpoint; }
         public void setEndpoint(String endpoint) { this.endpoint = endpoint; }

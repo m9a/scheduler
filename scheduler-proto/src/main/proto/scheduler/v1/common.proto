@@ -83,5 +83,6 @@ message FileHeader {
 message ResourceRequirements {
   int32 memory_mb = 1;
   int32 cpu_cores = 2;
-  repeated string capabilities = 3;
+  bool gpu = 3;
+  repeated string capabilities = 4;
 }

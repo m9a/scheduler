@@ -136,11 +136,12 @@ public final class ProtoMapper {
 
     public static ResourceRequirements toDomain(com.scheduler.proto.v1.ResourceRequirements proto) {
         if (proto == null || proto.equals(com.scheduler.proto.v1.ResourceRequirements.getDefaultInstance())) {
-            return ResourceRequirements.NONE;
+            return ResourceRequirements.DEFAULT;
         }
         return new ResourceRequirements(
                 proto.getMemoryMb(),
                 proto.getCpuCores(),
+                proto.getGpu(),
                 new HashSet<>(proto.getCapabilitiesList())
         );
     }
@@ -149,6 +150,7 @@ public final class ProtoMapper {
         return com.scheduler.proto.v1.ResourceRequirements.newBuilder()
                 .setMemoryMb(domain.memoryMb())
                 .setCpuCores(domain.cpuCores())
+                .setGpu(domain.gpu())
                 .addAllCapabilities(domain.capabilities())
                 .build();
     }
