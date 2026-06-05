@@ -10,6 +10,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -27,7 +28,9 @@ class WorkerAgentCallbackTest {
     @BeforeEach
     void setUp() throws IOException {
         receivedUpdates = Collections.synchronizedList(new ArrayList<>());
-        agent = new WorkerAgent("localhost", 1, "localhost", 1, null);
+        Path configPath = Path.of(getClass().getClassLoader().getResource("config.yaml").getPath());
+        WorkerConfig config = WorkerConfig.load(configPath);
+        agent = new WorkerAgent(config, null, java.time.Duration.ofSeconds(10));
         agent.onStatusUpdate(receivedUpdates::add);
     }
 

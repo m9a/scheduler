@@ -22,7 +22,7 @@ class JobManagerImplTest {
 
     @Test
     void submit() {
-        Job job = new Job("test-job", "registry.example.com/job:v1", null, 5);
+        Job job = new Job("test-job", "registry.example.com/job:v1", null, 5, null, null);
 
         JobState execution = jobManager.submit("job-1", job);
 
@@ -35,7 +35,7 @@ class JobManagerImplTest {
 
     @Test
     void getJob() {
-        Job job = new Job("test-job", "my-job:latest", null, 0);
+        Job job = new Job("test-job", "my-job:latest", null, 0, null, null);
         JobState submitted = jobManager.submit("job-1", job);
 
         JobState result = jobManager.getJob(submitted.id());
@@ -50,7 +50,7 @@ class JobManagerImplTest {
 
     @Test
     void claimNextJob() {
-        Job job = new Job("test-job", "my-job:latest", null, 0);
+        Job job = new Job("test-job", "my-job:latest", null, 0, null, null);
         jobManager.submit("job-1", job);
 
         Optional<JobState> claimed = jobManager.claimNextJob(DEFAULT_WORKER);
@@ -224,8 +224,8 @@ class JobManagerImplTest {
 
     @Test
     void testFailJobsForWorkerMultipleJobs() {
-        Job job1 = new Job("job-a", "img:latest", null, 0);
-        Job job2 = new Job("job-b", "img:latest", null, 0);
+        Job job1 = new Job("job-a", "img:latest", null, 0, null, null);
+        Job job2 = new Job("job-b", "img:latest", null, 0, null, null);
         jobManager.submit("id-a", job1);
         jobManager.submit("id-b", job2);
         jobManager.claimNextJob(DEFAULT_WORKER);
@@ -243,12 +243,12 @@ class JobManagerImplTest {
     }
 
     @Test
-    void testClaimMatchesCapabilities() {
+    void testClaimGpuJobMatchesGpuWorker() {
         Job job = new Job("gpu-job", "img:latest", null, 0, null,
-                new ResourceRequirements(0, 0, Set.of("gpu")));
+                new ResourceRequirements(0, 0, true, Set.of()));
         jobManager.submit("job-gpu", job);
 
-        WorkerInfo gpuWorker = worker("gpu-worker", 0, 0, Set.of("gpu"));
+        WorkerInfo gpuWorker = worker("gpu-worker", 8192, 8, true, Set.of());
         Optional<JobState> claimed = jobManager.claimNextJob(gpuWorker);
 
         assertTrue(claimed.isPresent());
@@ -256,14 +256,14 @@ class JobManagerImplTest {
     }
 
     @Test
-    void testClaimSkipsUnmatchedCapabilities() {
+    void testClaimGpuJobSkipsNonGpuWorker() {
         Job gpuJob = new Job("gpu-job", "img:latest", null, 0, null,
-                new ResourceRequirements(0, 0, Set.of("gpu")));
-        Job cpuJob = new Job("cpu-job", "img:latest", null, 0);
+                new ResourceRequirements(0, 0, true, Set.of()));
+        Job cpuJob = new Job("cpu-job", "img:latest", null, 0, null, null);
         jobManager.submit("job-gpu", gpuJob);
         jobManager.submit("job-cpu", cpuJob);
 
-        WorkerInfo cpuWorker = worker("cpu-worker", 0, 0, Set.of());
+        WorkerInfo cpuWorker = worker("cpu-worker", 8192, 8, false, Set.of());
         Optional<JobState> claimed = jobManager.claimNextJob(cpuWorker);
 
         assertTrue(claimed.isPresent());
@@ -271,11 +271,36 @@ class JobManagerImplTest {
     }
 
     @Test
-    void testClaimNoRequirementsMatchesAny() {
-        Job job = new Job("any-job", "img:latest", null, 0);
+    void testClaimNonGpuJobSkipsGpuWorker() {
+        // GPU workers are reserved: a CPU-only job must not occupy a GPU worker.
+        Job cpuJob = new Job("cpu-job", "img:latest", null, 0, null, null);
+        jobManager.submit("job-cpu", cpuJob);
+
+        WorkerInfo gpuWorker = worker("gpu-worker", 8192, 8, true, Set.of());
+        Optional<JobState> claimed = jobManager.claimNextJob(gpuWorker);
+
+        assertTrue(claimed.isEmpty());
+    }
+
+    @Test
+    void testClaimMatchesCapabilities() {
+        Job job = new Job("cap-job", "img:latest", null, 0, null,
+                new ResourceRequirements(0, 0, false, Set.of("avx512")));
+        jobManager.submit("job-cap", job);
+
+        WorkerInfo plainWorker = worker("plain", 8192, 8, false, Set.of());
+        assertTrue(jobManager.claimNextJob(plainWorker).isEmpty());
+
+        WorkerInfo capableWorker = worker("capable", 8192, 8, false, Set.of("avx512"));
+        assertTrue(jobManager.claimNextJob(capableWorker).isPresent());
+    }
+
+    @Test
+    void testClaimDefaultRequirementsMatchAdequateWorker() {
+        Job job = new Job("any-job", "img:latest", null, 0, null, null);
         jobManager.submit("job-any", job);
 
-        WorkerInfo worker = worker("w", 0, 0, Set.of());
+        WorkerInfo worker = worker("w", 8192, 8, false, Set.of());
         Optional<JobState> claimed = jobManager.claimNextJob(worker);
 
         assertTrue(claimed.isPresent());
@@ -284,24 +309,24 @@ class JobManagerImplTest {
     @Test
     void testClaimMemoryInsufficient() {
         Job job = new Job("big-job", "img:latest", null, 0, null,
-                new ResourceRequirements(4096, 0, Set.of()));
+                new ResourceRequirements(4096, 0, false, Set.of()));
         jobManager.submit("job-big", job);
 
-        WorkerInfo smallWorker = worker("small", 2048, 0, Set.of());
+        WorkerInfo smallWorker = worker("small", 2048, 8, false, Set.of());
         Optional<JobState> claimed = jobManager.claimNextJob(smallWorker);
 
         assertTrue(claimed.isEmpty());
     }
 
-    private static WorkerInfo worker(String id, int memoryMb, int cpuCores, Set<String> capabilities) {
-        return new WorkerInfo(id, "localhost", 1, memoryMb, cpuCores, capabilities,
+    private static WorkerInfo worker(String id, int memoryMb, int cpuCores, boolean gpu, Set<String> capabilities) {
+        return new WorkerInfo(id, "localhost", memoryMb, cpuCores, gpu, capabilities,
                 Instant.now(), Instant.now());
     }
 
-    private static final WorkerInfo DEFAULT_WORKER = worker("worker-1", 0, 0, Set.of());
+    private static final WorkerInfo DEFAULT_WORKER = worker("worker-1", 8192, 8, false, Set.of());
 
     private JobState submitAndClaim(String name) {
-        Job job = new Job(name, "my-job:latest", null, 0);
+        Job job = new Job(name, "my-job:latest", null, 0, null, null);
         jobManager.submit("job-" + name, job);
         return jobManager.claimNextJob(DEFAULT_WORKER).orElseThrow();
     }

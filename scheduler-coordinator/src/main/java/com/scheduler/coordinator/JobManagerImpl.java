@@ -80,6 +80,7 @@ public class JobManagerImpl {
     //  - Coordinator concurrency review: evaluate finer-grained locking for high worker/job counts
     //  - Microbenchmarks: JMH benchmarks for claimNextJob, handleStatusUpdate, submit
     //  - Worker/job health checks with retry and backoff
+    //  - Docker image caching: pre-pull images on workers to avoid cold-start latency
 
     public synchronized Optional<JobState> claimNextJob(WorkerInfo worker) {
         Iterator<String> it = queue.iterator();
@@ -91,7 +92,7 @@ public class JobManagerImpl {
                 continue;
             }
             ResourceRequirements req = job.job().resources();
-            if (req.satisfiedBy(worker.memoryMb(), worker.cpuCores(), worker.capabilities())) {
+            if (req.satisfiedBy(worker.memoryMb(), worker.cpuCores(), worker.gpu(), worker.capabilities())) {
                 it.remove();
                 JobState claimed = job.claim();
                 jobs.put(jobId, claimed);
