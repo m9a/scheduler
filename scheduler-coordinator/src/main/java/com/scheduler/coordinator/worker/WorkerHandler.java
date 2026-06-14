@@ -1,69 +1,76 @@
 package com.scheduler.coordinator.worker;
 
+import com.scheduler.coordinator.CoordinatorMetrics;
+import com.scheduler.coordinator.JobManager;
 import com.scheduler.coordinator.ProtoMapper;
-
-import com.scheduler.core.FailureReason;
-import com.scheduler.core.JobState;
+import com.scheduler.core.FailureMessages;
 import com.scheduler.core.JobStatus;
-import com.scheduler.core.TaskStatus;
 import com.scheduler.core.WorkerInfo;
-
-import java.util.HashSet;
-import com.scheduler.coordinator.JobManagerImpl;
-import com.scheduler.proto.coordinator.*;
-import com.scheduler.proto.job.StatusUpdate;
+import com.scheduler.proto.v1.FailureReason;
+import com.scheduler.proto.v1.JobState;
+import com.scheduler.proto.v1.TaskState;
+import com.scheduler.proto.worker.HeartbeatRequest;
+import com.scheduler.proto.worker.HeartbeatResponse;
+import com.scheduler.proto.worker.PullJobRequest;
+import com.scheduler.proto.worker.PullJobResponse;
+import com.scheduler.proto.worker.RegisterWorkerRequest;
+import com.scheduler.proto.worker.RegisterWorkerResponse;
+import com.scheduler.proto.worker.ReportTelemetryResponse;
+import com.scheduler.proto.worker.StatusUpdateResponse;
+import com.scheduler.proto.worker.WorkerServiceGrpc;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
- * Handles gRPC RPCs from workers. Workers call this to register, pull jobs,
- * and stream status updates (both job-level and task-level).
+ * <b>Worker → Coordinator edge.</b> Implements the WorkerService gRPC API that
+ * workers (the other side is the worker's {@code CoordinatorClient}) call into.
+ * Pure transport: unpacks protos via {@link ProtoMapper}, delegates to
+ * {@link JobManager} (job state) and {@link WorkerRegistry} (worker liveness),
+ * and packs the replies — no scheduling or lifecycle logic of its own.
  *
  * <pre>
- * Worker ──gRPC──► WorkerHandler ──► JobManagerImpl
- *                  (RegisterWorker)   (claimNextJob)
- *                  (PullJob)          (handleStatusUpdate)
- *                  (ReportStatus)
+ * Worker ──gRPC──► WorkerHandler ──► JobManager        WorkerRegistry
+ *   RegisterWorker                                       register
+ *   PullJob                          claimNextJob        find
+ *   ReportStatus (stream)            handleStatusUpdate
+ *   ReportTelemetry                  handleReport
+ *   Heartbeat                                            updateHeartbeat
  * </pre>
  */
 public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerHandler.class);
 
-    private final ConcurrentHashMap<String, WorkerInfo> workers = new ConcurrentHashMap<>();
-    private final JobManagerImpl jobManager;
-    private ScheduledExecutorService heartbeatMonitor;
+    private final JobManager jobManager;
+    private final WorkerRegistry workers = new WorkerRegistry();
 
-    public WorkerHandler(JobManagerImpl jobManager) {
+    public WorkerHandler(JobManager jobManager) {
         this.jobManager = jobManager;
     }
 
     @Override
     public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> responseObserver) {
         String workerId = UUID.randomUUID().toString();
+        com.scheduler.proto.v1.ResourceRequirements resources = request.getResources();
         log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, assigned workerId={}",
-                request.getHostname(), request.getMemoryMb(), request.getCpuCores(), request.getGpu(), workerId);
-        WorkerInfo worker = new WorkerInfo(
+                request.getHostname(), resources.getMemoryMb(), resources.getCpuCores(), resources.getGpu(), workerId);
+        workers.register(new WorkerInfo(
                 workerId,
                 request.getHostname(),
-                request.getMemoryMb(),
-                request.getCpuCores(),
-                request.getGpu(),
-                new HashSet<>(request.getCapabilitiesList()),
+                resources.getMemoryMb(),
+                resources.getCpuCores(),
+                resources.getGpu(),
+                new HashSet<>(resources.getCapabilitiesList()),
                 Instant.now(),
                 Instant.now()
-        );
-        workers.put(workerId, worker);
+        ));
 
         responseObserver.onNext(RegisterWorkerResponse.newBuilder()
                 .setWorkerId(workerId)
@@ -74,15 +81,15 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void pullJob(PullJobRequest request, StreamObserver<PullJobResponse> responseObserver) {
         log.info("Received pullJob from workerId={}", request.getWorkerId());
-        WorkerInfo worker = workers.get(request.getWorkerId());
-        if (worker == null) {
+        Optional<WorkerInfo> worker = workers.find(request.getWorkerId());
+        if (worker.isEmpty()) {
             log.warn("Unknown workerId={} in pullJob", request.getWorkerId());
             responseObserver.onNext(PullJobResponse.getDefaultInstance());
             responseObserver.onCompleted();
             return;
         }
 
-        Optional<JobState> claimed = jobManager.claimNextJob(worker);
+        Optional<JobStatus> claimed = jobManager.claimNextJob(worker.get());
 
         PullJobResponse.Builder builder = PullJobResponse.newBuilder();
         if (claimed.isPresent()) {
@@ -97,43 +104,23 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     @Override
-    public StreamObserver<StatusUpdate> reportStatus(StreamObserver<StatusUpdateResponse> responseObserver) {
+    public StreamObserver<com.scheduler.proto.job.StatusUpdate> reportStatus(
+            StreamObserver<StatusUpdateResponse> responseObserver) {
         return new StreamObserver<>() {
             @Override
-            public void onNext(StatusUpdate update) {
-                JobStatus jobStatus = null;
-                FailureReason failureReason = null;
-                String failureDetail = null;
-                if (update.getJobStatus() != com.scheduler.proto.v1.JobStatus.JOB_STATUS_UNSPECIFIED) {
-                    jobStatus = ProtoMapper.toDomain(update.getJobStatus());
-
-                    if (update.getFailureReason() != com.scheduler.proto.v1.FailureReason.FAILURE_REASON_UNSPECIFIED) {
-                        failureReason = ProtoMapper.toDomain(update.getFailureReason());
-                        failureDetail = update.getFailureDetail().isEmpty() ? null : update.getFailureDetail();
-                    }
-
-                    log.info("Received job status update: jobId={}, jobStatus={}{}",
-                            update.getJobId(), jobStatus,
-                            failureReason != null ? ", reason=" + failureReason.toMessage(failureDetail) : "");
+            public void onNext(com.scheduler.proto.job.StatusUpdate update) {
+                if (update.getJobState() != JobState.JOB_STATE_UNSPECIFIED) {
+                    log.info("Received job status update: jobId={}, jobState={}{}",
+                            update.getJobId(), update.getJobState(),
+                            update.getFailureReason() != FailureReason.FAILURE_REASON_UNSPECIFIED
+                                    ? ", reason=" + FailureMessages.format(update.getFailureReason(), update.getFailureDetail()) : "");
                 }
-
-                TaskStatus taskStatus = null;
-                if (update.getTaskStatus() != com.scheduler.proto.v1.TaskStatus.TASK_STATUS_UNSPECIFIED) {
-                    taskStatus = ProtoMapper.toDomain(update.getTaskStatus());
+                if (update.getTaskState() != TaskState.TASK_STATE_UNSPECIFIED) {
                     log.info("Received task status update: jobId={}, taskIndex={}, taskName={}, status={}{}",
-                            update.getJobId(), update.getTaskIndex(), update.getTaskName(), taskStatus,
+                            update.getJobId(), update.getTaskIndex(), update.getTaskName(), update.getTaskState(),
                             update.getErrorMessage().isEmpty() ? "" : ", error=" + update.getErrorMessage());
                 }
-
-                jobManager.handleStatusUpdate(
-                        update.getJobId(),
-                        jobStatus,
-                        failureReason, failureDetail,
-                        update.getTaskIndex(),
-                        update.getTaskName().isEmpty() ? null : update.getTaskName(),
-                        taskStatus,
-                        update.getErrorMessage().isEmpty() ? null : update.getErrorMessage()
-                );
+                jobManager.handleStatusUpdate(update);
             }
 
             @Override
@@ -150,53 +137,51 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     @Override
+    public void reportTelemetry(com.scheduler.proto.job.Report request,
+                                StreamObserver<ReportTelemetryResponse> responseObserver) {
+        log.debug("Received telemetry from job={}, taskIndex={}, entries={}",
+                request.getJobId(), request.getTaskIndex(), request.getEntriesCount());
+        try {
+            jobManager.handleReport(request.getJobId(), request.getTaskIndex(), request.getEntriesList());
+        } catch (Exception e) {
+            // Telemetry is lossy by design — never fail the worker over it, but say why.
+            log.warn("Dropping telemetry for job={}, taskIndex={}: {}",
+                    request.getJobId(), request.getTaskIndex(), e.getMessage());
+        }
+        responseObserver.onNext(ReportTelemetryResponse.getDefaultInstance());
+        responseObserver.onCompleted();
+    }
+
+    @Override
     public void heartbeat(HeartbeatRequest request, StreamObserver<HeartbeatResponse> responseObserver) {
-        String workerId = request.getWorkerId();
-        log.debug("Received heartbeat from workerId={}", workerId);
-        updateHeartbeat(workerId);
+        log.debug("Received heartbeat from workerId={}", request.getWorkerId());
+        workers.updateHeartbeat(request.getWorkerId());
         responseObserver.onNext(HeartbeatResponse.newBuilder()
                 .setShouldDrain(false)
                 .build());
         responseObserver.onCompleted();
     }
 
-    void updateHeartbeat(String workerId) {
-        workers.computeIfPresent(workerId, (id, worker) -> worker.withLastHeartbeat(Instant.now()));
+    /** Read at Prometheus scrape time by CoordinatorMetrics. */
+    public int workerCount() {
+        return workers.count();
     }
 
     /**
-     * Starts a background thread that periodically scans all registered workers
-     * and fails jobs for any worker whose last heartbeat is older than the timeout.
+     * Starts the liveness monitor in {@link WorkerRegistry}; a dead worker's
+     * in-flight jobs are failed with HEARTBEAT_LOST.
      */
     public void startHeartbeatMonitor(Duration heartbeatTimeout, Duration scanInterval) {
-        heartbeatMonitor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "heartbeat-monitor");
-            t.setDaemon(true);
-            return t;
-        });
-        heartbeatMonitor.scheduleAtFixedRate(() -> {
-            try {
-                Instant cutoff = Instant.now().minus(heartbeatTimeout);
-                for (WorkerInfo worker : workers.values()) {
-                    if (worker.lastHeartbeat().isBefore(cutoff)) {
-                        log.warn("Worker heartbeat lost: workerId={}, hostname={}, lastHeartbeat={}",
-                                worker.id(), worker.hostname(), worker.lastHeartbeat());
-                        int failed = jobManager.failJobsForWorker(worker.id(), FailureReason.HEARTBEAT_LOST);
-                        if (failed > 0) {
-                            log.warn("Failed {} job(s) for dead worker: workerId={}", failed, worker.id());
-                        }
-                        workers.remove(worker.id());
-                    }
-                }
-            } catch (Exception e) {
-                log.error("Heartbeat monitor scan failed: {}", e.getMessage(), e);
+        workers.startMonitor(heartbeatTimeout, scanInterval, worker -> {
+            int failed = jobManager.failJobsForWorker(worker.id(), FailureReason.FAILURE_REASON_HEARTBEAT_LOST);
+            if (failed > 0) {
+                log.warn("Failed {} job(s) for dead worker: workerId={}", failed, worker.id());
             }
-        }, scanInterval.toMillis(), scanInterval.toMillis(), TimeUnit.MILLISECONDS);
+            CoordinatorMetrics.HEARTBEAT_LOSSES.inc();
+        });
     }
 
     public void shutdownHeartbeatMonitor() {
-        if (heartbeatMonitor != null) {
-            heartbeatMonitor.shutdown();
-        }
+        workers.shutdownMonitor();
     }
 }

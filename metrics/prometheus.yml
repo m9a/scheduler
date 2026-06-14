@@ -1,0 +1,14 @@
+# Scrape targets for the scheduler control plane. The coordinator and worker
+# run on the host in dev, so targets go through host.docker.internal.
+# Ports: coordinator metrics = gRPC port + 1 (9090 → 9091); worker metrics = 9092 (fixed).
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: coordinator
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+
+  - job_name: worker
+    static_configs:
+      - targets: ["host.docker.internal:9092"]

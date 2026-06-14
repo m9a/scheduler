@@ -1,6 +1,6 @@
 package com.scheduler.coordinator;
 
-import com.scheduler.coordinator.client.UserRequestHandler;
+import com.scheduler.coordinator.client.ClientHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
 import io.grpc.Server;
@@ -19,18 +19,36 @@ import java.time.Duration;
 public class Coordinator {
 
     private static final Logger log = LoggerFactory.getLogger(Coordinator.class);
-    private static final int DEFAULT_PORT = 9090;
-    private static final Duration HEARTBEAT_TIMEOUT = Duration.ofSeconds(15);
-    private static final Duration HEARTBEAT_SCAN_INTERVAL = Duration.ofSeconds(5);
 
+    /**
+     * Usage: {@code coordinator [--config <control-plane.yaml>] [port]}.
+     * Settings come from control-plane.yaml (defaults apply without one); a bare
+     * port argument overrides the configured port (used by scheduler-cli).
+     */
     public static void main(String[] args) throws IOException, InterruptedException {
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_PORT;
+        CoordinatorConfig config = new CoordinatorConfig();
+        Integer portOverride = null;
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equals("--config") && i + 1 < args.length) {
+                config = CoordinatorConfig.load(java.nio.file.Path.of(args[++i]));
+            } else {
+                portOverride = Integer.parseInt(args[i]);
+            }
+        }
+        int port = portOverride != null ? portOverride : config.getCoordinator().getPort();
+        Duration heartbeatTimeout = Duration.ofSeconds(config.getCoordinator().getHeartbeatTimeoutSeconds());
+        Duration heartbeatScanInterval = Duration.ofSeconds(config.getCoordinator().getHeartbeatScanIntervalSeconds());
 
-        ObjectStore objectStore = createObjectStore();
-        JobManagerImpl jobManager = new JobManagerImpl();
-        UserRequestHandler clientHandler = new UserRequestHandler(jobManager, objectStore);
+        ObjectStore objectStore = createObjectStore(config.getMinio());
+        JobManager jobManager = new JobManager();
+        ClientHandler clientHandler = new ClientHandler(jobManager, objectStore);
         WorkerHandler workerHandler = new WorkerHandler(jobManager);
-        workerHandler.startHeartbeatMonitor(HEARTBEAT_TIMEOUT, HEARTBEAT_SCAN_INTERVAL);
+        workerHandler.startHeartbeatMonitor(heartbeatTimeout, heartbeatScanInterval);
+
+        // Prometheus scrapes gRPC port + 1 (e.g. 9090 → 9091/metrics).
+        CoordinatorMetrics.init(jobManager, workerHandler);
+        CoordinatorMetrics metrics = new CoordinatorMetrics();
+        metrics.startServer(port + 1);
 
         Server server = ServerBuilder.forPort(port)
                 .addService(clientHandler)
@@ -43,26 +61,22 @@ public class Coordinator {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutting down coordinator");
             workerHandler.shutdownHeartbeatMonitor();
+            metrics.stop();
             server.shutdown();
         }));
 
         server.awaitTermination();
     }
 
-    private static ObjectStore createObjectStore() {
-        String endpoint = System.getProperty("minio.endpoint", "http://localhost:9000");
-        String accessKey = System.getProperty("minio.accessKey", "minioadmin");
-        String secretKey = System.getProperty("minio.secretKey", "minioadmin");
-        String bucket = System.getProperty("minio.bucket", "scheduler");
-
+    private static ObjectStore createObjectStore(CoordinatorConfig.Minio minio) {
         S3Client s3 = S3Client.builder()
-                .endpointOverride(URI.create(endpoint))
+                .endpointOverride(URI.create(minio.getEndpoint()))
                 .credentialsProvider(StaticCredentialsProvider.create(
-                        AwsBasicCredentials.create(accessKey, secretKey)))
+                        AwsBasicCredentials.create(minio.getAccessKey(), minio.getSecretKey())))
                 .region(Region.US_EAST_1)
                 .forcePathStyle(true)
                 .build();
 
-        return new ObjectStore(s3, bucket);
+        return new ObjectStore(s3, minio.getBucket());
     }
 }

@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+// Boundary: Job container (SDK) -> Worker, over WebSocket. Both messages are
+// also forwarded unchanged on the Worker -> Coordinator leg (worker_api).
+package scheduler.job.v1;
+
+option java_multiple_files = true;
+option java_package = "com.scheduler.proto.job";
+
+import "scheduler/v1/common.proto";
+
+// Unified status update used on both the WebSocket leg (SDK → Worker)
+// and the gRPC leg (Worker → Coordinator). The SDK populates task-level
+// fields only; the worker adds the job-level section before forwarding —
+// job fields are always present on the worker → coordinator leg.
+//
+// WebSocket frame: [0x01] [StatusUpdate bytes]
+message StatusUpdate {
+  string job_id = 1;
+
+  // Task-level — populated by SDK, forwarded by worker
+  int32 task_index = 2;
+  string task_name = 3;
+  scheduler.v1.TaskState task_state = 4;
+  string error_message = 5;
+  int64 duration_ms = 6;
+  string output = 7;
+
+  // Job-level — populated by worker before forwarding to coordinator
+  scheduler.v1.JobState job_state = 8;
+  scheduler.v1.FailureReason failure_reason = 9;
+  string failure_detail = 10;
+}
+
+// Generic key-value telemetry emitted by the job for a running task. Distinct
+// from StatusUpdate (which carries lifecycle state): a Report carries arbitrary
+// user-defined data — metrics, attributes, counters, events (ReportEntry /
+// ReportKind live in common.proto, shared with the Task snapshot). Jobs differ
+// in nature, so the schema is open: the job decides which keys are meaningful.
+// "progress" is just a well-known set of keys (progress_current / progress_total
+// / progress_unit), not a special field. Latest-wins per key; high-frequency.
+//
+// WebSocket frame: [0x03] [Report bytes]
+// Worker -> Coordinator: forwarded as-is via WorkerService.ReportTelemetry.
+message Report {
+  string job_id = 1;
+  int32 task_index = 2;
+  int64 timestamp_ms = 3;
+  repeated scheduler.v1.ReportEntry entries = 4;
+}

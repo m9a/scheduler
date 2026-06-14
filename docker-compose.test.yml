@@ -1,3 +1,10 @@
+# Control-plane stack — a template: which services run (compose profiles) and the
+# ${VAR:-default} values below are derived from control-plane.yaml by
+# scripts/control-plane.sh. Run it via `scripts/control-plane.sh up|down|status`;
+# the fully resolved compose is logged to .control-plane-resolved.yml on up.
+#   mlflow  → MLflow + PostgreSQL   (experiment tracking for training jobs)
+#   metrics → Prometheus + Grafana  (infra/container metrics)
+# MinIO is always on — the object store is core infra, not optional.
 services:
 
   minio:
@@ -7,8 +14,8 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     volumes:
       - minio-data:/data
     networks:
@@ -29,6 +36,7 @@ services:
 
   postgres:
     image: postgres:16
+    profiles: ["mlflow"]
     ports:
       - "5432:5432"
     environment:
@@ -42,11 +50,12 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.16.0
+    profiles: ["mlflow"]
     depends_on:
       - postgres
       - minio
     ports:
-      - "5000:5000"
+      - "${MLFLOW_PORT:-5000}:5000"
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -62,6 +71,36 @@ services:
           --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow \
           --artifacts-destination s3://mlflow/ \
           --serve-artifacts
+    networks:
+      - scheduler-net
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: ["metrics"]
+    ports:
+      - "${PROMETHEUS_PORT:-9095}:9090"
+    volumes:
+      - ./metrics/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # Coordinator/worker run on the host in dev — containers reach them
+    # via host.docker.internal (see metrics/prometheus.yml targets).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - scheduler-net
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: ["metrics"]
+    depends_on:
+      - prometheus
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./metrics/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./metrics/grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks:
       - scheduler-net
 

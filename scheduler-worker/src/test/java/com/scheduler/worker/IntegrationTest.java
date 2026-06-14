@@ -1,12 +1,13 @@
 package com.scheduler.worker;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.scheduler.coordinator.JobManagerImpl;
-import com.scheduler.coordinator.client.UserRequestHandler;
+import com.scheduler.coordinator.JobManager;
+import com.scheduler.coordinator.client.ClientHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
 import com.scheduler.client.SchedulerClient;
 import com.scheduler.proto.v1.*;
+import com.scheduler.proto.client.*;
 import com.google.protobuf.ByteString;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -147,12 +148,26 @@ class IntegrationTest {
 
         String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
+        assertEquals(JobState.JOB_STATE_QUEUED, submitted.getState());
 
         Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
+        assertEquals(JobState.JOB_STATE_COMPLETED, completed.getState());
         assertTrue(completed.getStartedAtMillis() > 0, "Expected startedAt to be set");
         assertTrue(completed.getCompletedAtMillis() > 0, "Expected completedAt to be set");
+
+        // Telemetry emitted via TaskContext must surface on the task snapshot.
+        // extract: rows metric; transform: progress (5000 rows / 100 = 50 batches) + duration; load: event
+        Map<String, ReportEntry> extract = reportsByKey(completed, "extract");
+        assertEquals(5000, extract.get("rows_extracted").getNumValue());
+
+        Map<String, ReportEntry> transform = reportsByKey(completed, "transform");
+        assertEquals(50, transform.get("progress_current").getNumValue());
+        assertEquals(50, transform.get("progress_total").getNumValue());
+        assertTrue(transform.get("transform_duration_ms").getNumValue() >= 0,
+                "Expected transform_duration_ms metric");
+
+        Map<String, ReportEntry> load = reportsByKey(completed, "load");
+        assertEquals(ReportKind.REPORT_KIND_EVENT, load.get("load_complete").getKind());
     }
 
     @Test
@@ -164,10 +179,24 @@ class IntegrationTest {
 
         String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
+        assertEquals(JobState.JOB_STATE_QUEUED, submitted.getState());
 
         Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
+        assertEquals(JobState.JOB_STATE_COMPLETED, completed.getState());
+
+        // Same KV pipeline as the Java SDK: progress (5000 rows / 500 = 10 batches),
+        // duration metric, and a load event.
+        Map<String, ReportEntry> extract = reportsByKey(completed, "extract");
+        assertEquals(5000, extract.get("rows_extracted").getNumValue());
+
+        Map<String, ReportEntry> transform = reportsByKey(completed, "transform");
+        assertEquals(10, transform.get("progress_current").getNumValue());
+        assertEquals(10, transform.get("progress_total").getNumValue());
+        assertTrue(transform.get("transform_duration_ms").getNumValue() >= 0,
+                "Expected transform_duration_ms metric");
+
+        Map<String, ReportEntry> load = reportsByKey(completed, "load");
+        assertEquals(ReportKind.REPORT_KIND_EVENT, load.get("load_complete").getKind());
     }
 
     @Test
@@ -192,25 +221,37 @@ class IntegrationTest {
         String jobId = submitResponse.getJob().getId();
         trainingJobId = jobId;
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitResponse.getJob().getStatus());
+        assertEquals(JobState.JOB_STATE_QUEUED, submitResponse.getJob().getState());
 
         // PyTorch install + training takes longer than the simple jobs
         Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(120));
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
+        assertEquals(JobState.JOB_STATE_COMPLETED, completed.getState());
 
         // Verify task states: both completed with real names from the @task decorators
         assertEquals(2, completed.getTasksCount());
         for (Task task : completed.getTasksList()) {
-            assertEquals(TaskStatus.TASK_STATUS_COMPLETED, task.getStatus());
+            assertEquals(TaskState.TASK_STATE_COMPLETED, task.getState());
             assertFalse(task.getName().startsWith("task-"),
                     "Expected real task name, got " + task.getName());
         }
 
         // Verify model.pt exists in output files
-        List<OutputFile> files = client.listJobFiles(jobId);
+        List<FileInfo> files = client.listJobFiles(jobId);
         boolean hasModel = files.stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
         assertTrue(hasModel, "Expected model.pt in output files, got: " + files);
+
+        // Raw-PyTorch loop reports per-epoch progress, loss, duration, and a save event.
+        Map<String, ReportEntry> prepare = reportsByKey(completed, "prepare_data");
+        assertEquals(190, prepare.get("training_sequences").getNumValue(),
+                "200 samples - window 10 = 190 sequences");
+
+        Map<String, ReportEntry> train = reportsByKey(completed, "train_model");
+        assertEquals(5, train.get("progress_current").getNumValue());
+        assertEquals(5, train.get("progress_total").getNumValue());
+        assertTrue(train.get("loss").getNumValue() >= 0, "Expected latest loss metric");
+        assertTrue(train.get("train_duration_ms").getNumValue() > 0, "Expected train_duration_ms");
+        assertEquals(ReportKind.REPORT_KIND_EVENT, train.get("model_saved").getKind());
     }
 
     @Test
@@ -276,10 +317,10 @@ class IntegrationTest {
 
         // The server exits, task completes, job finishes normally
         Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(60));
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus());
+        assertEquals(JobState.JOB_STATE_COMPLETED, completed.getState());
 
         // Verify predictions.jsonl was uploaded to the object store
-        List<OutputFile> files = client.listJobFiles(jobId);
+        List<FileInfo> files = client.listJobFiles(jobId);
         boolean hasPredictions = files.stream()
                 .anyMatch(f -> f.getName().endsWith("predictions.jsonl"));
         assertTrue(hasPredictions, "Expected predictions.jsonl in output files, got: " + files);
@@ -295,30 +336,33 @@ class IntegrationTest {
     @Order(5)
     @SuppressWarnings("unchecked")
     void testLightningTrainingJob() throws Exception {
+        // The Lightning + torch + mlflow stack needs more than the 512 MB
+        // default — the container gets OOM-killed (exit 137) mid-epoch there.
         Job submitted = client.submitJob("docker-lightning-job",
                 REGISTRY_PREFIX + "/sample-py-training-job:latest",
-                Map.of("epochs", "2", "batch_size", "128"));
+                Map.of("epochs", "2", "batch_size", "128"),
+                2048, 2, null);
 
         String jobId = submitted.getId();
         assertFalse(jobId.isEmpty(), "Expected a job ID");
-        assertEquals(JobStatus.JOB_STATUS_QUEUED, submitted.getStatus());
+        assertEquals(JobState.JOB_STATE_QUEUED, submitted.getState());
 
         // Lightning + MNIST download + training — needs a generous timeout
         Job completed = client.waitForCompletion(jobId, Duration.ofSeconds(300));
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, completed.getStatus(),
+        assertEquals(JobState.JOB_STATE_COMPLETED, completed.getState(),
                 "Lightning training job should complete successfully");
 
         // All three tasks should have completed: train, test, export
         assertEquals(3, completed.getTasksCount(), "Expected 3 tasks");
         assertEquals("train", completed.getTasks(0).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(0).getStatus());
+        assertEquals(TaskState.TASK_STATE_COMPLETED, completed.getTasks(0).getState());
         assertEquals("test", completed.getTasks(1).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(1).getStatus());
+        assertEquals(TaskState.TASK_STATE_COMPLETED, completed.getTasks(1).getState());
         assertEquals("export", completed.getTasks(2).getName());
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, completed.getTasks(2).getStatus());
+        assertEquals(TaskState.TASK_STATE_COMPLETED, completed.getTasks(2).getState());
 
         // Verify model.pt was exported and uploaded
-        List<OutputFile> files = client.listJobFiles(jobId);
+        List<FileInfo> files = client.listJobFiles(jobId);
         boolean hasModel = files.stream()
                 .anyMatch(f -> f.getName().endsWith("model.pt"));
         assertTrue(hasModel, "Expected model.pt in output files, got: " + files);
@@ -337,7 +381,30 @@ class IntegrationTest {
         String experimentId = (String) experiment.get("experiment_id");
         assertNotNull(experimentId, "Expected experiment_id");
 
-        // Search for runs in this experiment
+        // Verify training metrics were logged. mlflow.autolog() can split one
+        // job across runs (one for trainer.fit, another for trainer.test), so
+        // collect metric keys across all runs — the DB is fresh per test run
+        // (compose down -v), so every run here belongs to this job. Autolog
+        // flushes metrics asynchronously, so poll until they appear.
+        List<String> expectedMetrics = List.of("train_loss", "val_loss", "val_acc", "test_loss", "test_acc");
+        List<String> metricKeys = List.of();
+        long metricsDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        while (System.nanoTime() < metricsDeadline) {
+            metricKeys = mlflowMetricKeys(mapper, experimentId);
+            if (metricKeys.containsAll(expectedMetrics)) {
+                break;
+            }
+            Thread.sleep(2000);
+        }
+        for (String expected : expectedMetrics) {
+            assertTrue(metricKeys.contains(expected),
+                    "Expected metric '" + expected + "' across MLflow runs, got: " + metricKeys);
+        }
+    }
+
+    /** Collects metric keys across all runs of the given MLflow experiment. */
+    @SuppressWarnings("unchecked")
+    private static List<String> mlflowMetricKeys(ObjectMapper mapper, String experimentId) throws Exception {
         HttpURLConnection runConn = (HttpURLConnection) URI.create(
                 MLFLOW_URL + "/api/2.0/mlflow/runs/search"
         ).toURL().openConnection();
@@ -352,22 +419,21 @@ class IntegrationTest {
         String runBody = new String(runConn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         Map<String, Object> runJson = mapper.readValue(runBody, Map.class);
         List<Map<String, Object>> runs = (List<Map<String, Object>>) runJson.get("runs");
+        assertNotNull(runs, "Expected runs in MLflow search response");
         assertFalse(runs.isEmpty(), "Expected at least one MLflow run");
 
-        // Verify training metrics were logged
-        Map<String, Object> firstRun = runs.get(0);
-        Map<String, Object> data = (Map<String, Object>) firstRun.get("data");
-        List<Map<String, Object>> metrics = (List<Map<String, Object>>) data.get("metrics");
-        assertNotNull(metrics, "Expected metrics in run data");
-
         List<String> metricKeys = new ArrayList<>();
-        for (Map<String, Object> m : metrics) {
-            metricKeys.add((String) m.get("key"));
+        for (Map<String, Object> run : runs) {
+            Map<String, Object> data = (Map<String, Object>) run.get("data");
+            List<Map<String, Object>> metrics = (List<Map<String, Object>>) data.get("metrics");
+            if (metrics == null) {
+                continue;
+            }
+            for (Map<String, Object> m : metrics) {
+                metricKeys.add((String) m.get("key"));
+            }
         }
-        for (String expected : List.of("train_loss", "val_loss", "val_acc", "test_loss", "test_acc")) {
-            assertTrue(metricKeys.contains(expected),
-                    "Expected metric '" + expected + "' in MLflow run, got: " + metricKeys);
-        }
+        return metricKeys;
     }
 
     @Test
@@ -380,17 +446,17 @@ class IntegrationTest {
         assertFalse(jobId.isEmpty(), "Expected a job ID");
 
         Job finalJob = client.waitForCompletion(jobId, Duration.ofSeconds(60));
-        assertEquals(JobStatus.JOB_STATUS_FAILED, finalJob.getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, finalJob.getState());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, finalJob.getFailureReason());
         assertFalse(finalJob.getErrorMessage().isEmpty(), "Expected error_message for backward compat");
 
         // First task (validate) should have completed
         assertTrue(finalJob.getTasksCount() >= 2, "Expected at least 2 tasks reported");
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(0).getStatus());
+        assertEquals(TaskState.TASK_STATE_COMPLETED, finalJob.getTasks(0).getState());
         assertEquals("validate", finalJob.getTasks(0).getName());
 
         // Second task (process) should have failed
-        assertEquals(TaskStatus.TASK_STATUS_FAILED, finalJob.getTasks(1).getStatus());
+        assertEquals(TaskState.TASK_STATE_FAILED, finalJob.getTasks(1).getState());
         assertEquals("process", finalJob.getTasks(1).getName());
     }
 
@@ -404,17 +470,17 @@ class IntegrationTest {
         assertFalse(jobId.isEmpty(), "Expected a job ID");
 
         Job finalJob = client.waitForCompletion(jobId, Duration.ofSeconds(60));
-        assertEquals(JobStatus.JOB_STATUS_FAILED, finalJob.getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, finalJob.getState());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, finalJob.getFailureReason());
         assertFalse(finalJob.getErrorMessage().isEmpty(), "Expected error_message for backward compat");
 
         // First task (setup_data) should have completed
         assertTrue(finalJob.getTasksCount() >= 2, "Expected at least 2 tasks reported");
-        assertEquals(TaskStatus.TASK_STATUS_COMPLETED, finalJob.getTasks(0).getStatus());
+        assertEquals(TaskState.TASK_STATE_COMPLETED, finalJob.getTasks(0).getState());
         assertEquals("setup_data", finalJob.getTasks(0).getName());
 
         // Second task (process) should have failed
-        assertEquals(TaskStatus.TASK_STATUS_FAILED, finalJob.getTasks(1).getStatus());
+        assertEquals(TaskState.TASK_STATE_FAILED, finalJob.getTasks(1).getState());
         assertEquals("process", finalJob.getTasks(1).getName());
     }
 
@@ -431,12 +497,12 @@ class IntegrationTest {
     @Order(8)
     void testWorkerHeartbeatLost() throws Exception {
         // Stand up a coordinator with aggressive heartbeat settings (2s timeout, 500ms scan)
-        JobManagerImpl hbJobManager = new JobManagerImpl();
+        JobManager hbJobManager = new JobManager();
         WorkerHandler hbWorkerHandler = new WorkerHandler(hbJobManager);
         hbWorkerHandler.startHeartbeatMonitor(Duration.ofSeconds(2), Duration.ofMillis(500));
 
         Server hbServer = ServerBuilder.forPort(0)
-                .addService(new UserRequestHandler(hbJobManager, null))
+                .addService(new ClientHandler(hbJobManager, null))
                 .addService(hbWorkerHandler)
                 .build()
                 .start();
@@ -451,7 +517,7 @@ class IntegrationTest {
         // Worker that blocks the spawn so the job stays in-flight while we kill heartbeats
         TestableWorkerAgent hbWorker = new TestableWorkerAgent(testConfig(hbServer.getPort()));
         CountDownLatch spawnBlocked = new CountDownLatch(1);
-        hbWorker.setSpawnBehavior((details, url) -> {
+        hbWorker.setSpawnBehavior((details, url, onTimeout) -> {
             spawnBlocked.await();
             return 0;
         });
@@ -469,7 +535,7 @@ class IntegrationTest {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             while (System.nanoTime() < deadline) {
                 Job polled = hbClient.getJobStatus(jobId);
-                if (polled.getStatus() != JobStatus.JOB_STATUS_QUEUED) {
+                if (polled.getState() != JobState.JOB_STATE_QUEUED) {
                     break;
                 }
                 Thread.sleep(100);
@@ -483,14 +549,14 @@ class IntegrationTest {
             Job job = null;
             while (System.nanoTime() < deadline) {
                 job = hbClient.getJobStatus(jobId);
-                if (job.getStatus() == JobStatus.JOB_STATUS_FAILED) {
+                if (job.getState() == JobState.JOB_STATE_FAILED) {
                     break;
                 }
                 Thread.sleep(100);
             }
 
             assertNotNull(job);
-            assertEquals(JobStatus.JOB_STATUS_FAILED, job.getStatus());
+            assertEquals(JobState.JOB_STATE_FAILED, job.getState());
             assertEquals(FailureReason.FAILURE_REASON_HEARTBEAT_LOST, job.getFailureReason());
             assertTrue(job.getErrorMessage().contains("heartbeat"),
                     "Expected error_message to mention heartbeat, got: " + job.getErrorMessage());
@@ -508,7 +574,10 @@ class IntegrationTest {
 
     @FunctionalInterface
     interface SpawnBehavior {
-        int execute(JobDetails details, String workerAgentUrl) throws IOException, InterruptedException;
+        // onTimeout simulates the launcher's deadline hook: call it, then return -1,
+        // to behave like a container that hit the execution timeout.
+        int execute(JobDetails details, String workerAgentUrl, Runnable onTimeout)
+                throws IOException, InterruptedException;
     }
 
     /**
@@ -528,8 +597,8 @@ class IntegrationTest {
 
         @Override
         int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
-                            Map<String, String> params) throws IOException, InterruptedException {
-            return spawnBehavior.execute(details, workerAgentUrl());
+                            Map<String, String> params, Runnable onTimeout) throws IOException, InterruptedException {
+            return spawnBehavior.execute(details, workerAgentUrl(), onTimeout);
         }
     }
 
@@ -578,7 +647,10 @@ class IntegrationTest {
 
     private static void startComposeStack() throws Exception {
         log.info("Starting docker-compose stack from {}", COMPOSE_FILE.toAbsolutePath());
-        runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(), "up", "-d");
+        // The mlflow stack is behind a compose profile (see the repo's .env, which
+        // doesn't apply here because compose runs with -f from this module's cwd).
+        runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(),
+                "--profile", "mlflow", "up", "-d");
 
         boolean minioReady = pollUrl(MINIO_URL + "/minio/health/ready", 60);
         assertTrue(minioReady, "MinIO did not become ready");
@@ -592,7 +664,9 @@ class IntegrationTest {
 
     private static void stopComposeStack() {
         try {
-            runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(), "down", "-v");
+            // Profile must match `up` — `down` without it would leave mlflow/postgres running.
+            runCommand("docker", "compose", "-f", COMPOSE_FILE.toAbsolutePath().toString(),
+                    "--profile", "mlflow", "down", "-v");
         } catch (Exception e) {
             log.warn("Failed to stop compose stack: {}", e.getMessage());
         }
@@ -700,10 +774,10 @@ class IntegrationTest {
     }
 
     private static void startCoordinatorAndWorker() throws Exception {
-        JobManagerImpl jobManager = new JobManagerImpl();
+        JobManager jobManager = new JobManager();
 
         coordinatorServer = ServerBuilder.forPort(0)
-                .addService(new UserRequestHandler(jobManager, objectStore))
+                .addService(new ClientHandler(jobManager, objectStore))
                 .addService(new WorkerHandler(jobManager))
                 .build()
                 .start();
@@ -794,6 +868,21 @@ class IntegrationTest {
         runQuietly("docker", "image", "prune", "-f");
     }
 
+    // -- telemetry assertions --
+
+    /** Returns the latest-wins report snapshot of the named task, keyed by report key. */
+    private static Map<String, ReportEntry> reportsByKey(Job job, String taskName) {
+        Task task = job.getTasksList().stream()
+                .filter(t -> t.getName().equals(taskName))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(
+                        "No task named '" + taskName + "' in " + job.getTasksList()));
+        Map<String, ReportEntry> byKey = new java.util.HashMap<>();
+        task.getReportsList().forEach(e -> byKey.put(e.getKey(), e));
+        assertFalse(byKey.isEmpty(), "Expected telemetry reports on task " + taskName);
+        return byKey;
+    }
+
     // -- config --
 
     private static WorkerConfig testConfig(int coordinatorPort) throws IOException {
@@ -808,23 +897,23 @@ class IntegrationTest {
 
     private void pollUntilRunning(String jobId, long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
-        JobStatus status = JobStatus.JOB_STATUS_UNSPECIFIED;
+        JobState state = JobState.JOB_STATE_UNSPECIFIED;
 
         while (System.nanoTime() < deadline) {
             Job job = client.getJobStatus(jobId);
-            status = job.getStatus();
+            state = job.getState();
 
-            if (status == JobStatus.JOB_STATUS_RUNNING) {
+            if (state == JobState.JOB_STATE_RUNNING) {
                 return;
             }
-            if (status == JobStatus.JOB_STATUS_COMPLETED || status == JobStatus.JOB_STATUS_FAILED
-                    || status == JobStatus.JOB_STATUS_KILLED) {
-                fail("Job reached terminal status before RUNNING: " + status);
+            if (state == JobState.JOB_STATE_COMPLETED || state == JobState.JOB_STATE_FAILED
+                    || state == JobState.JOB_STATE_KILLED) {
+                fail("Job reached terminal status before RUNNING: " + state);
             }
             Thread.sleep(500);
         }
 
-        fail("Job did not reach RUNNING within timeout. Last status: " + status);
+        fail("Job did not reach RUNNING within timeout. Last status: " + state);
     }
 
     private static void pollUntilHealthy(int port, long timeout, TimeUnit unit) throws Exception {

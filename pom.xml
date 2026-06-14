@@ -30,6 +30,7 @@
         <tomcat-annotations.version>6.0.53</tomcat-annotations.version>
         <jackson.version>2.17.0</jackson.version>
         <aws.sdk.version>2.25.27</aws.sdk.version>
+        <prometheus.version>0.16.0</prometheus.version>
     </properties>
 
     <dependencyManagement>
@@ -107,6 +108,18 @@
                 <groupId>software.amazon.awssdk</groupId>
                 <artifactId>s3</artifactId>
                 <version>${aws.sdk.version}</version>
+            </dependency>
+
+            <!-- Prometheus metrics: simpleclient used directly (no Micrometer layer) -->
+            <dependency>
+                <groupId>io.prometheus</groupId>
+                <artifactId>simpleclient</artifactId>
+                <version>${prometheus.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.prometheus</groupId>
+                <artifactId>simpleclient_httpserver</artifactId>
+                <version>${prometheus.version}</version>
             </dependency>
 
             <!-- Testing -->

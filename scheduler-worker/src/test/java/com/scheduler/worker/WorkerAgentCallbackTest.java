@@ -1,6 +1,6 @@
 package com.scheduler.worker;
 
-import com.scheduler.proto.v1.TaskStatus;
+import com.scheduler.proto.v1.TaskState;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class WorkerAgentCallbackTest {
 
     private WorkerAgent agent;
-    private List<StatusUpdate> receivedUpdates;
+    private List<com.scheduler.proto.job.StatusUpdate> receivedUpdates;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -45,16 +45,16 @@ class WorkerAgentCallbackTest {
                 .setJobId("job-1")
                 .setTaskIndex(0)
                 .setTaskName("extract")
-                .setTaskStatus(TaskStatus.TASK_STATUS_RUNNING)
+                .setTaskState(TaskState.TASK_STATE_RUNNING)
                 .build()
                 .toByteArray();
 
-        sendWebSocketBinary(agent.workerAgentUrl(), prefixed(WorkerAgent.TYPE_TAG_STATUS, proto));
+        sendWebSocketBinary(agent.workerAgentUrl(), prefixed(JobCallbackServer.TYPE_TAG_STATUS, proto));
 
         assertEquals(1, receivedUpdates.size());
-        assertEquals("job-1", receivedUpdates.get(0).jobId());
-        assertEquals("extract", receivedUpdates.get(0).taskName());
-        assertEquals("RUNNING", receivedUpdates.get(0).taskStatus());
+        assertEquals("job-1", receivedUpdates.get(0).getJobId());
+        assertEquals("extract", receivedUpdates.get(0).getTaskName());
+        assertEquals(TaskState.TASK_STATE_RUNNING, receivedUpdates.get(0).getTaskState());
     }
 
     /** Prepends a one-byte type tag to a proto payload, matching the SDK wire format. */

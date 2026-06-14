@@ -1,18 +1,24 @@
 package com.scheduler.coordinator;
 
-import com.scheduler.core.FailureReason;
+import com.scheduler.core.FailureMessages;
 import com.scheduler.core.InputFile;
 import com.scheduler.core.Job;
-import com.scheduler.core.JobState;
 import com.scheduler.core.JobStatus;
 import com.scheduler.core.ResourceRequirements;
-import com.scheduler.core.TaskState;
 import com.scheduler.core.TaskStatus;
-import com.scheduler.proto.v1.SubmitJobRequest;
+import com.scheduler.proto.client.SubmitJobRequest;
 
 import java.util.HashSet;
 import java.util.List;
 
+/**
+ * Assembles the client-facing wire shapes from the coordinator's domain objects
+ * and vice versa: the submit request → immutable {@link Job} definition, and the
+ * runtime {@link JobStatus} snapshot → the client {@code Job} proto (which merges
+ * the definition with live state). This is genuine definition/snapshot ⇄ wire
+ * assembly, not a status/enum copy — state and telemetry now use the proto types
+ * directly with no conversion (see CLAUDE.md "One status message").
+ */
 public final class ProtoMapper {
 
     private ProtoMapper() {}
@@ -28,14 +34,14 @@ public final class ProtoMapper {
         );
     }
 
-    public static com.scheduler.proto.v1.Job toProto(JobState execution) {
+    public static com.scheduler.proto.v1.Job toProto(JobStatus execution) {
         com.scheduler.proto.v1.Job.Builder builder = com.scheduler.proto.v1.Job.newBuilder()
                 .setId(execution.id())
                 .setName(execution.job().name())
                 .setArtifactUri(execution.job().artifactUri())
                 .putAllParams(execution.job().params())
-                .setStatus(toProto(execution.status()))
-                .addAllTasks(execution.taskStates().values().stream().map(ProtoMapper::toProto).toList())
+                .setState(execution.state())
+                .addAllTasks(execution.taskStatuses().values().stream().map(ProtoMapper::toProto).toList())
                 .setPriority(execution.job().priority())
                 .addAllInputFiles(execution.job().inputFiles().stream()
                         .map(f -> com.scheduler.proto.v1.InputFile.newBuilder()
@@ -53,85 +59,21 @@ public final class ProtoMapper {
             builder.setCompletedAtMillis(execution.completedAt().toEpochMilli());
         }
         if (execution.failureReason() != null) {
-            builder.setFailureReason(toProto(execution.failureReason()));
+            builder.setFailureReason(execution.failureReason());
             builder.setFailureDetail(execution.failureDetail() != null ? execution.failureDetail() : "");
-            builder.setErrorMessage(execution.failureReason().toMessage(execution.failureDetail()));
+            builder.setErrorMessage(FailureMessages.format(execution.failureReason(), execution.failureDetail()));
         }
         return builder.build();
     }
 
-    public static com.scheduler.proto.v1.Task toProto(TaskState taskExecution) {
-        com.scheduler.proto.v1.Task.Builder builder = com.scheduler.proto.v1.Task.newBuilder()
+    public static com.scheduler.proto.v1.Task toProto(TaskStatus taskExecution) {
+        return com.scheduler.proto.v1.Task.newBuilder()
                 .setId(taskExecution.id())
                 .setName(taskExecution.taskName())
                 .setSequenceNumber(taskExecution.taskIndex())
-                .setStatus(toProto(taskExecution.status()));
-        return builder.build();
-    }
-
-    public static com.scheduler.proto.v1.JobStatus toProto(JobStatus status) {
-        return switch (status) {
-            case SUBMITTED, QUEUED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_QUEUED;
-            case STARTING -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_STARTING;
-            case RUNNING -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_RUNNING;
-            case COMPLETED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_COMPLETED;
-            case FAILED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_FAILED;
-            case KILLED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_KILLED;
-            case CANCELLED -> com.scheduler.proto.v1.JobStatus.JOB_STATUS_CANCELLED;
-        };
-    }
-
-    public static JobStatus toDomain(com.scheduler.proto.v1.JobStatus status) {
-        return switch (status) {
-            case JOB_STATUS_QUEUED -> JobStatus.QUEUED;
-            case JOB_STATUS_STARTING -> JobStatus.STARTING;
-            case JOB_STATUS_RUNNING -> JobStatus.RUNNING;
-            case JOB_STATUS_COMPLETED -> JobStatus.COMPLETED;
-            case JOB_STATUS_FAILED -> JobStatus.FAILED;
-            case JOB_STATUS_KILLED -> JobStatus.KILLED;
-            case JOB_STATUS_CANCELLED -> JobStatus.CANCELLED;
-            default -> throw new IllegalArgumentException("Unknown job status: " + status);
-        };
-    }
-
-    public static com.scheduler.proto.v1.TaskStatus toProto(TaskStatus status) {
-        return switch (status) {
-            case PENDING -> com.scheduler.proto.v1.TaskStatus.TASK_STATUS_PENDING;
-            case RUNNING -> com.scheduler.proto.v1.TaskStatus.TASK_STATUS_RUNNING;
-            case COMPLETED -> com.scheduler.proto.v1.TaskStatus.TASK_STATUS_COMPLETED;
-            case FAILED -> com.scheduler.proto.v1.TaskStatus.TASK_STATUS_FAILED;
-            case SKIPPED -> com.scheduler.proto.v1.TaskStatus.TASK_STATUS_SKIPPED;
-        };
-    }
-
-    public static TaskStatus toDomain(com.scheduler.proto.v1.TaskStatus status) {
-        return switch (status) {
-            case TASK_STATUS_PENDING -> TaskStatus.PENDING;
-            case TASK_STATUS_RUNNING -> TaskStatus.RUNNING;
-            case TASK_STATUS_COMPLETED -> TaskStatus.COMPLETED;
-            case TASK_STATUS_FAILED -> TaskStatus.FAILED;
-            case TASK_STATUS_SKIPPED -> TaskStatus.SKIPPED;
-            default -> throw new IllegalArgumentException("Unknown task status: " + status);
-        };
-    }
-
-    public static com.scheduler.proto.v1.FailureReason toProto(FailureReason reason) {
-        return switch (reason) {
-            case HEARTBEAT_LOST -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_HEARTBEAT_LOST;
-            case PROCESS_TIMEOUT -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_PROCESS_TIMEOUT;
-            case PROCESS_EXITED -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_PROCESS_EXITED;
-            case PROCESS_START_FAILED -> com.scheduler.proto.v1.FailureReason.FAILURE_REASON_PROCESS_START_FAILED;
-        };
-    }
-
-    public static FailureReason toDomain(com.scheduler.proto.v1.FailureReason reason) {
-        return switch (reason) {
-            case FAILURE_REASON_HEARTBEAT_LOST -> FailureReason.HEARTBEAT_LOST;
-            case FAILURE_REASON_PROCESS_TIMEOUT -> FailureReason.PROCESS_TIMEOUT;
-            case FAILURE_REASON_PROCESS_EXITED -> FailureReason.PROCESS_EXITED;
-            case FAILURE_REASON_PROCESS_START_FAILED -> FailureReason.PROCESS_START_FAILED;
-            default -> throw new IllegalArgumentException("Unknown failure reason: " + reason);
-        };
+                .setState(taskExecution.state())
+                .addAllReports(taskExecution.reports().values())   // proto ReportEntry, stored as-is
+                .build();
     }
 
     public static ResourceRequirements toDomain(com.scheduler.proto.v1.ResourceRequirements proto) {

@@ -1,19 +1,18 @@
 syntax = "proto3";
 
-package scheduler.coordinator;
+// Boundary: Coordinator <-> Worker (the worker's CoordinatorClient calls in).
+package scheduler.worker.v1;
 
 option java_multiple_files = true;
-option java_package = "com.scheduler.proto.coordinator";
+option java_package = "com.scheduler.proto.worker";
 
 import "scheduler/v1/common.proto";
-import "scheduler/v1/job_message.proto";
+import "scheduler/v1/job_callback.proto";
 
 message RegisterWorkerRequest {
   string hostname = 1;
-  int32 memory_mb = 2;
-  int32 cpu_cores = 3;
-  bool gpu = 4;
-  repeated string capabilities = 5;
+  // What this worker offers — same shape as what jobs require.
+  scheduler.v1.ResourceRequirements resources = 2;
 }
 
 message RegisterWorkerResponse {
@@ -31,6 +30,9 @@ message PullJobResponse {
 message StatusUpdateResponse {
 }
 
+message ReportTelemetryResponse {
+}
+
 message HeartbeatRequest {
   string worker_id = 1;
 }
@@ -45,6 +47,10 @@ message HeartbeatResponse {
 service WorkerService {
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc PullJob(PullJobRequest) returns (PullJobResponse);
-  rpc ReportStatus(stream scheduler.v1.StatusUpdate) returns (StatusUpdateResponse);
+  rpc ReportStatus(stream scheduler.job.v1.StatusUpdate) returns (StatusUpdateResponse);
+  // Telemetry pipe — separate from the status stream so frequent, lossy reports
+  // never crowd the rare, important lifecycle updates. Unary: the SDK throttles
+  // to <=1 report/s per job, so per-call overhead is negligible.
+  rpc ReportTelemetry(scheduler.job.v1.Report) returns (ReportTelemetryResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }

@@ -1,9 +1,10 @@
 syntax = "proto3";
 
-package scheduler.v1;
+// Boundary: Client (scheduler-cli / SchedulerClient library) <-> Coordinator.
+package scheduler.client.v1;
 
 option java_multiple_files = true;
-option java_package = "com.scheduler.proto.v1";
+option java_package = "com.scheduler.proto.client";
 
 import "scheduler/v1/common.proto";
 
@@ -16,13 +17,13 @@ message SubmitJobRequest {
   reserved 3;
   map<string, string> params = 4;
   int32 priority = 5;
-  repeated InputFile input_files = 6;
+  repeated scheduler.v1.InputFile input_files = 6;
   reserved 7;
   scheduler.v1.ResourceRequirements resources = 8;
 }
 
 message SubmitJobResponse {
-  Job job = 1;
+  scheduler.v1.Job job = 1;
 }
 
 message GetJobStatusRequest {
@@ -30,7 +31,7 @@ message GetJobStatusRequest {
 }
 
 message GetJobStatusResponse {
-  Job job = 1;
+  scheduler.v1.Job job = 1;
 }
 
 message ListJobFilesRequest {
@@ -38,7 +39,7 @@ message ListJobFilesRequest {
 }
 
 message ListJobFilesResponse {
-  repeated OutputFile files = 1;
+  repeated FileInfo files = 1;
 }
 
 message GetJobOutputRequest {
@@ -48,9 +49,16 @@ message GetJobOutputRequest {
 
 message GetJobOutputResponse {
   oneof data {
-    FileHeader header = 1;
+    FileInfo header = 1;
     bytes chunk = 2;
   }
+}
+
+// A job output file's name and size — used both for listings and as the
+// header that precedes a chunked download.
+message FileInfo {
+  string name = 1;
+  int64 size_bytes = 2;
 }
 
 service ClientService {
