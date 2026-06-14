@@ -13,6 +13,13 @@
     <artifactId>scheduler-core</artifactId>
 
     <dependencies>
+        <!-- The generated StatusUpdate/Job protos and their enums are the single
+             status/state types shared across modules (see CLAUDE.md "One status
+             message"). An essential library import, not an infra dependency. -->
+        <dependency>
+            <groupId>com.scheduler</groupId>
+            <artifactId>scheduler-proto</artifactId>
+        </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>s3</artifactId>

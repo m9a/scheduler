@@ -1,0 +1,68 @@
+{
+  "title": "Scheduler",
+  "uid": "scheduler",
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "title": "Queue depth",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 8 },
+      "targets": [{ "expr": "scheduler_queue_depth", "legendFormat": "queued" }]
+    },
+    {
+      "title": "Jobs by status",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 8 },
+      "targets": [{ "expr": "scheduler_jobs", "legendFormat": "{{status}}" }]
+    },
+    {
+      "title": "Job throughput (finished/min)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 8 },
+      "targets": [{ "expr": "rate(scheduler_jobs_finished_total[5m]) * 60", "legendFormat": "{{status}}" }]
+    },
+    {
+      "title": "Queue wait p95 (s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 8 },
+      "targets": [{ "expr": "histogram_quantile(0.95, rate(scheduler_job_queue_wait_seconds_bucket[5m]))", "legendFormat": "p95" }]
+    },
+    {
+      "title": "Workers registered / jobs running",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "scheduler_workers_registered", "legendFormat": "workers" },
+        { "expr": "scheduler_worker_jobs_running", "legendFormat": "jobs running" }
+      ]
+    },
+    {
+      "title": "Job duration p95 by outcome (s)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 8 },
+      "targets": [{ "expr": "histogram_quantile(0.95, rate(scheduler_worker_job_duration_seconds_bucket[10m]))", "legendFormat": "{{outcome}}" }]
+    },
+    {
+      "title": "Job container CPU %",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 8, "h": 8 },
+      "targets": [{ "expr": "scheduler_job_container_cpu_percent", "legendFormat": "{{job_name}}" }]
+    },
+    {
+      "title": "Job container memory",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "gridPos": { "x": 8, "y": 16, "w": 8, "h": 8 },
+      "targets": [{ "expr": "scheduler_job_container_memory_used_bytes", "legendFormat": "{{job_name}}" }]
+    },
+    {
+      "title": "GPU utilization %",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 16, "w": 8, "h": 8 },
+      "targets": [{ "expr": "scheduler_gpu_utilization_percent", "legendFormat": "gpu {{gpu}}" }]
+    }
+  ],
+  "schemaVersion": 39
+}

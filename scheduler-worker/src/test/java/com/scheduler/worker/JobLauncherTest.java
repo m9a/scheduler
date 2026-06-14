@@ -8,7 +8,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-class JobExecutorTest {
+class JobLauncherTest {
 
     @Test
     void buildCommandDocker() {
@@ -16,7 +16,7 @@ class JobExecutorTest {
         Path inputDir = Path.of("/tmp/jobs/job-4/input");
         Path outputDir = Path.of("/tmp/jobs/job-4/output");
 
-        List<String> command = WorkerAgent.buildCommand(details, inputDir, outputDir,
+        List<String> command = JobLauncher.buildCommand(details, inputDir, outputDir,
                 Map.of(), null, null);
 
         assertEquals(List.of(
@@ -36,7 +36,7 @@ class JobExecutorTest {
         Path inputDir = Path.of("/tmp/jobs/job-5/input");
         Path outputDir = Path.of("/tmp/jobs/job-5/output");
 
-        List<String> command = WorkerAgent.buildCommand(details, inputDir, outputDir,
+        List<String> command = JobLauncher.buildCommand(details, inputDir, outputDir,
                 Map.of(), null, null);
 
         assertEquals(List.of(
@@ -56,7 +56,7 @@ class JobExecutorTest {
         Path inputDir = Path.of("/tmp/jobs/job-6/input");
         Path outputDir = Path.of("/tmp/jobs/job-6/output");
 
-        List<String> command = WorkerAgent.buildCommand(details, inputDir, outputDir,
+        List<String> command = JobLauncher.buildCommand(details, inputDir, outputDir,
                 Map.of("containerPort", "8080"), null, null);
 
         assertEquals(List.of(
@@ -77,7 +77,7 @@ class JobExecutorTest {
         Path inputDir = Path.of("/tmp/jobs/job-7/input");
         Path outputDir = Path.of("/tmp/jobs/job-7/output");
 
-        List<String> command = WorkerAgent.buildCommand(details, inputDir, outputDir,
+        List<String> command = JobLauncher.buildCommand(details, inputDir, outputDir,
                 Map.of(), "scheduler-net", "http://mlflow:5000");
 
         assertEquals(List.of(

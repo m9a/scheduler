@@ -12,59 +12,72 @@ Job(name, artifactUri, params, priority, inputFiles)
 
 Runtime state is tracked separately:
 
-- `JobState(id, job, status, taskStates, timestamps, reason)` — mutable runtime state of a submitted job
-- `TaskState(id, taskIndex, taskName, status, timestamps, errorMessage, exitCode)` — mutable runtime state of a task within a job
+- `JobStatus(id, job, state, taskStatuses, timestamps, reason)` — mutable runtime state of a submitted job
+- `TaskStatus(id, taskIndex, taskName, state, timestamps, errorMessage, exitCode)` — mutable runtime state of a task within a job
 - `InputFile(name, uri)` — an input file resolved to an object store URI
 
 The job does not declare its tasks upfront. Tasks are created lazily by the coordinator when the SDK first reports each task's status at runtime.
 
 ## Job Lifecycle
 
-### JobStatus
+These tables are the canonical state definitions — code follows them, not the
+other way around. **Job and task state are owned by the worker.** Task state is
+written only by the SDK (as the job runs); the worker decides the job's terminal
+state from the container's exit. The coordinator writes state in exactly one
+case: the worker is dead (heartbeat lost), when it fails the **job** — it never
+touches task state. It otherwise only applies what the worker sends and de-dupes
+no-ops; it never infers or overrides. A task interrupted by a crash, kill, or
+dead worker keeps its **last reported state** (no one back-fills it to FAILED).
+Status updates travel as one object — a job section, a task section, or both;
+the task section is proxied unchanged from the SDK, plus the worker's RUNNING
+stamp.
+
+### Job states
 
 ```
 QUEUED → STARTING → RUNNING → COMPLETED
-                  ↘         ↘
-                 FAILED    FAILED
-                  ↘         ↘
-                KILLED    KILLED
-                  ↘         ↘
-               CANCELLED  CANCELLED
+              ↘         ↘ FAILED
+            FAILED      ↘ TIMEOUT → KILLED
 ```
 
-| Status | Description |
-|--------|-------------|
-| QUEUED | Submitted, waiting in the priority queue |
-| STARTING | Claimed by a worker, container not yet running |
-| RUNNING | At least one task has started executing |
-| COMPLETED | All tasks finished successfully |
-| FAILED | A task failed or the container exited non-zero |
-| KILLED | Job process timed out, destroyed forcibly |
-| CANCELLED | Cancelled by client |
+| State | Set by | Trigger |
+|-------|--------|---------|
+| QUEUED | coordinator | `submit()` accepts the job |
+| STARTING | coordinator | a worker claims it |
+| RUNNING | worker | first task reports — the worker stamps RUNNING on every task update; the coordinator de-dupes |
+| COMPLETED | worker | container exit 0 |
+| FAILED | worker | container exit ≠ 0 (a task that threw exits the container non-zero), or `docker run` failed to start |
+| FAILED | coordinator | worker missed health checks (heartbeat lost) — the only state the coordinator writes |
+| TIMEOUT | worker | execution deadline hit; kill has been initiated |
+| KILLED | worker | container kill confirmed (always preceded by TIMEOUT, or future cancel) |
+| CANCELLED | coordinator | client cancel — no CancelJob RPC yet, currently unreachable |
 
-### TaskStatus
+### Task states
 
 ```
 PENDING → RUNNING → COMPLETED
-                  ↘
-                 FAILED
-
-PENDING → SKIPPED  (remaining tasks after a failure)
+                  ↘ FAILED
 ```
 
-| Status | Description |
-|--------|-------------|
-| PENDING | Not yet started |
-| RUNNING | Currently executing |
-| COMPLETED | Finished successfully |
-| FAILED | Threw an exception or errored out |
-| SKIPPED | Skipped because a prior task failed |
+| State | Set by | Trigger |
+|-------|--------|---------|
+| PENDING | coordinator | transient — created on the task's first update, transitioned immediately |
+| RUNNING | sdk | `@task` method started |
+| COMPLETED | sdk | method returned normally |
+| FAILED | sdk | method threw/raised (carries the error) |
+
+A task is only ever advanced by the SDK. If the container dies (crash, kill, or
+dead worker) while a task is mid-execution, that task keeps its **last reported
+state** (typically RUNNING) — only the job goes terminal. Tasks that never
+started are simply **absent** from the job's task list — there is no task
+manifest (the JAR is the sole source of task definitions), so a task exists only
+once it has reported. There is no SKIPPED state.
 
 ## Module Structure
 
 | Module | Purpose |
 |--------|---------|
-| `scheduler-core` | Domain records (`Job`, `JobState`, `TaskState`, `InputFile`, `ObjectStore`), enums, exceptions. Zero infrastructure dependencies. |
+| `scheduler-core` | Domain records (`Job`, `JobStatus`, `TaskStatus`, `InputFile`, `ObjectStore`), enums, exceptions. Zero infrastructure dependencies. |
 | `scheduler-proto` | Protobuf/gRPC definitions + generated code. Proto files in `src/main/proto/scheduler/v1/`. |
 | `scheduler-coordinator` | gRPC server, `JobManagerImpl`, `ProtoMapper`, wiring. Sub-packages: `client/` (UserRequestHandler), `worker/` (WorkerHandler). |
 | `scheduler-worker` | WorkerAgent main loop, Docker process spawning, status forwarding, file staging. |
@@ -88,6 +101,12 @@ The **scheduler-sdk** lives in a [separate repository](../scheduler-sdk). It pro
 - **Client → Coordinator**: Clients submit jobs and query status via `ClientService` gRPC.
 - **Worker → Coordinator**: Workers register, pull jobs, and stream status via `WorkerService` gRPC.
 - **Worker → Docker container**: WorkerAgent runs `docker run` with volume mounts for input/output. The container runs the SDK, which sends binary proto status updates to WorkerAgent over WebSocket. WorkerAgent forwards these to the coordinator via gRPC.
+
+### Design decisions (developers, read this)
+
+- **One status message** — the generated `StatusUpdate` proto is the single status type across SDK, worker, and coordinator. There are no parallel domain copies and no proto↔domain conversions; the proto flows SDK → worker → coordinator unchanged. (`scheduler-core` imports the proto — that's an essential library, not an infra dependency.)
+- **One WebSocket connection** — a job container and its worker share exactly one WebSocket connection for all SDK→worker traffic (status + telemetry). No per-message or secondary connections.
+- **State ownership** — job and task state are owned by the **worker**. The coordinator writes state in exactly **one** case: a worker misses its heartbeat / loses its connection, at which point it fails the **job** (never task state). Otherwise the coordinator only applies and de-dupes what the worker sends. Task state is only ever advanced by the SDK; a task interrupted by a crash/kill/dead worker keeps its last reported state.
 
 ## How a Job Runs
 
@@ -187,6 +206,16 @@ mvn compile                      # compile all modules
 mvn test                         # run tests
 mvn compile -pl scheduler-proto  # regenerate proto code after .proto changes
 ```
+
+## Control Plane & Infra Metrics
+
+`control-plane.yaml` is the single config for the control plane: which stacks
+are enabled (MLflow, Prometheus/Grafana) and the coordinator's settings (port,
+heartbeat timeouts, MinIO). `scripts/control-plane.sh up|down|status` derives
+compose profiles/variables from it and logs the fully resolved compose to
+`.control-plane-resolved.yml` for debugging. The coordinator reads the same
+file via `--config`. Available metrics per component:
+[docs/metrics.md](docs/metrics.md).
 
 ## External Dependencies
 

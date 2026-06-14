@@ -1,0 +1,27 @@
+# Control-plane configuration — the single place that says what this infra runs
+# and with what settings. Consumed by:
+#   - scripts/control-plane.sh  → starts/stops the docker stacks (compose profiles
+#     and variables are derived from this file; never edit a generated artifact)
+#   - the coordinator process   → reads its own settings from here (--config)
+#
+# MinIO (object store) is core infra and always on.
+
+mlflow:                 # experiment tracking for training jobs (MLflow + PostgreSQL)
+  enabled: true
+  port: 5000
+
+metrics:                # infra/container metrics (Prometheus + Grafana), see docs/metrics.md
+  enabled: true
+  prometheusPort: 9095
+  grafanaPort: 3000
+
+coordinator:
+  port: 9090            # gRPC; /metrics is served on port + 1
+  heartbeatTimeoutSeconds: 15
+  heartbeatScanIntervalSeconds: 5
+
+minio:
+  endpoint: http://localhost:9000
+  accessKey: minioadmin
+  secretKey: minioadmin
+  bucket: scheduler

@@ -2,11 +2,12 @@ package com.scheduler.coordinator.client;
 
 import com.scheduler.coordinator.ProtoMapper;
 import com.scheduler.core.InputFile;
-import com.scheduler.core.JobState;
+import com.scheduler.core.JobStatus;
 import com.scheduler.core.ObjectStore;
 import com.scheduler.core.exception.JobNotFoundException;
-import com.scheduler.coordinator.JobManagerImpl;
+import com.scheduler.coordinator.JobManager;
 import com.scheduler.proto.v1.*;
+import com.scheduler.proto.client.*;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
@@ -18,25 +19,29 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Handles gRPC RPCs from external clients (CLI, UI, etc.).
+ * <b>Client → Coordinator edge.</b> Implements the ClientService gRPC API that
+ * external clients (scheduler-cli, the SchedulerClient library) call into.
+ * Pure transport plus input-file staging: protos are unpacked/packed via
+ * {@link ProtoMapper}, job state lives in {@link JobManager}, files go through
+ * the ObjectStore.
  *
  * <pre>
- * Client ──gRPC──► UserRequestHandler ──► JobManagerImpl
- *                  (SubmitJob)           (submit, getJob)
- *                  (GetJobStatus)
- *                  (ListJobFiles)        ──► ObjectStore (MinIO)
- *                  (GetJobOutput)
+ * Client ──gRPC──► ClientHandler ──► JobManager
+ *                  SubmitJob          submit   (input files staged to ObjectStore first)
+ *                  GetJobStatus       getJob
+ *                  ListJobFiles    ──► ObjectStore (MinIO)
+ *                  GetJobOutput    ──► ObjectStore (chunked stream)
  * </pre>
  */
-public class UserRequestHandler extends ClientServiceGrpc.ClientServiceImplBase {
+public class ClientHandler extends ClientServiceGrpc.ClientServiceImplBase {
 
-    private static final Logger log = LoggerFactory.getLogger(UserRequestHandler.class);
+    private static final Logger log = LoggerFactory.getLogger(ClientHandler.class);
     private static final int CHUNK_SIZE = 64 * 1024;
 
-    private final JobManagerImpl jobManager;
+    private final JobManager jobManager;
     private final ObjectStore objectStore;
 
-    public UserRequestHandler(JobManagerImpl jobManager, ObjectStore objectStore) {
+    public ClientHandler(JobManager jobManager, ObjectStore objectStore) {
         this.jobManager = jobManager;
         this.objectStore = objectStore;
     }
@@ -49,7 +54,7 @@ public class UserRequestHandler extends ClientServiceGrpc.ClientServiceImplBase 
 
             List<InputFile> resolvedFiles = resolveInputFiles(jobId, request.getInputFilesList());
 
-            JobState execution = jobManager.submit(jobId, ProtoMapper.toDomain(request, resolvedFiles));
+            JobStatus execution = jobManager.submit(jobId, ProtoMapper.toDomain(request, resolvedFiles));
             log.info("Job submitted: jobId={}, name={}, inputFiles={}", execution.id(), execution.job().name(), resolvedFiles.size());
             responseObserver.onNext(SubmitJobResponse.newBuilder()
                     .setJob(ProtoMapper.toProto(execution))
@@ -67,7 +72,7 @@ public class UserRequestHandler extends ClientServiceGrpc.ClientServiceImplBase 
     public void getJobStatus(GetJobStatusRequest request, StreamObserver<GetJobStatusResponse> responseObserver) {
         log.info("Received getJobStatus jobId={}", request.getJobId());
         try {
-            JobState execution = jobManager.getJob(request.getJobId());
+            JobStatus execution = jobManager.getJob(request.getJobId());
             responseObserver.onNext(GetJobStatusResponse.newBuilder()
                     .setJob(ProtoMapper.toProto(execution))
                     .build());
@@ -87,7 +92,7 @@ public class UserRequestHandler extends ClientServiceGrpc.ClientServiceImplBase 
             List<ObjectStore.ObjectInfo> objects = objectStore.listObjects("jobs/" + request.getJobId() + "/");
             ListJobFilesResponse.Builder builder = ListJobFilesResponse.newBuilder();
             for (ObjectStore.ObjectInfo obj : objects) {
-                builder.addFiles(OutputFile.newBuilder()
+                builder.addFiles(FileInfo.newBuilder()
                         .setName(obj.key())
                         .setSizeBytes(obj.sizeBytes())
                         .build());
@@ -109,7 +114,7 @@ public class UserRequestHandler extends ClientServiceGrpc.ClientServiceImplBase 
         try {
             long size = objectStore.getObjectSize(key);
             responseObserver.onNext(GetJobOutputResponse.newBuilder()
-                    .setHeader(FileHeader.newBuilder().setName(request.getPath()).setSizeBytes(size).build())
+                    .setHeader(FileInfo.newBuilder().setName(request.getPath()).setSizeBytes(size).build())
                     .build());
 
             try (InputStream in = objectStore.getObjectStream(key)) {

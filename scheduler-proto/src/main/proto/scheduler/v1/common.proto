@@ -1,28 +1,35 @@
 syntax = "proto3";
 
+// Shared definitions only — every message/enum here is used by at least two
+// boundaries (client_api, worker_api, job_callback). Boundary-specific
+// messages live in their boundary's file.
 package scheduler.v1;
 
 option java_multiple_files = true;
 option java_package = "com.scheduler.proto.v1";
 
-enum JobStatus {
-  JOB_STATUS_UNSPECIFIED = 0;
-  JOB_STATUS_QUEUED = 1;
-  JOB_STATUS_STARTING = 2;
-  JOB_STATUS_RUNNING = 3;
-  JOB_STATUS_COMPLETED = 4;
-  JOB_STATUS_FAILED = 5;
-  JOB_STATUS_CANCELLED = 6;
-  JOB_STATUS_KILLED = 7;
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_QUEUED = 1;
+  JOB_STATE_STARTING = 2;
+  JOB_STATE_RUNNING = 3;
+  JOB_STATE_COMPLETED = 4;
+  JOB_STATE_FAILED = 5;
+  JOB_STATE_CANCELLED = 6;
+  JOB_STATE_KILLED = 7;
+  // Execution deadline hit, kill initiated; KILLED follows once confirmed.
+  JOB_STATE_TIMEOUT = 8;
 }
 
-enum TaskStatus {
-  TASK_STATUS_UNSPECIFIED = 0;
-  TASK_STATUS_PENDING = 1;
-  TASK_STATUS_RUNNING = 2;
-  TASK_STATUS_COMPLETED = 3;
-  TASK_STATUS_FAILED = 4;
-  TASK_STATUS_SKIPPED = 5;
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_COMPLETED = 3;
+  TASK_STATE_FAILED = 4;
+  // 5 was SKIPPED — removed: tasks that never started are simply
+  // absent from the job's task list (no manifest is sent).
+  reserved 5;
 }
 
 enum FailureReason {
@@ -37,7 +44,32 @@ message Task {
   string id = 1;
   string name = 2;
   int32 sequence_number = 3;
-  TaskStatus status = 4;
+  TaskState state = 4;
+
+  // Latest-wins snapshot of the key-value telemetry the job emitted for this
+  // task (progress_*, metrics, events) — populated from forwarded Reports.
+  repeated ReportEntry reports = 5;
+}
+
+// One key-value telemetry entry. The kind classifies how the value behaves;
+// the SDKs choose it from the verb used (progress/metric -> METRIC or
+// ATTRIBUTE, event -> EVENT). COUNTER is reserved, not yet emitted.
+message ReportEntry {
+  string key = 1;
+  ReportKind kind = 2;
+  // A value is either textual or numeric depending on kind.
+  oneof value {
+    string str_value = 3;
+    double num_value = 4;
+  }
+}
+
+enum ReportKind {
+  REPORT_KIND_UNSPECIFIED = 0;
+  REPORT_KIND_METRIC = 1;     // numeric, latest-wins (loss, accuracy, lr, progress_*)
+  REPORT_KIND_ATTRIBUTE = 2;  // set-once string fact (model_version, output_uri)
+  REPORT_KIND_COUNTER = 3;    // monotonic total (records_written, errors)
+  REPORT_KIND_EVENT = 4;      // timestamped note (checkpoint_saved, early_stop)
 }
 
 message Job {
@@ -48,7 +80,7 @@ message Job {
   string artifact_uri = 3;
 
   reserved 4;
-  JobStatus status = 5;
+  JobState state = 5;
   repeated Task tasks = 6;
   int32 priority = 7;
   int64 created_at_millis = 8;
@@ -68,16 +100,6 @@ message InputFile {
     string uri = 2;
     bytes content = 3;
   }
-}
-
-message OutputFile {
-  string name = 1;
-  int64 size_bytes = 2;
-}
-
-message FileHeader {
-  string name = 1;
-  int64 size_bytes = 2;
 }
 
 message ResourceRequirements {

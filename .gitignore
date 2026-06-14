@@ -39,3 +39,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### Control plane ###
+.control-plane-resolved.yml

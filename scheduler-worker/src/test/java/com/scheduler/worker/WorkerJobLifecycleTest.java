@@ -1,9 +1,10 @@
 package com.scheduler.worker;
 
-import com.scheduler.coordinator.JobManagerImpl;
-import com.scheduler.coordinator.client.UserRequestHandler;
+import com.scheduler.coordinator.JobManager;
+import com.scheduler.coordinator.client.ClientHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.proto.v1.*;
+import com.scheduler.proto.client.*;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
@@ -36,7 +37,10 @@ class WorkerJobLifecycleTest {
 
     @FunctionalInterface
     interface SpawnBehavior {
-        int execute(JobDetails details, String workerAgentUrl) throws IOException, InterruptedException;
+        // onTimeout simulates the launcher's deadline hook: call it, then return -1,
+        // to behave like a container that hit the execution timeout.
+        int execute(JobDetails details, String workerAgentUrl, Runnable onTimeout)
+                throws IOException, InterruptedException;
     }
 
     static class TestableWorkerAgent extends WorkerAgent {
@@ -52,8 +56,8 @@ class WorkerJobLifecycleTest {
 
         @Override
         int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
-                            Map<String, String> params) throws IOException, InterruptedException {
-            return spawnBehavior.execute(details, workerAgentUrl());
+                            Map<String, String> params, Runnable onTimeout) throws IOException, InterruptedException {
+            return spawnBehavior.execute(details, workerAgentUrl(), onTimeout);
         }
     }
 
@@ -65,10 +69,10 @@ class WorkerJobLifecycleTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        JobManagerImpl jobManager = new JobManagerImpl();
+        JobManager jobManager = new JobManager();
 
         server = ServerBuilder.forPort(0)
-                .addService(new UserRequestHandler(jobManager, null))
+                .addService(new ClientHandler(jobManager, null))
                 .addService(new WorkerHandler(jobManager))
                 .build()
                 .start();
@@ -96,9 +100,9 @@ class WorkerJobLifecycleTest {
 
     @Test
     void processExitZero() throws Exception {
-        worker.setSpawnBehavior((details, url) -> {
-            postTaskStatus(url, details.jobId(), 0, "extract", "RUNNING", null);
-            postTaskStatus(url, details.jobId(), 0, "extract", "COMPLETED", null);
+        worker.setSpawnBehavior((details, url, onTimeout) -> {
+            postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
+            postTaskState(url, details.jobId(), 0, "extract", "COMPLETED", null);
             return 0;
         });
 
@@ -106,15 +110,15 @@ class WorkerJobLifecycleTest {
         startWorker();
 
         Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, job.getStatus());
+        assertEquals(JobState.JOB_STATE_COMPLETED, job.getState());
         assertTrue(job.getStartedAtMillis() > 0, "startedAt should be set");
         assertTrue(job.getCompletedAtMillis() > 0, "completedAt should be set");
     }
 
     @Test
     void processExitNonZero() throws Exception {
-        worker.setSpawnBehavior((details, url) -> {
-            postTaskStatus(url, details.jobId(), 0, "extract", "RUNNING", null);
+        worker.setSpawnBehavior((details, url, onTimeout) -> {
+            postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
             return 1;
         });
 
@@ -122,33 +126,48 @@ class WorkerJobLifecycleTest {
         startWorker();
 
         Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, job.getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, job.getFailureReason());
         assertEquals("exit code 1", job.getFailureDetail());
         assertTrue(job.getErrorMessage().contains("non-zero code"));
+        // The container died mid-task; the task keeps its last reported state
+        // (RUNNING) — only the job goes FAILED.
+        assertEquals(1, job.getTasksCount());
+        assertEquals(TaskState.TASK_STATE_RUNNING, job.getTasks(0).getState());
     }
 
     @Test
     void processExitNonZeroNoUpdates() throws Exception {
-        worker.setSpawnBehavior((details, url) -> 42);
+        worker.setSpawnBehavior((details, url, onTimeout) -> 42);
 
         String jobId = submitJob("no-updates");
         startWorker();
 
         Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, job.getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
         assertEquals(0, job.getTasksCount());
     }
 
     @Test
     void processTimeout() throws Exception {
-        worker.setSpawnBehavior((details, url) -> -1);
+        // Hold the spawn between the deadline hook and the kill confirmation so
+        // the test can observe the intermediate TIMEOUT state.
+        CountDownLatch killConfirmed = new CountDownLatch(1);
+        worker.setSpawnBehavior((details, url, onTimeout) -> {
+            onTimeout.run();
+            killConfirmed.await();
+            return -1;
+        });
 
         String jobId = submitJob("timeout");
         startWorker();
 
-        Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_KILLED, job.getStatus());
+        Job job = pollUntilStatus(jobId, JobState.JOB_STATE_TIMEOUT, 10, TimeUnit.SECONDS);
+        assertEquals(FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, job.getFailureReason());
+
+        killConfirmed.countDown();
+        job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
+        assertEquals(JobState.JOB_STATE_KILLED, job.getState());
         assertEquals(FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, job.getFailureReason());
         assertTrue(job.getErrorMessage().contains("timed out"));
         assertEquals(0, job.getTasksCount());
@@ -156,9 +175,9 @@ class WorkerJobLifecycleTest {
 
     @Test
     void taskFailed() throws Exception {
-        worker.setSpawnBehavior((details, url) -> {
-            postTaskStatus(url, details.jobId(), 0, "extract", "RUNNING", null);
-            postTaskStatus(url, details.jobId(), 0, "extract", "FAILED", "out of memory");
+        worker.setSpawnBehavior((details, url, onTimeout) -> {
+            postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
+            postTaskState(url, details.jobId(), 0, "extract", "FAILED", "out of memory");
             return 1;
         });
 
@@ -166,8 +185,8 @@ class WorkerJobLifecycleTest {
         startWorker();
 
         Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, job.getStatus());
-        assertEquals(TaskStatus.TASK_STATUS_FAILED, job.getTasks(0).getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
+        assertEquals(TaskState.TASK_STATE_FAILED, job.getTasks(0).getState());
     }
 
     @Test
@@ -183,12 +202,12 @@ class WorkerJobLifecycleTest {
         server.shutdown().awaitTermination(5, TimeUnit.SECONDS);
 
         // Stand up a coordinator with aggressive heartbeat settings (2s timeout, 500ms scan)
-        JobManagerImpl jobManager = new JobManagerImpl();
+        JobManager jobManager = new JobManager();
         WorkerHandler workerHandler = new WorkerHandler(jobManager);
         workerHandler.startHeartbeatMonitor(Duration.ofSeconds(2), Duration.ofMillis(500));
 
         server = ServerBuilder.forPort(0)
-                .addService(new UserRequestHandler(jobManager, null))
+                .addService(new ClientHandler(jobManager, null))
                 .addService(workerHandler)
                 .build()
                 .start();
@@ -203,7 +222,7 @@ class WorkerJobLifecycleTest {
 
         // Block the spawn so the job stays in-flight while we kill the worker
         CountDownLatch spawnBlocked = new CountDownLatch(1);
-        worker.setSpawnBehavior((details, url) -> {
+        worker.setSpawnBehavior((details, url, onTimeout) -> {
             spawnBlocked.await();
             return 0;
         });
@@ -216,7 +235,7 @@ class WorkerJobLifecycleTest {
         while (System.nanoTime() < deadline) {
             GetJobStatusResponse resp = clientStub.getJobStatus(
                     GetJobStatusRequest.newBuilder().setJobId(jobId).build());
-            if (resp.getJob().getStatus() != JobStatus.JOB_STATUS_QUEUED) {
+            if (resp.getJob().getState() != JobState.JOB_STATE_QUEUED) {
                 break;
             }
             Thread.sleep(100);
@@ -228,7 +247,7 @@ class WorkerJobLifecycleTest {
 
         // The coordinator's heartbeat monitor should detect the dead worker and fail the job
         Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, job.getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
         assertEquals(FailureReason.FAILURE_REASON_HEARTBEAT_LOST, job.getFailureReason());
         assertTrue(job.getErrorMessage().contains("heartbeat"),
                 "Expected reason to mention heartbeat, got: " + job.getErrorMessage());
@@ -239,7 +258,7 @@ class WorkerJobLifecycleTest {
 
         // Recreate worker so tearDown doesn't NPE
         worker = new TestableWorkerAgent(testConfig(server.getPort()));
-        worker.setSpawnBehavior((details, url) -> 0);
+        worker.setSpawnBehavior((details, url, onTimeout) -> 0);
         workerThread = null;
 
         workerHandler.shutdownHeartbeatMonitor();
@@ -248,12 +267,12 @@ class WorkerJobLifecycleTest {
     @Test
     void workerContinuesAfterFailure() throws Exception {
         AtomicBoolean first = new AtomicBoolean(true);
-        worker.setSpawnBehavior((details, url) -> {
+        worker.setSpawnBehavior((details, url, onTimeout) -> {
             if (first.compareAndSet(true, false)) {
                 return 1;
             }
-            postTaskStatus(url, details.jobId(), 0, "extract", "RUNNING", null);
-            postTaskStatus(url, details.jobId(), 0, "extract", "COMPLETED", null);
+            postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
+            postTaskState(url, details.jobId(), 0, "extract", "COMPLETED", null);
             return 0;
         });
 
@@ -263,8 +282,8 @@ class WorkerJobLifecycleTest {
 
         Job job1 = pollUntilTerminal(jobId1, 10, TimeUnit.SECONDS);
         Job job2 = pollUntilTerminal(jobId2, 10, TimeUnit.SECONDS);
-        assertEquals(JobStatus.JOB_STATUS_FAILED, job1.getStatus());
-        assertEquals(JobStatus.JOB_STATUS_COMPLETED, job2.getStatus());
+        assertEquals(JobState.JOB_STATE_FAILED, job1.getState());
+        assertEquals(JobState.JOB_STATE_COMPLETED, job2.getState());
     }
 
     // -- helpers --
@@ -291,6 +310,24 @@ class WorkerJobLifecycleTest {
         workerThread.start();
     }
 
+    /** Polls until the job reaches the given (possibly transient) status — for observing TIMEOUT. */
+    private Job pollUntilStatus(String jobId, JobState expected, long timeout, TimeUnit unit)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + unit.toNanos(timeout);
+        Job job = null;
+        while (System.nanoTime() < deadline) {
+            job = clientStub.getJobStatus(
+                    GetJobStatusRequest.newBuilder().setJobId(jobId).build()).getJob();
+            if (job.getState() == expected) {
+                return job;
+            }
+            Thread.sleep(50);
+        }
+        fail("Job did not reach " + expected + " within timeout. Last status: "
+                + (job != null ? job.getState() : "null"));
+        return null;
+    }
+
     private Job pollUntilTerminal(String jobId, long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
         Job job = null;
@@ -299,27 +336,27 @@ class WorkerJobLifecycleTest {
             GetJobStatusResponse response = clientStub.getJobStatus(
                     GetJobStatusRequest.newBuilder().setJobId(jobId).build());
             job = response.getJob();
-            JobStatus status = job.getStatus();
+            JobState state = job.getState();
 
-            if (status == JobStatus.JOB_STATUS_COMPLETED || status == JobStatus.JOB_STATUS_FAILED
-                    || status == JobStatus.JOB_STATUS_KILLED) {
+            if (state == JobState.JOB_STATE_COMPLETED || state == JobState.JOB_STATE_FAILED
+                    || state == JobState.JOB_STATE_KILLED) {
                 return job;
             }
             Thread.sleep(100);
         }
 
-        fail("Job did not reach terminal status within timeout. Last status: " + (job != null ? job.getStatus() : "null"));
+        fail("Job did not reach terminal status within timeout. Last status: " + (job != null ? job.getState() : "null"));
         return null;
     }
 
-    private static void postTaskStatus(String workerUrl, String jobId, int taskIndex,
+    private static void postTaskState(String workerUrl, String jobId, int taskIndex,
                                         String taskName, String status, String errorMessage) {
         try {
-            TaskStatus protoStatus = switch (status) {
-                case "RUNNING" -> TaskStatus.TASK_STATUS_RUNNING;
-                case "COMPLETED" -> TaskStatus.TASK_STATUS_COMPLETED;
-                case "FAILED" -> TaskStatus.TASK_STATUS_FAILED;
-                default -> TaskStatus.TASK_STATUS_UNSPECIFIED;
+            TaskState protoStatus = switch (status) {
+                case "RUNNING" -> TaskState.TASK_STATE_RUNNING;
+                case "COMPLETED" -> TaskState.TASK_STATE_COMPLETED;
+                case "FAILED" -> TaskState.TASK_STATE_FAILED;
+                default -> TaskState.TASK_STATE_UNSPECIFIED;
             };
 
             com.scheduler.proto.job.StatusUpdate.Builder builder =
@@ -327,14 +364,14 @@ class WorkerJobLifecycleTest {
                             .setJobId(jobId)
                             .setTaskIndex(taskIndex)
                             .setTaskName(taskName)
-                            .setTaskStatus(protoStatus);
+                            .setTaskState(protoStatus);
             if (errorMessage != null) {
                 builder.setErrorMessage(errorMessage);
             }
 
             byte[] proto = builder.build().toByteArray();
             byte[] framed = new byte[proto.length + 1];
-            framed[0] = WorkerAgent.TYPE_TAG_STATUS;
+            framed[0] = JobCallbackServer.TYPE_TAG_STATUS;
             System.arraycopy(proto, 0, framed, 1, proto.length);
 
             WebSocket ws = HttpClient.newHttpClient().newWebSocketBuilder()
