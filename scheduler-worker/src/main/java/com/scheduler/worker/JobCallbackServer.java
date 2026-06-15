@@ -1,5 +1,8 @@
 package com.scheduler.worker;
 
+import com.scheduler.proto.job.Liveness;
+import com.scheduler.proto.job.Report;
+import com.scheduler.proto.job.StatusUpdate;
 import org.java_websocket.WebSocket;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
@@ -43,17 +46,19 @@ class JobCallbackServer extends WebSocketServer {
     // Sent back to the SDK to confirm a status frame was received and forwarded.
     static final byte TYPE_TAG_ACK = 0x02;
     static final byte TYPE_TAG_REPORT = 0x03;
+    // SDK liveness ping — consumed locally for stall detection, never forwarded.
+    static final byte TYPE_TAG_LIVENESS = 0x04;
 
     /** Receives task status updates parsed from WebSocket binary frames. */
     @FunctionalInterface
     public interface StatusHandler {
-        void handle(com.scheduler.proto.job.StatusUpdate update);
+        void handle(StatusUpdate update);
     }
 
     /** Receives key-value telemetry (Report) parsed from WebSocket binary frames. */
     @FunctionalInterface
     public interface ReportHandler {
-        void handle(com.scheduler.proto.job.Report report);
+        void handle(Report report);
     }
 
     private volatile StatusHandler statusHandler;
@@ -103,8 +108,8 @@ class JobCallbackServer extends WebSocketServer {
             buffer.get(payload);
 
             if (typeTag == TYPE_TAG_STATUS) {
-                com.scheduler.proto.job.StatusUpdate update =
-                        com.scheduler.proto.job.StatusUpdate.parseFrom(payload);
+                StatusUpdate update =
+                        StatusUpdate.parseFrom(payload);
                 log.info("Received status from JobProcess: jobId={}, taskIndex={}, taskName={}, taskState={}",
                         update.getJobId(), update.getTaskIndex(), update.getTaskName(), update.getTaskState());
                 StatusHandler handler = statusHandler;
@@ -117,8 +122,8 @@ class JobCallbackServer extends WebSocketServer {
                     log.warn("No status handler registered, dropping update: jobId={}", update.getJobId());
                 }
             } else if (typeTag == TYPE_TAG_REPORT) {
-                com.scheduler.proto.job.Report report =
-                        com.scheduler.proto.job.Report.parseFrom(payload);
+                Report report =
+                        Report.parseFrom(payload);
                 log.debug("Received telemetry from JobProcess: jobId={}, taskIndex={}, entries={}",
                         report.getJobId(), report.getTaskIndex(), report.getEntriesCount());
                 ReportHandler handler = reportHandler;
@@ -127,6 +132,10 @@ class JobCallbackServer extends WebSocketServer {
                 } else {
                     log.warn("No report handler registered, dropping telemetry: jobId={}", report.getJobId());
                 }
+            } else if (typeTag == TYPE_TAG_LIVENESS) {
+                Liveness ping = Liveness.parseFrom(payload);
+                // Phase 2 wires this to per-job stall detection; for now just record it.
+                log.debug("Received liveness ping: jobId={}", ping.getJobId());
             } else {
                 log.warn("Unknown type tag 0x{} from {}",
                         String.format("%02x", typeTag), conn.getRemoteSocketAddress());

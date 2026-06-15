@@ -2,6 +2,7 @@ package com.scheduler.coordinator;
 
 import com.scheduler.core.*;
 import com.scheduler.core.exception.JobNotFoundException;
+import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.JobState;
 import com.scheduler.proto.v1.ReportEntry;
@@ -134,7 +135,7 @@ public class JobManager {
 
 
     /**
-     * Applies a status update from the worker — one {@link com.scheduler.proto.job.StatusUpdate}
+     * Applies a status update from the worker — one {@link StatusUpdate}
      * proto, job section always present, task section only when a task changed
      * (see README "Job Lifecycle"). The task section is applied <b>before</b> the
      * job section so a terminal update sees the final task states.
@@ -146,7 +147,7 @@ public class JobManager {
      * dropped — they're late messages arriving after the heartbeat monitor
      * already failed the job.
      */
-    public synchronized void handleStatusUpdate(com.scheduler.proto.job.StatusUpdate update) {
+    public synchronized void handleStatusUpdate(StatusUpdate update) {
         String jobId = update.getJobId();
         JobStatus job = getJob(jobId);
 

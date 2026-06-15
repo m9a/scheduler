@@ -1,5 +1,7 @@
 package com.scheduler.worker;
 
+import com.scheduler.proto.job.Report;
+import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.worker.HeartbeatRequest;
 import com.scheduler.proto.worker.PullJobRequest;
 import com.scheduler.proto.worker.PullJobResponse;
@@ -108,7 +110,7 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     /** Forwards job-emitted telemetry to the coordinator. Lossy by design — log and move on. */
-    void forwardTelemetry(com.scheduler.proto.job.Report report) {
+    void forwardTelemetry(Report report) {
         try {
             blockingStub.reportTelemetry(report);
         } catch (Exception e) {
@@ -154,7 +156,7 @@ class CoordinatorClient implements AutoCloseable {
         };
 
         // Send side: each onNext() pushes a status update to the coordinator
-        StreamObserver<com.scheduler.proto.job.StatusUpdate> requestObserver =
+        StreamObserver<StatusUpdate> requestObserver =
                 asyncStub.reportStatus(responseObserver);
 
         return new CoordinatorStatusStream(requestObserver, done);
