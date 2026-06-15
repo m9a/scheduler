@@ -3,6 +3,7 @@ package com.scheduler.worker;
 import com.scheduler.proto.job.Report;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.worker.HeartbeatRequest;
+import com.scheduler.proto.worker.JobLiveness;
 import com.scheduler.proto.worker.PullJobRequest;
 import com.scheduler.proto.worker.PullJobResponse;
 import com.scheduler.proto.worker.RegisterWorkerRequest;
@@ -116,6 +117,18 @@ class CoordinatorClient implements AutoCloseable {
         } catch (Exception e) {
             log.warn("Failed to forward telemetry for job={}, taskIndex={}: {}",
                     report.getJobId(), report.getTaskIndex(), e.getMessage());
+        }
+    }
+
+    /** Reports a job's worker-tracked last-activity time. Lossy — log and move on. */
+    void reportLiveness(String jobId, long lastActivityAtMillis) {
+        try {
+            blockingStub.reportLiveness(JobLiveness.newBuilder()
+                    .setJobId(jobId)
+                    .setLastActivityAtMillis(lastActivityAtMillis)
+                    .build());
+        } catch (Exception e) {
+            log.debug("Failed to report liveness for job={}: {}", jobId, e.getMessage());
         }
     }
 

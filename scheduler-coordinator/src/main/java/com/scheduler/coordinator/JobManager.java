@@ -56,6 +56,11 @@ public class JobManager {
     // which jobs to fail when a worker dies.
     private final ConcurrentHashMap<String, String> jobWorker = new ConcurrentHashMap<>();
 
+    // jobId -> last-activity epoch millis, reported by the worker (which owns job
+    // liveness — it sees the SDK's frames and pings). Read by the client API;
+    // removed when the job goes terminal.
+    private final ConcurrentHashMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
+
 
     public synchronized JobStatus submit(String jobId, Job job) {
         JobStatus execution = new JobStatus(
@@ -186,6 +191,7 @@ public class JobManager {
         };
         if (JobStates.isTerminal(jobState)) {
             jobWorker.remove(jobId);
+            lastActivityMillis.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(CoordinatorMetrics.jobStateLabel(jobState)).inc();
         }
         jobs.put(jobId, updated);
@@ -223,6 +229,24 @@ public class JobManager {
         task.applyReports(entries);
     }
 
+    /**
+     * Records the worker-reported last-activity time for a live job (the worker
+     * owns liveness — see CLAUDE.md "State ownership"). Ignored for unknown or
+     * already-terminal jobs.
+     */
+    public synchronized void updateLastActivity(String jobId, long lastActivityAtMillis) {
+        JobStatus job = jobs.get(jobId);
+        if (job == null || JobStates.isTerminal(job.state())) {
+            return;
+        }
+        lastActivityMillis.put(jobId, lastActivityAtMillis);
+    }
+
+    /** Last-activity epoch millis for a job, or 0 if none reported. Read by the client API. */
+    public long lastActivity(String jobId) {
+        return lastActivityMillis.getOrDefault(jobId, 0L);
+    }
+
 
     /**
      * Fails all non-terminal jobs assigned to the given worker.
@@ -243,6 +267,7 @@ public class JobManager {
             JobStatus job = jobs.get(jobId);
             if (job == null || JobStates.isTerminal(job.state())) {
                 jobWorker.remove(jobId);
+                lastActivityMillis.remove(jobId);
                 continue;
             }
             // Only the job state is written here; any in-progress task keeps its
@@ -250,6 +275,7 @@ public class JobManager {
             JobStatus failed = job.fail(reason, null);
             jobs.put(jobId, failed);
             jobWorker.remove(jobId);
+            lastActivityMillis.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(
                     CoordinatorMetrics.jobStateLabel(JobState.JOB_STATE_FAILED)).inc();
             log.info("Failed job due to dead worker: jobId={}, workerId={}, reason={}",

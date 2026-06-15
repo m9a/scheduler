@@ -92,6 +92,9 @@ message Job {
   FailureReason failure_reason = 14;
   string failure_detail = 15;
   ResourceRequirements resources = 16;
+  // Worker-reported last-activity time (SDK frames incl. liveness pings); 0 when
+  // never reported. Surfaced for the API/UI "last health check" of the job.
+  int64 last_activity_at_millis = 17;
 }
 
 message InputFile {

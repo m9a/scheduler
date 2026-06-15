@@ -63,6 +63,8 @@ class JobCallbackServer extends WebSocketServer {
 
     private volatile StatusHandler statusHandler;
     private volatile ReportHandler reportHandler;
+    // Fired on every inbound frame (status/report/liveness) — feeds stall detection.
+    private volatile Runnable activityListener;
     private final CountDownLatch ready = new CountDownLatch(1);
 
     JobCallbackServer(InetSocketAddress address) {
@@ -81,6 +83,18 @@ class JobCallbackServer extends WebSocketServer {
 
     void setReportHandler(ReportHandler handler) {
         this.reportHandler = handler;
+    }
+
+    /** Sets the per-job activity listener, run on every inbound frame (for stall detection). */
+    void setActivityListener(Runnable listener) {
+        this.activityListener = listener;
+    }
+
+    private void notifyActivity() {
+        Runnable listener = activityListener;
+        if (listener != null) {
+            listener.run();
+        }
     }
 
     @Override
@@ -106,6 +120,11 @@ class JobCallbackServer extends WebSocketServer {
             byte typeTag = buffer.get();
             byte[] payload = new byte[buffer.remaining()];
             buffer.get(payload);
+
+            // Any frame from the SDK is proof of life for stall detection.
+            if (typeTag == TYPE_TAG_STATUS || typeTag == TYPE_TAG_REPORT || typeTag == TYPE_TAG_LIVENESS) {
+                notifyActivity();
+            }
 
             if (typeTag == TYPE_TAG_STATUS) {
                 StatusUpdate update =

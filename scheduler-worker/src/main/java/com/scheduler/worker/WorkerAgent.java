@@ -211,11 +211,19 @@ public class WorkerAgent implements AutoCloseable {
         onStatusUpdate(update -> statusStream.report(
                 update.toBuilder().setJobState(JobState.JOB_STATE_RUNNING).build()));
 
+        // Worker-owned liveness: every inbound SDK frame bumps the monitor, which
+        // forwards the job's last-activity time to the coordinator periodically.
+        JobLivenessMonitor liveness = new JobLivenessMonitor(job.getId(), coordinator);
+        jobCallbacks.setActivityListener(liveness::recordActivity);
+        liveness.start();
+
         metrics.jobStarted(job.getId(), job.getName());
         StatusUpdate terminal = awaitContainerOutcome(job, inputDir, outputDir, logFile, statusStream);
         try {
             statusStream.report(terminal);
         } finally {
+            liveness.close();
+            jobCallbacks.setActivityListener(null);
             metrics.jobFinished(job.getId(), job.getName(), outcomeLabel(terminal.getJobState()));
             statusStream.complete();
             awaitStreamClose(statusStream);

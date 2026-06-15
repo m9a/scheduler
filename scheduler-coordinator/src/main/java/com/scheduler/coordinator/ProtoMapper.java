@@ -34,7 +34,7 @@ public final class ProtoMapper {
         );
     }
 
-    public static com.scheduler.proto.v1.Job toProto(JobStatus execution) {
+    public static com.scheduler.proto.v1.Job toProto(JobStatus execution, long lastActivityAtMillis) {
         com.scheduler.proto.v1.Job.Builder builder = com.scheduler.proto.v1.Job.newBuilder()
                 .setId(execution.id())
                 .setName(execution.job().name())
@@ -57,6 +57,9 @@ public final class ProtoMapper {
         }
         if (execution.completedAt() != null) {
             builder.setCompletedAtMillis(execution.completedAt().toEpochMilli());
+        }
+        if (lastActivityAtMillis > 0) {
+            builder.setLastActivityAtMillis(lastActivityAtMillis);
         }
         if (execution.failureReason() != null) {
             builder.setFailureReason(execution.failureReason());

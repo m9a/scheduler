@@ -13,6 +13,8 @@ import com.scheduler.proto.v1.JobState;
 import com.scheduler.proto.v1.TaskState;
 import com.scheduler.proto.worker.HeartbeatRequest;
 import com.scheduler.proto.worker.HeartbeatResponse;
+import com.scheduler.proto.worker.JobLiveness;
+import com.scheduler.proto.worker.ReportLivenessResponse;
 import com.scheduler.proto.worker.PullJobRequest;
 import com.scheduler.proto.worker.PullJobResponse;
 import com.scheduler.proto.worker.RegisterWorkerRequest;
@@ -96,7 +98,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
         PullJobResponse.Builder builder = PullJobResponse.newBuilder();
         if (claimed.isPresent()) {
             log.info("Assigned jobId={} to workerId={}", claimed.get().id(), request.getWorkerId());
-            builder.setJob(ProtoMapper.toProto(claimed.get()));
+            builder.setJob(ProtoMapper.toProto(claimed.get(), jobManager.lastActivity(claimed.get().id())));
         } else {
             log.debug("No jobs available for workerId={}", request.getWorkerId());
         }
@@ -151,6 +153,15 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                     request.getJobId(), request.getTaskIndex(), e.getMessage());
         }
         responseObserver.onNext(ReportTelemetryResponse.getDefaultInstance());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void reportLiveness(JobLiveness request, StreamObserver<ReportLivenessResponse> responseObserver) {
+        log.debug("Received liveness from job={}, lastActivityAtMillis={}",
+                request.getJobId(), request.getLastActivityAtMillis());
+        jobManager.updateLastActivity(request.getJobId(), request.getLastActivityAtMillis());
+        responseObserver.onNext(ReportLivenessResponse.getDefaultInstance());
         responseObserver.onCompleted();
     }
 
