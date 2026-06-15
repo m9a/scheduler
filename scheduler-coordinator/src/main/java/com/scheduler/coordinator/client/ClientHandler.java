@@ -57,7 +57,7 @@ public class ClientHandler extends ClientServiceGrpc.ClientServiceImplBase {
             JobStatus execution = jobManager.submit(jobId, ProtoMapper.toDomain(request, resolvedFiles));
             log.info("Job submitted: jobId={}, name={}, inputFiles={}", execution.id(), execution.job().name(), resolvedFiles.size());
             responseObserver.onNext(SubmitJobResponse.newBuilder()
-                    .setJob(ProtoMapper.toProto(execution))
+                    .setJob(ProtoMapper.toProto(execution, jobManager.lastActivity(execution.id())))
                     .build());
             responseObserver.onCompleted();
         } catch (IllegalArgumentException e) {
@@ -74,7 +74,7 @@ public class ClientHandler extends ClientServiceGrpc.ClientServiceImplBase {
         try {
             JobStatus execution = jobManager.getJob(request.getJobId());
             responseObserver.onNext(GetJobStatusResponse.newBuilder()
-                    .setJob(ProtoMapper.toProto(execution))
+                    .setJob(ProtoMapper.toProto(execution, jobManager.lastActivity(execution.id())))
                     .build());
             responseObserver.onCompleted();
         } catch (JobNotFoundException e) {

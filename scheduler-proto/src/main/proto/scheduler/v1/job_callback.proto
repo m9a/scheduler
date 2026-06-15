@@ -48,3 +48,14 @@ message Report {
   int64 timestamp_ms = 3;
   repeated scheduler.v1.ReportEntry entries = 4;
 }
+
+// Liveness ping: SDK -> Worker only, proving the job process/connection is
+// alive (not that work is advancing). Sent on a fixed interval while a task
+// runs. Consumed locally by the worker for stall detection — never forwarded
+// to the coordinator.
+//
+// WebSocket frame: [0x04] [Liveness bytes]
+message Liveness {
+  string job_id = 1;
+  int64 timestamp_ms = 2;
+}

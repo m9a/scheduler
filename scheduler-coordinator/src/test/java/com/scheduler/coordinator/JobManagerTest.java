@@ -306,6 +306,38 @@ class JobManagerTest {
         assertTrue(claimed.isEmpty());
     }
 
+    @Test
+    void lastActivityTracked() {
+        JobStatus claimed = submitAndClaim("live");
+        jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
+
+        jobManager.updateLastActivity(claimed.id(), 1234L);
+
+        assertEquals(1234L, jobManager.lastActivity(claimed.id()));
+    }
+
+    @Test
+    void lastActivityClearedOnTerminal() {
+        JobStatus claimed = submitAndClaim("done");
+        jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
+        jobManager.updateLastActivity(claimed.id(), 1234L);
+
+        jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_COMPLETED, null, null));
+
+        assertEquals(0L, jobManager.lastActivity(claimed.id()));
+    }
+
+    @Test
+    void lastActivityIgnoredForTerminalJob() {
+        JobStatus claimed = submitAndClaim("term");
+        jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_FAILED,
+                FailureReason.FAILURE_REASON_PROCESS_EXITED, "exit code 1"));
+
+        jobManager.updateLastActivity(claimed.id(), 1234L);  // late report — must be ignored
+
+        assertEquals(0L, jobManager.lastActivity(claimed.id()));
+    }
+
     // -- helpers --
 
     private static StatusUpdate jobUpdate(String jobId, JobState state, FailureReason reason, String detail) {

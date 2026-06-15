@@ -1,5 +1,6 @@
 package com.scheduler.worker;
 
+import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.TaskState;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class WorkerAgentCallbackTest {
 
     private WorkerAgent agent;
-    private List<com.scheduler.proto.job.StatusUpdate> receivedUpdates;
+    private List<StatusUpdate> receivedUpdates;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -41,7 +42,7 @@ class WorkerAgentCallbackTest {
 
     @Test
     void receiveUpdate() throws Exception {
-        byte[] proto = com.scheduler.proto.job.StatusUpdate.newBuilder()
+        byte[] proto = StatusUpdate.newBuilder()
                 .setJobId("job-1")
                 .setTaskIndex(0)
                 .setTaskName("extract")

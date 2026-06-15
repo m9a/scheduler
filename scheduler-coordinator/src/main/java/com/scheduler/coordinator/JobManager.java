@@ -2,6 +2,7 @@ package com.scheduler.coordinator;
 
 import com.scheduler.core.*;
 import com.scheduler.core.exception.JobNotFoundException;
+import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.JobState;
 import com.scheduler.proto.v1.ReportEntry;
@@ -54,6 +55,11 @@ public class JobManager {
     // when the job reaches a terminal state. Used by the heartbeat monitor to find
     // which jobs to fail when a worker dies.
     private final ConcurrentHashMap<String, String> jobWorker = new ConcurrentHashMap<>();
+
+    // jobId -> last-activity epoch millis, reported by the worker (which owns job
+    // liveness — it sees the SDK's frames and pings). Read by the client API;
+    // removed when the job goes terminal.
+    private final ConcurrentHashMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
 
 
     public synchronized JobStatus submit(String jobId, Job job) {
@@ -134,7 +140,7 @@ public class JobManager {
 
 
     /**
-     * Applies a status update from the worker — one {@link com.scheduler.proto.job.StatusUpdate}
+     * Applies a status update from the worker — one {@link StatusUpdate}
      * proto, job section always present, task section only when a task changed
      * (see README "Job Lifecycle"). The task section is applied <b>before</b> the
      * job section so a terminal update sees the final task states.
@@ -146,7 +152,7 @@ public class JobManager {
      * dropped — they're late messages arriving after the heartbeat monitor
      * already failed the job.
      */
-    public synchronized void handleStatusUpdate(com.scheduler.proto.job.StatusUpdate update) {
+    public synchronized void handleStatusUpdate(StatusUpdate update) {
         String jobId = update.getJobId();
         JobStatus job = getJob(jobId);
 
@@ -185,6 +191,7 @@ public class JobManager {
         };
         if (JobStates.isTerminal(jobState)) {
             jobWorker.remove(jobId);
+            lastActivityMillis.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(CoordinatorMetrics.jobStateLabel(jobState)).inc();
         }
         jobs.put(jobId, updated);
@@ -222,6 +229,24 @@ public class JobManager {
         task.applyReports(entries);
     }
 
+    /**
+     * Records the worker-reported last-activity time for a live job (the worker
+     * owns liveness — see CLAUDE.md "State ownership"). Ignored for unknown or
+     * already-terminal jobs.
+     */
+    public synchronized void updateLastActivity(String jobId, long lastActivityAtMillis) {
+        JobStatus job = jobs.get(jobId);
+        if (job == null || JobStates.isTerminal(job.state())) {
+            return;
+        }
+        lastActivityMillis.put(jobId, lastActivityAtMillis);
+    }
+
+    /** Last-activity epoch millis for a job, or 0 if none reported. Read by the client API. */
+    public long lastActivity(String jobId) {
+        return lastActivityMillis.getOrDefault(jobId, 0L);
+    }
+
 
     /**
      * Fails all non-terminal jobs assigned to the given worker.
@@ -242,6 +267,7 @@ public class JobManager {
             JobStatus job = jobs.get(jobId);
             if (job == null || JobStates.isTerminal(job.state())) {
                 jobWorker.remove(jobId);
+                lastActivityMillis.remove(jobId);
                 continue;
             }
             // Only the job state is written here; any in-progress task keeps its
@@ -249,6 +275,7 @@ public class JobManager {
             JobStatus failed = job.fail(reason, null);
             jobs.put(jobId, failed);
             jobWorker.remove(jobId);
+            lastActivityMillis.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(
                     CoordinatorMetrics.jobStateLabel(JobState.JOB_STATE_FAILED)).inc();
             log.info("Failed job due to dead worker: jobId={}, workerId={}, reason={}",

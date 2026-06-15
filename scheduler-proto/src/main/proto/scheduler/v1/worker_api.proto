@@ -41,6 +41,17 @@ message HeartbeatResponse {
   bool should_drain = 1;
 }
 
+// Worker -> Coordinator: the worker owns job liveness (it receives the SDK's
+// pings); it forwards the job's last-activity time so the coordinator can expose
+// it on GetJobStatus. Throttled (~once per probe interval), not per ping.
+message JobLiveness {
+  string job_id = 1;
+  int64 last_activity_at_millis = 2;
+}
+
+message ReportLivenessResponse {
+}
+
 // WorkerService is the coordinator-side gRPC service that workers connect to.
 // Workers call these RPCs to register, pull jobs, stream status updates
 // (both job-level and task-level), and send heartbeats.
@@ -53,4 +64,6 @@ service WorkerService {
   // to <=1 report/s per job, so per-call overhead is negligible.
   rpc ReportTelemetry(scheduler.job.v1.Report) returns (ReportTelemetryResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Per-job last-activity (worker-tracked from SDK frames incl. liveness pings).
+  rpc ReportLiveness(JobLiveness) returns (ReportLivenessResponse);
 }

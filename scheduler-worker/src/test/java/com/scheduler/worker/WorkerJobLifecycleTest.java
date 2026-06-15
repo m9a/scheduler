@@ -4,6 +4,7 @@ import com.scheduler.coordinator.JobManager;
 import com.scheduler.coordinator.client.ClientHandler;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.proto.v1.*;
+import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.client.*;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -359,8 +360,8 @@ class WorkerJobLifecycleTest {
                 default -> TaskState.TASK_STATE_UNSPECIFIED;
             };
 
-            com.scheduler.proto.job.StatusUpdate.Builder builder =
-                    com.scheduler.proto.job.StatusUpdate.newBuilder()
+            StatusUpdate.Builder builder =
+                    StatusUpdate.newBuilder()
                             .setJobId(jobId)
                             .setTaskIndex(taskIndex)
                             .setTaskName(taskName)
