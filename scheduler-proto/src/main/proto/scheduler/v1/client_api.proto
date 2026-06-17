@@ -1,6 +1,5 @@
 syntax = "proto3";
 
-// Boundary: Client (scheduler-cli / SchedulerClient library) <-> Coordinator.
 package scheduler.client.v1;
 
 option java_multiple_files = true;
@@ -8,12 +7,10 @@ option java_package = "com.scheduler.proto.client";
 
 import "scheduler/v1/common.proto";
 
+// Client -> Coordinator
 message SubmitJobRequest {
   string name = 1;
-
-  // Docker image reference (e.g., registry.example.com/job:v1).
   string artifact_uri = 2;
-
   reserved 3;
   map<string, string> params = 4;
   int32 priority = 5;
@@ -22,31 +19,38 @@ message SubmitJobRequest {
   scheduler.v1.ResourceRequirements resources = 8;
 }
 
+// Coordinator -> Client
 message SubmitJobResponse {
   scheduler.v1.Job job = 1;
 }
 
+// Client -> Coordinator
 message GetJobStatusRequest {
   string job_id = 1;
 }
 
+// Coordinator -> Client
 message GetJobStatusResponse {
   scheduler.v1.Job job = 1;
 }
 
+// Client -> Coordinator
 message ListJobFilesRequest {
   string job_id = 1;
 }
 
+// Coordinator -> Client
 message ListJobFilesResponse {
   repeated FileInfo files = 1;
 }
 
+// Client -> Coordinator
 message GetJobOutputRequest {
   string job_id = 1;
   string path = 2;
 }
 
+// Coordinator -> Client
 message GetJobOutputResponse {
   oneof data {
     FileInfo header = 1;
@@ -54,16 +58,18 @@ message GetJobOutputResponse {
   }
 }
 
-// A job output file's name and size — used both for listings and as the
-// header that precedes a chunked download.
 message FileInfo {
   string name = 1;
   int64 size_bytes = 2;
 }
 
 service ClientService {
+  // Client -> Coordinator
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  // Client -> Coordinator
   rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  // Client -> Coordinator
   rpc ListJobFiles(ListJobFilesRequest) returns (ListJobFilesResponse);
+  // Client -> Coordinator
   rpc GetJobOutput(GetJobOutputRequest) returns (stream GetJobOutputResponse);
 }

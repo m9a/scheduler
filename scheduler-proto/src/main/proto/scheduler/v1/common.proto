@@ -1,8 +1,5 @@
 syntax = "proto3";
 
-// Shared definitions only — every message/enum here is used by at least two
-// boundaries (client_api, worker_api, job_callback). Boundary-specific
-// messages live in their boundary's file.
 package scheduler.v1;
 
 option java_multiple_files = true;
@@ -17,7 +14,6 @@ enum JobState {
   JOB_STATE_FAILED = 5;
   JOB_STATE_CANCELLED = 6;
   JOB_STATE_KILLED = 7;
-  // Execution deadline hit, kill initiated; KILLED follows once confirmed.
   JOB_STATE_TIMEOUT = 8;
 }
 
@@ -27,8 +23,6 @@ enum TaskState {
   TASK_STATE_RUNNING = 2;
   TASK_STATE_COMPLETED = 3;
   TASK_STATE_FAILED = 4;
-  // 5 was SKIPPED — removed: tasks that never started are simply
-  // absent from the job's task list (no manifest is sent).
   reserved 5;
 }
 
@@ -38,6 +32,15 @@ enum FailureReason {
   FAILURE_REASON_PROCESS_TIMEOUT = 2;
   FAILURE_REASON_PROCESS_EXITED = 3;
   FAILURE_REASON_PROCESS_START_FAILED = 4;
+  FAILURE_REASON_UNRESPONSIVE = 5;
+}
+
+enum ReportKind {
+  REPORT_KIND_UNSPECIFIED = 0;
+  REPORT_KIND_METRIC = 1;
+  REPORT_KIND_ATTRIBUTE = 2;
+  REPORT_KIND_COUNTER = 3;
+  REPORT_KIND_EVENT = 4;
 }
 
 message Task {
@@ -45,40 +48,23 @@ message Task {
   string name = 2;
   int32 sequence_number = 3;
   TaskState state = 4;
-
-  // Latest-wins snapshot of the key-value telemetry the job emitted for this
-  // task (progress_*, metrics, events) — populated from forwarded Reports.
   repeated ReportEntry reports = 5;
 }
 
-// One key-value telemetry entry. The kind classifies how the value behaves;
-// the SDKs choose it from the verb used (progress/metric -> METRIC or
-// ATTRIBUTE, event -> EVENT). COUNTER is reserved, not yet emitted.
 message ReportEntry {
   string key = 1;
   ReportKind kind = 2;
-  // A value is either textual or numeric depending on kind.
   oneof value {
     string str_value = 3;
     double num_value = 4;
   }
 }
 
-enum ReportKind {
-  REPORT_KIND_UNSPECIFIED = 0;
-  REPORT_KIND_METRIC = 1;     // numeric, latest-wins (loss, accuracy, lr, progress_*)
-  REPORT_KIND_ATTRIBUTE = 2;  // set-once string fact (model_version, output_uri)
-  REPORT_KIND_COUNTER = 3;    // monotonic total (records_written, errors)
-  REPORT_KIND_EVENT = 4;      // timestamped note (checkpoint_saved, early_stop)
-}
-
+// Coordinator -> Client, Worker
 message Job {
   string id = 1;
   string name = 2;
-
-  // Docker image reference (e.g., registry.example.com/job:v1).
   string artifact_uri = 3;
-
   reserved 4;
   JobState state = 5;
   repeated Task tasks = 6;
@@ -92,8 +78,6 @@ message Job {
   FailureReason failure_reason = 14;
   string failure_detail = 15;
   ResourceRequirements resources = 16;
-  // Worker-reported last-activity time (SDK frames incl. liveness pings); 0 when
-  // never reported. Surfaced for the API/UI "last health check" of the job.
   int64 last_activity_at_millis = 17;
 }
 

@@ -33,8 +33,12 @@ import java.util.concurrent.CountDownLatch;
  * half-open socket can swallow a send without erroring. Telemetry is not acked
  * (lossy by design).
  *
- * Owned by {@link WorkerAgent}, which wires the handlers: the status handler is
- * swapped in per job, the report handler is fixed for the worker's lifetime.
+ * Owned by {@link WorkerAgent}, which wires the two handlers differently because
+ * their coordinator-side transports differ. Status travels on a per-job
+ * client-streaming RPC, so the status handler is rebound each job to point at
+ * that job's stream. Telemetry is a stateless unary forward keyed by job_id in
+ * the payload, so a single report handler ({@code coordinator::forwardTelemetry})
+ * serves every job for the worker's lifetime.
  */
 class JobCallbackServer extends WebSocketServer {
 

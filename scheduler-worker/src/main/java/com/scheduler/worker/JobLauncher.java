@@ -42,13 +42,15 @@ class JobLauncher {
     private final Duration jobExecutionTimeout;
     private final String dockerNetwork;
     private final String mlflowTrackingUri;
+    private final int shutdownGraceSeconds;
 
     JobLauncher(ObjectStore objectStore, Duration jobExecutionTimeout,
-                String dockerNetwork, String mlflowTrackingUri) {
+                String dockerNetwork, String mlflowTrackingUri, int shutdownGraceSeconds) {
         this.objectStore = objectStore;
         this.jobExecutionTimeout = jobExecutionTimeout;
         this.dockerNetwork = dockerNetwork;
         this.mlflowTrackingUri = mlflowTrackingUri;
+        this.shutdownGraceSeconds = shutdownGraceSeconds;
     }
 
     /**
@@ -86,10 +88,12 @@ class JobLauncher {
         if (!finished) {
             log.warn("Job process timed out after {}: jobId={}", jobExecutionTimeout, details.jobId());
             onTimeout.run();
-            process.destroyForcibly();
-            // destroyForcibly kills the `docker run` CLI process but the container
-            // keeps running. Force-remove it by name so nothing is left dangling.
-            removeContainer(details.jobId());
+            // Graceful stop so the job's @OnShutdown hook can run before SIGKILL.
+            stopContainer(details.jobId());
+            if (!process.waitFor(shutdownGraceSeconds + 5L, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                removeContainer(details.jobId());
+            }
             return -1;
         }
 
@@ -144,6 +148,26 @@ class JobLauncher {
                     });
         } catch (IOException e) {
             log.warn("Failed to clean up temp dir for jobId={}: {}", jobId, e.getMessage());
+        }
+    }
+
+    /**
+     * Gracefully stops a job's container ({@code docker stop}: SIGTERM, then
+     * SIGKILL after {@code shutdownGraceSeconds}) — giving the job's
+     * {@code @OnShutdown} hook time to run before the container is killed.
+     */
+    void stopContainer(String jobId) {
+        String containerName = "job-" + jobId;
+        try {
+            Process stop = new ProcessBuilder(
+                    "docker", "stop", "-t", String.valueOf(shutdownGraceSeconds), containerName)
+                    .redirectErrorStream(true)
+                    .start();
+            stop.getInputStream().readAllBytes();
+            stop.waitFor(shutdownGraceSeconds + 10L, TimeUnit.SECONDS);
+            log.info("Gracefully stopped container: {}", containerName);
+        } catch (Exception e) {
+            log.warn("Failed to stop container {}: {}", containerName, e.getMessage());
         }
     }
 

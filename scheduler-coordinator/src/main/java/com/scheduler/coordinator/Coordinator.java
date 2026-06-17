@@ -21,21 +21,27 @@ public class Coordinator {
     private static final Logger log = LoggerFactory.getLogger(Coordinator.class);
 
     /**
-     * Usage: {@code coordinator [--config <control-plane.yaml>] [port]}.
-     * Settings come from control-plane.yaml (defaults apply without one); a bare
-     * port argument overrides the configured port (used by scheduler-cli).
+     * Config path comes from the {@code CONTROL_PLANE_CONFIG} env var — the single
+     * source of truth for all settings, including the port. The process refuses to
+     * start if the var is unset/empty or the file fails to parse. No CLI arguments.
      */
     public static void main(String[] args) throws IOException, InterruptedException {
-        CoordinatorConfig config = new CoordinatorConfig();
-        Integer portOverride = null;
-        for (int i = 0; i < args.length; i++) {
-            if (args[i].equals("--config") && i + 1 < args.length) {
-                config = CoordinatorConfig.load(java.nio.file.Path.of(args[++i]));
-            } else {
-                portOverride = Integer.parseInt(args[i]);
-            }
+        String configPath = System.getenv("CONTROL_PLANE_CONFIG");
+        if (configPath == null || configPath.isBlank()) {
+            System.err.println("CONTROL_PLANE_CONFIG must point to control-plane.yaml");
+            System.exit(1);
+            return;
         }
-        int port = portOverride != null ? portOverride : config.getCoordinator().getPort();
+        CoordinatorConfig config;
+        try {
+            config = CoordinatorConfig.load(java.nio.file.Path.of(configPath));
+        } catch (Exception e) {
+            System.err.println("Failed to load CONTROL_PLANE_CONFIG=" + configPath + ": " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+        log.info("Loaded config from CONTROL_PLANE_CONFIG={}", configPath);
+        int port = config.getCoordinator().getPort();
         Duration heartbeatTimeout = Duration.ofSeconds(config.getCoordinator().getHeartbeatTimeoutSeconds());
         Duration heartbeatScanInterval = Duration.ofSeconds(config.getCoordinator().getHeartbeatScanIntervalSeconds());
 

@@ -13,8 +13,6 @@ import com.scheduler.proto.v1.JobState;
 import com.scheduler.proto.v1.TaskState;
 import com.scheduler.proto.worker.HeartbeatRequest;
 import com.scheduler.proto.worker.HeartbeatResponse;
-import com.scheduler.proto.worker.JobLiveness;
-import com.scheduler.proto.worker.ReportLivenessResponse;
 import com.scheduler.proto.worker.PullJobRequest;
 import com.scheduler.proto.worker.PullJobResponse;
 import com.scheduler.proto.worker.RegisterWorkerRequest;
@@ -141,28 +139,36 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     @Override
-    public void reportTelemetry(Report request,
-                                StreamObserver<ReportTelemetryResponse> responseObserver) {
-        log.debug("Received telemetry from job={}, taskIndex={}, entries={}",
-                request.getJobId(), request.getTaskIndex(), request.getEntriesCount());
-        try {
-            jobManager.handleReport(request.getJobId(), request.getTaskIndex(), request.getEntriesList());
-        } catch (Exception e) {
-            // Telemetry is lossy by design — never fail the worker over it, but say why.
-            log.warn("Dropping telemetry for job={}, taskIndex={}: {}",
-                    request.getJobId(), request.getTaskIndex(), e.getMessage());
-        }
-        responseObserver.onNext(ReportTelemetryResponse.getDefaultInstance());
-        responseObserver.onCompleted();
-    }
+    public StreamObserver<Report> reportTelemetry(StreamObserver<ReportTelemetryResponse> responseObserver) {
+        // One telemetry stream per job (the worker's CoordinatorTelemetryStream). Each
+        // Report is applied to the task's latest-wins snapshot; the single response is
+        // sent once the worker closes the stream at job end.
+        return new StreamObserver<>() {
+            @Override
+            public void onNext(Report report) {
+                log.debug("Received telemetry from worker: jobId={}, taskIndex={}, entries={}",
+                        report.getJobId(), report.getTaskIndex(), report.getEntriesCount());
+                try {
+                    jobManager.handleReport(report.getJobId(), report.getTaskIndex(),
+                            report.getTimestampMs(), report.getEntriesList());
+                } catch (Exception e) {
+                    // Telemetry is lossy by design — never break the stream over one report.
+                    log.warn("Dropping telemetry for job={}, taskIndex={}: {}",
+                            report.getJobId(), report.getTaskIndex(), e.getMessage());
+                }
+            }
 
-    @Override
-    public void reportLiveness(JobLiveness request, StreamObserver<ReportLivenessResponse> responseObserver) {
-        log.debug("Received liveness from job={}, lastActivityAtMillis={}",
-                request.getJobId(), request.getLastActivityAtMillis());
-        jobManager.updateLastActivity(request.getJobId(), request.getLastActivityAtMillis());
-        responseObserver.onNext(ReportLivenessResponse.getDefaultInstance());
-        responseObserver.onCompleted();
+            @Override
+            public void onError(Throwable t) {
+                log.error("ReportTelemetry stream error: {}", t.getMessage());
+            }
+
+            @Override
+            public void onCompleted() {
+                responseObserver.onNext(ReportTelemetryResponse.getDefaultInstance());
+                responseObserver.onCompleted();
+            }
+        };
     }
 
     @Override

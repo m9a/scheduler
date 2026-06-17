@@ -3,11 +3,11 @@ package com.scheduler.worker;
 import com.scheduler.proto.job.Report;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.worker.HeartbeatRequest;
-import com.scheduler.proto.worker.JobLiveness;
 import com.scheduler.proto.worker.PullJobRequest;
 import com.scheduler.proto.worker.PullJobResponse;
 import com.scheduler.proto.worker.RegisterWorkerRequest;
 import com.scheduler.proto.worker.RegisterWorkerResponse;
+import com.scheduler.proto.worker.ReportTelemetryResponse;
 import com.scheduler.proto.worker.StatusUpdateResponse;
 import com.scheduler.proto.worker.WorkerServiceGrpc;
 import com.scheduler.proto.v1.Job;
@@ -38,14 +38,13 @@ import java.util.concurrent.TimeUnit;
  *   register()           RegisterWorker
  *   pullJob()            PullJob
  *   startHeartbeat()     Heartbeat            (5s loop, daemon thread)
- *   forwardTelemetry()   ReportTelemetry      (unary, lossy by design)
+ *   openTelemetryStream() ReportTelemetry     (client stream, one per job, lossy)
  *   openStatusStream()   ReportStatus         (client stream, one per job)
  * </pre>
  */
 class CoordinatorClient implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(CoordinatorClient.class);
-    private static final long HEARTBEAT_INTERVAL_MS = 5000;
 
     private final ManagedChannel channel;
     private final WorkerServiceGrpc.WorkerServiceBlockingStub blockingStub;
@@ -92,7 +91,7 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     /** Starts the liveness loop — the coordinator fails this worker's jobs if these stop. */
-    void startHeartbeat(String workerId) {
+    void startHeartbeat(String workerId, long intervalMs) {
         heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-sender");
             t.setDaemon(true);
@@ -107,29 +106,35 @@ class CoordinatorClient implements AutoCloseable {
             } catch (Exception e) {
                 log.warn("Failed to send heartbeat: workerId={}, error={}", workerId, e.getMessage());
             }
-        }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
     }
 
-    /** Forwards job-emitted telemetry to the coordinator. Lossy by design — log and move on. */
-    void forwardTelemetry(Report report) {
-        try {
-            blockingStub.reportTelemetry(report);
-        } catch (Exception e) {
-            log.warn("Failed to forward telemetry for job={}, taskIndex={}: {}",
-                    report.getJobId(), report.getTaskIndex(), e.getMessage());
-        }
-    }
+    /**
+     * Opens the per-job client-streaming pipe for telemetry. The coordinator sends a
+     * single response when the stream closes; onError/onCompleted release the latch so
+     * {@link CoordinatorTelemetryStream#awaitCompletion} can block on the ack.
+     */
+    CoordinatorTelemetryStream openTelemetryStream(String jobId) {
+        CountDownLatch done = new CountDownLatch(1);
 
-    /** Reports a job's worker-tracked last-activity time. Lossy — log and move on. */
-    void reportLiveness(String jobId, long lastActivityAtMillis) {
-        try {
-            blockingStub.reportLiveness(JobLiveness.newBuilder()
-                    .setJobId(jobId)
-                    .setLastActivityAtMillis(lastActivityAtMillis)
-                    .build());
-        } catch (Exception e) {
-            log.debug("Failed to report liveness for job={}: {}", jobId, e.getMessage());
-        }
+        StreamObserver<ReportTelemetryResponse> responseObserver = new StreamObserver<>() {
+            @Override
+            public void onNext(ReportTelemetryResponse response) {}
+
+            @Override
+            public void onError(Throwable t) {
+                log.warn("ReportTelemetry stream error for job={}: {}", jobId, t.getMessage());
+                done.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                done.countDown();
+            }
+        };
+
+        StreamObserver<Report> requestObserver = asyncStub.reportTelemetry(responseObserver);
+        return new CoordinatorTelemetryStream(requestObserver, done);
     }
 
     /**

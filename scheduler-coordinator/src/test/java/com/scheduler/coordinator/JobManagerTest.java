@@ -13,6 +13,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -311,7 +312,8 @@ class JobManagerTest {
         JobStatus claimed = submitAndClaim("live");
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
 
-        jobManager.updateLastActivity(claimed.id(), 1234L);
+        // Liveness-only report: timestamp, no entries.
+        jobManager.handleReport(claimed.id(), 0, 1234L, List.of());
 
         assertEquals(1234L, jobManager.lastActivity(claimed.id()));
     }
@@ -320,7 +322,7 @@ class JobManagerTest {
     void lastActivityClearedOnTerminal() {
         JobStatus claimed = submitAndClaim("done");
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
-        jobManager.updateLastActivity(claimed.id(), 1234L);
+        jobManager.handleReport(claimed.id(), 0, 1234L, List.of());
 
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_COMPLETED, null, null));
 
@@ -333,7 +335,7 @@ class JobManagerTest {
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_FAILED,
                 FailureReason.FAILURE_REASON_PROCESS_EXITED, "exit code 1"));
 
-        jobManager.updateLastActivity(claimed.id(), 1234L);  // late report — must be ignored
+        jobManager.handleReport(claimed.id(), 0, 1234L, List.of());  // late report — must be ignored
 
         assertEquals(0L, jobManager.lastActivity(claimed.id()));
     }
