@@ -17,6 +17,7 @@ public final class FailureMessages {
             case FAILURE_REASON_PROCESS_TIMEOUT -> "Job process timed out";
             case FAILURE_REASON_PROCESS_EXITED -> "Job process exited with non-zero code";
             case FAILURE_REASON_PROCESS_START_FAILED -> "Failed to start job process";
+            case FAILURE_REASON_UNRESPONSIVE -> "Job container became unresponsive";
             default -> "Job failed";
         };
     }

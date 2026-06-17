@@ -1,5 +1,6 @@
 package com.scheduler.worker;
 
+import io.prometheus.client.Counter;
 import io.prometheus.client.Gauge;
 import io.prometheus.client.Histogram;
 import io.prometheus.client.exporter.HTTPServer;
@@ -39,6 +40,10 @@ final class WorkerMetrics {
     static final Gauge JOBS_RUNNING = Gauge.build()
             .name("scheduler_worker_jobs_running")
             .help("Jobs currently executing on this worker").register();
+
+    static final Counter JOBS_KILLED_UNRESPONSIVE = Counter.build()
+            .name("scheduler_worker_jobs_killed_unresponsive_total")
+            .help("Jobs killed by the worker after going unresponsive (no liveness pings)").register();
 
     static final Histogram JOB_DURATION = Histogram.build()
             .name("scheduler_worker_job_duration_seconds")

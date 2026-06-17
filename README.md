@@ -108,6 +108,80 @@ The **scheduler-sdk** lives in a [separate repository](../scheduler-sdk). It pro
 - **One WebSocket connection** — a job container and its worker share exactly one WebSocket connection for all SDK→worker traffic (status + telemetry). No per-message or secondary connections.
 - **State ownership** — job and task state are owned by the **worker**. The coordinator writes state in exactly **one** case: a worker misses its heartbeat / loses its connection, at which point it fails the **job** (never task state). Otherwise the coordinator only applies and de-dupes what the worker sends. Task state is only ever advanced by the SDK; a task interrupted by a crash/kill/dead worker keeps its last reported state.
 
+## Protocol Exchanges
+
+Three boundaries, one proto file each; every message is labelled `Sender → Receiver`
+in the `.proto`. The diagrams are split per boundary to stay readable.
+
+### Client ↔ Coordinator — `client_api.proto` (`ClientService`)
+
+All unary, except `GetJobOutput` which server-streams file chunks.
+
+```
+Client                                Coordinator
+  │  SubmitJob(name, image, params…)      │  inline inputs → MinIO, job QUEUED
+  │ ────────────────────────────────────► │
+  │ ◄──────────────────────────────────── │  SubmitJobResponse(Job)
+  │                                        │
+  │  GetJobStatus(jobId)                   │
+  │ ────────────────────────────────────► │
+  │ ◄──────────────────────────────────── │  GetJobStatusResponse(Job snapshot)
+  │                                        │
+  │  ListJobFiles / GetJobOutput(jobId)    │
+  │ ────────────────────────────────────► │
+  │ ◄════════════════════════════════════ │  GetJobOutput: server-streamed chunks
+```
+
+### Worker ↔ Coordinator — `worker_api.proto` (`WorkerService`)
+
+Two unary calls to register/claim, a periodic heartbeat, and **two per-job client
+streams** (status + telemetry).
+
+```
+Worker                                     Coordinator
+  │  RegisterWorker(hostname, resources)      │
+  │ ────────────────────────────────────────► │  assigns workerId
+  │                                           │
+  │  PullJob(workerId)         (poll loop)    │  claimNextJob → job STARTING
+  │ ────────────────────────────────────────► │
+  │                                           │
+  │  Heartbeat(workerId)       (every N s)    │  miss ⇒ job FAILED / HEARTBEAT_LOST
+  │ ────────────────────────────────────────► │
+  │                                           │
+  │  ReportStatus(stream StatusUpdate)        │  one stream per job — lifecycle:
+  │ ════════════════════════════════════════► │  task updates + job RUNNING/terminal
+  │                                           │
+  │  ReportTelemetry(stream Report)           │  one stream per job — metrics/events
+  │ ════════════════════════════════════════► │  + liveness ticks (lossy, latest-wins)
+```
+
+### Job (SDK) ↔ Worker — `job_callback.proto` (one WebSocket)
+
+A single binary WebSocket per job container; each frame is prefixed by a one-byte
+type tag.
+
+```
+Job container (SDK)                        WorkerAgent
+  │  [0x01] StatusUpdate (task state)         │  → ReportStatus stream
+  │ ────────────────────────────────────────► │
+  │ ◄──────────────────────────────────────── │  [0x02] ack (status frames only)
+  │                                           │
+  │  [0x03] Report (metrics/events)           │  → ReportTelemetry stream
+  │ ────────────────────────────────────────► │
+  │                                           │
+  │  [0x04] Liveness (ping)                   │  consumed locally for stall detection;
+  │ ────────────────────────────────────────► │  not forwarded — the worker emits its
+  │                                           │  own liveness Report on the telemetry
+  │                                           │  stream so silent jobs still report
+```
+
+### Failure detection — who acts
+
+```
+Worker dies ─► heartbeats stop ─► coordinator monitor ─► job FAILED  (HEARTBEAT_LOST)
+Job stalls  ─► no activity     ─► worker JobLivenessMonitor ─► kill ─► job KILLED (UNRESPONSIVE)
+```
+
 ## How a Job Runs
 
 1. Client sends `SubmitJobRequest` → `UserRequestHandler` → resolves input files (inline content uploaded to MinIO, URIs validated) → `JobManager.submit()` → job QUEUED
@@ -129,7 +203,7 @@ The **scheduler-sdk** lives in a [separate repository](../scheduler-sdk). It pro
 | Exit code | Interpretation |
 |-----------|---------------|
 | 0 | Job COMPLETED — all tasks succeeded |
-| -1 | Job KILLED — process timed out (configurable, default 10 min), destroyed with `destroyForcibly()` |
+| -1 | Job KILLED — process timed out (`jobExecutionTimeoutMinutes`, default 10), destroyed with `destroyForcibly()` |
 | Any other | Job FAILED — "Job process exited with code N" |
 
 If `spawnJobProcess` throws `IOException` (container failed to start) or `InterruptedException`, the job is marked FAILED with the exception message.
@@ -140,11 +214,15 @@ When a task throws an exception, the SDK marks it FAILED and returns immediately
 
 ### Timeout
 
-The timeout is configurable via the `WorkerAgent` constructor (`jobExecutionTimeout`, default `Duration.ofMinutes(10)`). When the timeout expires, `process.waitFor()` returns false and the process is killed with `destroyForcibly()`.
+The timeout is configurable via `jobExecutionTimeoutMinutes` in `worker.yaml` (default 10). When the timeout expires, `process.waitFor()` returns false and the process is killed with `destroyForcibly()`.
 
 ### Worker crash
 
-WorkerAgent sends periodic heartbeats to the coordinator. If a worker stops sending heartbeats (crash, network partition), the coordinator's heartbeat monitor detects the dead worker and fails all its in-flight jobs with `HEARTBEAT_LOST`.
+WorkerAgent sends periodic heartbeats to the coordinator (`heartbeatIntervalSeconds`). If a worker stops sending heartbeats (crash, network partition), the coordinator's heartbeat monitor detects the dead worker and fails all its in-flight jobs with `HEARTBEAT_LOST`. (Covered end-to-end by `IntegrationTest#testWorkerHeartbeatLost`.)
+
+### Job stall
+
+Separately, the **worker** watches each running job's liveness (`JobLivenessMonitor`). A job that shows no activity within `liveness.startupTimeoutSeconds` of launch, or goes silent for `maxMissedPings × pingIntervalSeconds`, is flagged unresponsive; with `autoKill` the worker gracefully stops the container and reports the job `KILLED` / `UNRESPONSIVE`. (Covered by `IntegrationTest#testJobStallUnresponsive`.)
 
 ### Coordinator idempotency
 
@@ -207,15 +285,99 @@ mvn test                         # run tests
 mvn compile -pl scheduler-proto  # regenerate proto code after .proto changes
 ```
 
-## Control Plane & Infra Metrics
+## Configuration
 
-`control-plane.yaml` is the single config for the control plane: which stacks
-are enabled (MLflow, Prometheus/Grafana) and the coordinator's settings (port,
-heartbeat timeouts, MinIO). `scripts/control-plane.sh up|down|status` derives
-compose profiles/variables from it and logs the fully resolved compose to
-`.control-plane-resolved.yml` for debugging. The coordinator reads the same
-file via `--config`. Available metrics per component:
-[docs/metrics.md](docs/metrics.md).
+Each process is configured by **one YAML file, located via an env var** — no CLI
+flags, no second source. Built-in defaults apply per key and the file overrides
+them; required fields with no sensible default (hostnames, MinIO, worker
+resources) are validated at startup and the process refuses to start if missing
+or if the file fails to parse.
+
+| Process | Env var | File |
+|---------|---------|------|
+| Coordinator | `CONTROL_PLANE_CONFIG` | `control-plane.yaml` |
+| Worker | `WORKER_CONFIG` | `worker.yaml` |
+| CLI | `CONTROL_PLANE_CONFIG` | `control-plane.yaml` (coordinator endpoint + readiness URLs) |
+
+The worker is **not** part of the control plane, so its settings live in
+`worker.yaml`, never in `control-plane.yaml`.
+
+### Coordinator — `control-plane.yaml`
+
+| Key | Meaning |
+|-----|---------|
+| `coordinator.port` | gRPC port (metrics served on `port+1`) |
+| `coordinator.heartbeatTimeoutSeconds` | declare a worker dead after this long without a heartbeat |
+| `coordinator.heartbeatScanIntervalSeconds` | how often the monitor scans for dead workers |
+| `minio.endpoint` / `accessKey` / `secretKey` / `bucket` | object store connection |
+| `mlflow.enabled`, `metrics.enabled`, `*.port`, `registry.url` | infra-stack toggles/ports for `control-plane.sh` + CLI readiness |
+
+### Worker — `worker.yaml`
+
+| Key | Meaning |
+|-----|---------|
+| `coordinator.host` / `port` | where to reach the coordinator |
+| `coordinator.heartbeatIntervalSeconds` | heartbeat send period (keep below the coordinator's timeout) |
+| `coordinator.pollIntervalSeconds` | how often the worker polls for a job to claim |
+| `hostname` | address advertised to the coordinator |
+| `port` | WebSocket callback port (`0` = ephemeral) |
+| `jobExecutionTimeoutMinutes` | hard deadline before the worker kills a job (TIMEOUT) |
+| `resources.memory` / `cpu` / `gpu` / `capabilities` | what the worker advertises for placement |
+| `docker.network` | docker network the job containers join |
+| `minio.*` | object store connection (fetch inputs, upload outputs) |
+| `mlflow.trackingUri` | MLflow URI injected into job containers |
+| `liveness.startupTimeoutSeconds` | job must show activity within this of launch |
+| `liveness.pingIntervalSeconds` | stall-check tick + liveness-forward cadence (match the SDK ping rate) |
+| `liveness.maxMissedPings` | consecutive missed ping windows before "unresponsive" |
+| `liveness.autoKill` | kill the container when flagged unresponsive |
+| `liveness.shutdownGraceSeconds` | SIGTERM→SIGKILL grace on a graceful stop |
+
+`scripts/control-plane.sh up|down|status` derives compose profiles/variables from
+`control-plane.yaml` and logs the resolved compose to `.control-plane-resolved.yml`.
+
+## Metrics & Observability
+
+Three separate planes — don't conflate them:
+
+| Plane | What | Emitted by | Viewed in |
+|-------|------|-----------|-----------|
+| **Infra metrics** | machine + scheduling stats (CPU/GPU/mem, queue, throughput) | worker + coordinator | Prometheus / Grafana |
+| **Job telemetry** | "what's happening now" — progress, metrics, events | SDK (`ctx.progress/metric/event`) → worker → coordinator | `GetJobStatus` / CLI |
+| **Training history** | per-step curves, params, artifacts | the job, directly | MLflow |
+
+The **SDK never emits infra metrics** — the worker observes containers from the
+outside and the coordinator measures scheduling; job telemetry and MLflow are the
+SDK's only observability paths. So the metrics work touched the **coordinator** and
+**worker** only.
+
+### Infra metrics (Prometheus / Grafana)
+
+Each component serves a Prometheus endpoint that is **always on**; the `metrics`
+profile only controls whether Prometheus/Grafana run to scrape and display them.
+
+```
+   Coordinator  :9091/metrics ─┐
+   (gRPC port+1)                ├──► Prometheus :9095 ──► Grafana :3000
+   Worker       :9092/metrics ─┘                          ("Scheduler" dashboard)
+   (docker stats, nvidia-smi)
+```
+
+- **Coordinator** (`CoordinatorMetrics`, `:9091`): counters for jobs
+  submitted / finished-by-outcome / telemetry reports / heartbeat losses; a
+  queue-wait histogram; scrape-time gauges for jobs-by-status, queue depth, and
+  registered workers (read live from `JobManager`, never stale).
+- **Worker** (`WorkerMetrics`, `:9092`): a running-jobs gauge, a job-duration
+  histogram by outcome, per-container CPU/memory from `docker stats` (10s
+  sampling), and host GPU util/memory from `nvidia-smi` (only when
+  `resources.gpu: true`). Per-job series are dropped when the job finishes.
+
+Full metric tables: [docs/metrics.md](docs/metrics.md).
+
+### Planned
+
+- `scheduler_job_stalled{job_id}` on the coordinator — a RUNNING job with no
+  telemetry past a threshold. Now feasible: the worker forwards last-activity on
+  the telemetry stream (see Protocol Exchanges).
 
 ## External Dependencies
 

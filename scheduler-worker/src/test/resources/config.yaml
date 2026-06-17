@@ -1,9 +1,13 @@
 coordinator:
   host: localhost
   port: 0
+  heartbeatIntervalSeconds: 5
+  pollIntervalSeconds: 5
 
 hostname: localhost
 port: 0
+
+jobExecutionTimeoutMinutes: 10
 
 resources:
   memory: 8192

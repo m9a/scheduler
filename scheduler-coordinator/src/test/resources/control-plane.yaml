@@ -1,0 +1,22 @@
+# Sample control-plane.yaml for CoordinatorConfig loader tests.
+# The coordinator only reads the coordinator/minio sections; mlflow/metrics are
+# present to prove unknown sections are ignored, not rejected.
+mlflow:
+  enabled: true
+  port: 5000
+
+metrics:
+  enabled: true
+  prometheusPort: 9095
+  grafanaPort: 3000
+
+coordinator:
+  port: 7070
+  heartbeatTimeoutSeconds: 30
+  heartbeatScanIntervalSeconds: 10
+
+minio:
+  endpoint: http://minio:9000
+  accessKey: testkey
+  secretKey: testsecret
+  bucket: test-bucket

@@ -29,8 +29,9 @@ scripts/control-plane.sh status
 scripts/control-plane.sh down
 ```
 
-The coordinator reads the same file for its own settings:
-`java -jar scheduler-coordinator.jar --config control-plane.yaml`.
+The coordinator reads the same file for its own settings, located via the
+`CONTROL_PLANE_CONFIG` env var:
+`CONTROL_PLANE_CONFIG=control-plane.yaml java -jar scheduler-coordinator.jar`.
 
 | UI | URL |
 |----|-----|

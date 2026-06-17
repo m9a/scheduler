@@ -216,30 +216,26 @@ public class JobManager {
      * snapshot. Creates the TaskStatus if telemetry arrives before the first status
      * update (status and telemetry travel on separate RPCs, so order isn't guaranteed).
      */
-    public synchronized void handleReport(String jobId, int taskIndex, List<ReportEntry> entries) {
+    public synchronized void handleReport(String jobId, int taskIndex, long timestampMs, List<ReportEntry> entries) {
         CoordinatorMetrics.TELEMETRY_REPORTS.inc();
         JobStatus job = getJob(jobId);
         if (JobStates.isTerminal(job.state())) {
             // Telemetry flushed at task end can trail the terminal status; the final
             // values still matter, but a job failed by the heartbeat monitor stays failed.
             log.debug("Applying late report to terminal job: jobId={}, taskIndex={}", jobId, taskIndex);
+        } else {
+            // Every report doubles as a liveness signal — the worker owns liveness and
+            // stamps each Report with the job's last-activity time (see CLAUDE.md "State
+            // ownership"). Max-wins since unary reports can arrive out of order.
+            lastActivityMillis.merge(jobId, timestampMs, Math::max);
+        }
+        // A liveness-only report carries no entries — don't materialize a phantom task.
+        if (entries.isEmpty()) {
+            return;
         }
         TaskStatus task = job.taskStatuses().computeIfAbsent(taskIndex,
                 idx -> new TaskStatus(UUID.randomUUID().toString(), idx, "task-" + idx));
         task.applyReports(entries);
-    }
-
-    /**
-     * Records the worker-reported last-activity time for a live job (the worker
-     * owns liveness — see CLAUDE.md "State ownership"). Ignored for unknown or
-     * already-terminal jobs.
-     */
-    public synchronized void updateLastActivity(String jobId, long lastActivityAtMillis) {
-        JobStatus job = jobs.get(jobId);
-        if (job == null || JobStates.isTerminal(job.state())) {
-            return;
-        }
-        lastActivityMillis.put(jobId, lastActivityAtMillis);
     }
 
     /** Last-activity epoch millis for a job, or 0 if none reported. Read by the client API. */
