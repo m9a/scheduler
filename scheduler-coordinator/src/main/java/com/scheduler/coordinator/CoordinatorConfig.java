@@ -34,11 +34,18 @@ public class CoordinatorConfig {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class CoordinatorSettings {
         private int port = 9090;
+        private int httpPort = 8080;
+        // Directory of built UI static files (Vite dist/). Empty → API-only.
+        private String uiDir = "";
         private int heartbeatTimeoutSeconds = 15;
         private int heartbeatScanIntervalSeconds = 5;
 
         public int getPort() { return port; }
         public void setPort(int port) { this.port = port; }
+        public int getHttpPort() { return httpPort; }
+        public void setHttpPort(int httpPort) { this.httpPort = httpPort; }
+        public String getUiDir() { return uiDir; }
+        public void setUiDir(String uiDir) { this.uiDir = uiDir; }
         public int getHeartbeatTimeoutSeconds() { return heartbeatTimeoutSeconds; }
         public void setHeartbeatTimeoutSeconds(int v) { this.heartbeatTimeoutSeconds = v; }
         public int getHeartbeatScanIntervalSeconds() { return heartbeatScanIntervalSeconds; }

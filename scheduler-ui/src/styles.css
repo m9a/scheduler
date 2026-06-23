@@ -1,0 +1,72 @@
+:root {
+  --bg: #0f1115;
+  --panel: #181b21;
+  --border: #2a2f38;
+  --text: #e6e9ef;
+  --muted: #8a93a3;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app { max-width: 1200px; margin: 0 auto; padding: 0 16px; }
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 18px; margin: 0; }
+nav { display: flex; gap: 8px; }
+nav button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+nav button.active { color: var(--text); border-color: #4a90e2; }
+
+main { padding: 16px 0; }
+
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.list, .detail { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 200px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.row { cursor: pointer; }
+.row:hover { background: #1f242c; }
+.row.selected { background: #232a34; }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.error { color: #e06c75; }
+
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+.state-active { background: #1d3a5f; color: #7cc0ff; }
+.state-ok { background: #1d4031; color: #7ee2a8; }
+.state-bad { background: #4a1f24; color: #ff8b94; }
+.state-idle { background: #3a3320; color: #e0c878; }
+.state-other { background: #2a2f38; color: var(--muted); }
+
+.detail-head { display: flex; justify-content: space-between; align-items: center; }
+.close { background: transparent; border: none; color: var(--muted); font-size: 16px; cursor: pointer; }
+
+dl.meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; font-size: 14px; }
+dl.meta dt { color: var(--muted); }
+dl.meta dd { margin: 0; }
+
+.grafana { width: 100%; height: 80vh; border: 1px solid var(--border); border-radius: 8px; }
+
+@media (max-width: 800px) { .split { grid-template-columns: 1fr; } }

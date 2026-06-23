@@ -15,6 +15,9 @@ dependency-reduced-pom.xml
 ### Claude ###
 CLAUDE.md
 
+### Deployment (local-only, do not check in) ###
+deployment.md
+
 ### Eclipse ###
 .apt_generated
 .classpath

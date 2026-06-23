@@ -101,6 +101,16 @@ public class JobManager {
         return job;
     }
 
+    /**
+     * Snapshot of all jobs for the read-only HTTP API (UI). Newest first by
+     * submission time. A copied list so the HTTP layer never holds the live map.
+     */
+    public List<JobStatus> listJobs() {
+        List<JobStatus> all = new java.util.ArrayList<>(jobs.values());
+        all.sort(java.util.Comparator.comparing(JobStatus::createdAt).reversed());
+        return all;
+    }
+
 
     // TODO: future enhancements for scheduling:
     //  - Priority queue: use job.priority (stored but currently ignored) to order within the queue

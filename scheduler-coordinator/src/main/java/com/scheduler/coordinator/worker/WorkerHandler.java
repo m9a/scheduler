@@ -186,6 +186,11 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
         return workers.count();
     }
 
+    /** Snapshot of registered workers for the read-only HTTP API (UI). */
+    public java.util.List<com.scheduler.core.WorkerInfo> listWorkers() {
+        return workers.list();
+    }
+
     /**
      * Starts the liveness monitor in {@link WorkerRegistry}; a dead worker's
      * in-flight jobs are failed with HEARTBEAT_LOST.

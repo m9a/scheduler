@@ -44,6 +44,11 @@ class WorkerRegistry {
         return workers.size();
     }
 
+    /** Snapshot of all registered workers for the read-only HTTP API (UI). */
+    java.util.List<WorkerInfo> list() {
+        return new java.util.ArrayList<>(workers.values());
+    }
+
     /**
      * Starts a background thread that periodically scans all registered workers
      * and evicts any whose last heartbeat is older than the timeout, invoking
