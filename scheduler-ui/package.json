@@ -1,0 +1,24 @@
+{
+  "name": "scheduler-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Read-only monitoring UI for the scheduler control plane. Polls the coordinator's HTTP read API; embeds Grafana for metrics.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

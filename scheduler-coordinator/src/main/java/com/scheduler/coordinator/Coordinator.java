@@ -1,6 +1,7 @@
 package com.scheduler.coordinator;
 
 import com.scheduler.coordinator.client.ClientHandler;
+import com.scheduler.coordinator.http.ReadApiServer;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
 import io.grpc.Server;
@@ -14,6 +15,7 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.time.Duration;
 
 public class Coordinator {
@@ -62,11 +64,22 @@ public class Coordinator {
                 .build()
                 .start();
 
+        // In-process HTTP server: serves the UI static files (when configured)
+        // and the pull-only JSON read API, on its own port.
+        String uiDirSetting = config.getCoordinator().getUiDir();
+        Path uiDir = null;
+        if (uiDirSetting != null && !uiDirSetting.isBlank()) {
+            uiDir = Path.of(uiDirSetting);
+        }
+        ReadApiServer httpApi = new ReadApiServer(jobManager, workerHandler, uiDir);
+        httpApi.start(config.getCoordinator().getHttpPort());
+
         log.info("Coordinator started on port {}", port);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutting down coordinator");
             workerHandler.shutdownHeartbeatMonitor();
+            httpApi.stop();
             metrics.stop();
             server.shutdown();
         }));
