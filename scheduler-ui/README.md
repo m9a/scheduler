@@ -55,7 +55,7 @@ The coordinator serves whatever directory `coordinator.uiDir` points at (empty â
 API-only). Two flows:
 
 - **Local (CLI launches the coordinator as a host process):** build `dist/` as
-  above, then set `uiDir` to its absolute path in your `control-plane.yaml`
+  above, then set `uiDir` to its absolute path in your `control_plane_config.yaml`
   (the file at `CONTROL_PLANE_CONFIG`; the CLI preserves your edits):
 
   ```yaml

@@ -7,6 +7,8 @@ coordinator:
 hostname: localhost
 port: 0
 
+checkpointPath: target/worker_checkpoint.yaml
+
 jobExecutionTimeoutMinutes: 10
 
 resources:

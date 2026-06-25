@@ -65,6 +65,9 @@ public class WorkerAgent implements AutoCloseable {
     // Observes job containers from outside (docker stats / nvidia-smi → /metrics).
     private final WorkerMetrics metrics;
 
+    // Path to the worker's checkpoint file (worker_checkpoint.yaml) — source of the stable workerId.
+    private final String checkpointPath;
+
     // Resources advertised to the coordinator at registration.
     private final String hostname;
     private final int memory;
@@ -83,6 +86,7 @@ public class WorkerAgent implements AutoCloseable {
                        Duration jobExecutionTimeout) throws IOException {
         this.coordinator = new CoordinatorClient(
                 config.getCoordinator().getHost(), config.getCoordinator().getPort());
+        this.checkpointPath = config.getCheckpointPath();
         this.hostname = config.getHostname();
         this.memory = config.getResources().getMemory();
         this.cpu = config.getResources().getCpu();
@@ -138,7 +142,10 @@ public class WorkerAgent implements AutoCloseable {
      * multiplexing the status handler by jobId instead of replacing it per job.
      */
     public void run() {
-        workerId = coordinator.register(hostname, memory, cpu, gpu, capabilities);
+        // Stable identity from the checkpoint file (generated on first boot) so the
+        // same id survives restarts and the coordinator can reconcile our jobs.
+        workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
+        coordinator.register(workerId, hostname, memory, cpu, gpu, capabilities);
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
         coordinator.startHeartbeat(workerId, heartbeatIntervalMs);

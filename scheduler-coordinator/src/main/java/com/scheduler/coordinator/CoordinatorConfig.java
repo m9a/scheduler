@@ -8,7 +8,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 /**
- * Coordinator's view of control-plane.yaml — the single control-plane config,
+ * Coordinator's view of control_plane_config.yaml — the single control-plane config,
  * shared with scripts/control-plane.sh (which reads the mlflow/metrics stack
  * toggles; the coordinator only reads its own and the minio sections, ignoring
  * the rest). Loaded by {@link Coordinator#main} via {@code --config <path>};
@@ -37,6 +37,8 @@ public class CoordinatorConfig {
         private int httpPort = 8080;
         // Directory of built UI static files (Vite dist/). Empty → API-only.
         private String uiDir = "";
+        // SQLite file mirroring job state for restart recovery.
+        private String dbPath = "scheduler.db";
         private int heartbeatTimeoutSeconds = 15;
         private int heartbeatScanIntervalSeconds = 5;
 
@@ -46,6 +48,8 @@ public class CoordinatorConfig {
         public void setHttpPort(int httpPort) { this.httpPort = httpPort; }
         public String getUiDir() { return uiDir; }
         public void setUiDir(String uiDir) { this.uiDir = uiDir; }
+        public String getDbPath() { return dbPath; }
+        public void setDbPath(String dbPath) { this.dbPath = dbPath; }
         public int getHeartbeatTimeoutSeconds() { return heartbeatTimeoutSeconds; }
         public void setHeartbeatTimeoutSeconds(int v) { this.heartbeatTimeoutSeconds = v; }
         public int getHeartbeatScanIntervalSeconds() { return heartbeatScanIntervalSeconds; }

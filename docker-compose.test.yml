@@ -1,5 +1,5 @@
 # Control-plane stack — a template: which services run (compose profiles) and the
-# ${VAR:-default} values below are derived from control-plane.yaml by
+# ${VAR:-default} values below are derived from control_plane_config.yaml by
 # scripts/control-plane.sh. Run it via `scripts/control-plane.sh up|down|status`;
 # the fully resolved compose is logged to .control-plane-resolved.yml on up.
 #   mlflow  → MLflow + PostgreSQL   (experiment tracking for training jobs)

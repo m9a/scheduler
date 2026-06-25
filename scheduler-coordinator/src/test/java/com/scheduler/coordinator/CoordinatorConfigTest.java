@@ -14,7 +14,7 @@ class CoordinatorConfigTest {
 
     @Test
     void load() throws Exception {
-        CoordinatorConfig config = CoordinatorConfig.load(resource("control-plane.yaml"));
+        CoordinatorConfig config = CoordinatorConfig.load(resource("control_plane_config.yaml"));
 
         CoordinatorConfig.CoordinatorSettings coordinator = config.getCoordinator();
         assertEquals(7070, coordinator.getPort());
@@ -32,7 +32,7 @@ class CoordinatorConfigTest {
     // must skip them rather than fail on unknown properties.
     @Test
     void ignoresUnknownSections() throws Exception {
-        assertDoesNotThrow(() -> CoordinatorConfig.load(resource("control-plane.yaml")));
+        assertDoesNotThrow(() -> CoordinatorConfig.load(resource("control_plane_config.yaml")));
     }
 
     // No file / missing keys must fall back to the in-code defaults.

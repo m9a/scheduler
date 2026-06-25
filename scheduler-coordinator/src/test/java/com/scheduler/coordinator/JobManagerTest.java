@@ -5,6 +5,8 @@ import com.scheduler.core.JobStatus;
 import com.scheduler.core.ResourceRequirements;
 import com.scheduler.core.WorkerInfo;
 import com.scheduler.core.exception.JobNotFoundException;
+import com.scheduler.coordinator.persistence.InMemoryJobStore;
+import com.scheduler.coordinator.persistence.JobStore.PersistedJob;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.JobState;
@@ -22,10 +24,12 @@ import static org.junit.jupiter.api.Assertions.*;
 class JobManagerTest {
 
     private JobManager jobManager;
+    private InMemoryJobStore store;
 
     @BeforeEach
     void setUp() {
-        jobManager = new JobManager();
+        store = new InMemoryJobStore();
+        jobManager = new JobManager(store);
     }
 
     @Test
@@ -49,6 +53,32 @@ class JobManagerTest {
         JobStatus result = jobManager.getJob(submitted.id());
 
         assertEquals(submitted.id(), result.id());
+    }
+
+    @Test
+    void persistsWriteThrough() {
+        jobManager.submit("job-1", new Job("test-job", "img:v1", null, 0, null, null));
+        PersistedJob afterSubmit = store.find("job-1").orElseThrow();
+        assertEquals(JobState.JOB_STATE_QUEUED, afterSubmit.status().state());
+        assertNull(afterSubmit.assignedWorkerId());
+
+        jobManager.claimNextJob(DEFAULT_WORKER);
+        PersistedJob afterClaim = store.find("job-1").orElseThrow();
+        assertEquals(JobState.JOB_STATE_STARTING, afterClaim.status().state());
+        assertEquals("worker-1", afterClaim.assignedWorkerId());
+
+        // Task-only update (no job-state change) must still be persisted.
+        jobManager.handleStatusUpdate(taskUpdate("job-1", 0, "extract", TaskState.TASK_STATE_RUNNING, null));
+        assertEquals(TaskState.TASK_STATE_RUNNING,
+                store.find("job-1").orElseThrow().status().taskStatuses().get(0).state());
+
+        jobManager.handleStatusUpdate(jobUpdate("job-1", JobState.JOB_STATE_RUNNING, null, null));
+        jobManager.handleStatusUpdate(taskUpdate("job-1", 0, "extract", TaskState.TASK_STATE_COMPLETED, null));
+        jobManager.handleStatusUpdate(jobUpdate("job-1", JobState.JOB_STATE_COMPLETED, null, null));
+
+        PersistedJob afterDone = store.find("job-1").orElseThrow();
+        assertEquals(JobState.JOB_STATE_COMPLETED, afterDone.status().state());
+        assertEquals(TaskState.TASK_STATE_COMPLETED, afterDone.status().taskStatuses().get(0).state());
     }
 
     @Test

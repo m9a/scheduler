@@ -9,4 +9,4 @@ DOCKER_BUILDKIT=1 docker build --target export --output type=local,dest=dist .
 
 echo
 echo "Built UI bundle → $(pwd)/dist"
-echo "Set coordinator.uiDir to this path in control-plane.yaml to serve it."
+echo "Set coordinator.uiDir to this path in control_plane_config.yaml to serve it."
