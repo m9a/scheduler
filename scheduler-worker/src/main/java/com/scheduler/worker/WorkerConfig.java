@@ -14,6 +14,9 @@ public class WorkerConfig {
     private Coordinator coordinator = new Coordinator();
     private String hostname;
     private int port;
+    // Path to this worker's checkpoint file (worker_checkpoint.yaml) — holds the
+    // stable workerId. Required: no default, the worker fails fast if it's absent.
+    private String checkpointPath;
     // Hard deadline for a job container before the worker kills it (TIMEOUT).
     private int jobExecutionTimeoutMinutes = 10;
     private Resources resources = new Resources();
@@ -33,6 +36,7 @@ public class WorkerConfig {
         require(coordinator.heartbeatIntervalSeconds > 0, "coordinator.heartbeatIntervalSeconds");
         require(coordinator.pollIntervalSeconds > 0, "coordinator.pollIntervalSeconds");
         require(hostname != null && !hostname.isBlank(), "hostname");
+        require(checkpointPath != null && !checkpointPath.isBlank(), "checkpointPath");
         require(jobExecutionTimeoutMinutes > 0, "jobExecutionTimeoutMinutes");
         require(resources.memory > 0, "resources.memory");
         require(resources.cpu > 0, "resources.cpu");
@@ -54,6 +58,9 @@ public class WorkerConfig {
 
     public int getPort() { return port; }
     public void setPort(int port) { this.port = port; }
+
+    public String getCheckpointPath() { return checkpointPath; }
+    public void setCheckpointPath(String checkpointPath) { this.checkpointPath = checkpointPath; }
 
     public int getJobExecutionTimeoutMinutes() { return jobExecutionTimeoutMinutes; }
     public void setJobExecutionTimeoutMinutes(int v) { this.jobExecutionTimeoutMinutes = v; }

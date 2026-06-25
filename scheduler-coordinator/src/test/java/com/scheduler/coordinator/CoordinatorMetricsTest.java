@@ -28,7 +28,7 @@ class CoordinatorMetricsTest {
 
     @Test
     void testCountersAndGauges() {
-        JobManager jobManager = new JobManager();
+        JobManager jobManager = new JobManager(new com.scheduler.coordinator.persistence.InMemoryJobStore());
         CoordinatorMetrics.init(jobManager, null);
 
         double submittedBefore = counterValue("scheduler_jobs_submitted_total");
@@ -56,7 +56,7 @@ class CoordinatorMetricsTest {
 
     @Test
     void testHeartbeatFailureCountsAsFailed() {
-        JobManager jobManager = new JobManager();
+        JobManager jobManager = new JobManager(new com.scheduler.coordinator.persistence.InMemoryJobStore());
         double failedBefore = counterValue("scheduler_jobs_finished_total", "failed");
 
         jobManager.submit("job-hb", new Job("hb-job", "img:latest", null, 0, null, null));

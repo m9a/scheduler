@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts/stops the control-plane docker stacks based on control-plane.yaml.
+# Starts/stops the control-plane docker stacks based on control_plane_config.yaml.
 #
 # The compose file is the template: which services run (compose profiles) and
 # their ports/credentials (compose variables) are derived from the config here
@@ -11,11 +11,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIG="$REPO_ROOT/control-plane.yaml"
+CONFIG="$REPO_ROOT/control_plane_config.yaml"
 COMPOSE="$REPO_ROOT/docker-compose.test.yml"
 RESOLVED="$REPO_ROOT/.control-plane-resolved.yml"
 
-# Reads `<section>.<key>` from control-plane.yaml. Dependency-free on purpose
+# Reads `<section>.<key>` from control_plane_config.yaml. Dependency-free on purpose
 # (host pythons differ on pyyaml) — works because the config is constrained to
 # flat two-level scalar keys; keep it that way.
 cfg() {

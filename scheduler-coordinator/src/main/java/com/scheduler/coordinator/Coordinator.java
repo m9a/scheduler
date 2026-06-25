@@ -2,6 +2,7 @@ package com.scheduler.coordinator;
 
 import com.scheduler.coordinator.client.ClientHandler;
 import com.scheduler.coordinator.http.ReadApiServer;
+import com.scheduler.coordinator.persistence.SqliteJobStore;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
 import io.grpc.Server;
@@ -30,7 +31,7 @@ public class Coordinator {
     public static void main(String[] args) throws IOException, InterruptedException {
         String configPath = System.getenv("CONTROL_PLANE_CONFIG");
         if (configPath == null || configPath.isBlank()) {
-            System.err.println("CONTROL_PLANE_CONFIG must point to control-plane.yaml");
+            System.err.println("CONTROL_PLANE_CONFIG must point to control_plane_config.yaml");
             System.exit(1);
             return;
         }
@@ -48,7 +49,9 @@ public class Coordinator {
         Duration heartbeatScanInterval = Duration.ofSeconds(config.getCoordinator().getHeartbeatScanIntervalSeconds());
 
         ObjectStore objectStore = createObjectStore(config.getMinio());
-        JobManager jobManager = new JobManager();
+        // Durable job-state mirror (SQLite file) — JobManager writes through to it.
+        SqliteJobStore jobStore = new SqliteJobStore(Path.of(config.getCoordinator().getDbPath()));
+        JobManager jobManager = new JobManager(jobStore);
         ClientHandler clientHandler = new ClientHandler(jobManager, objectStore);
         WorkerHandler workerHandler = new WorkerHandler(jobManager);
         workerHandler.startHeartbeatMonitor(heartbeatTimeout, heartbeatScanInterval);
@@ -82,6 +85,7 @@ public class Coordinator {
             httpApi.stop();
             metrics.stop();
             server.shutdown();
+            jobStore.close();
         }));
 
         server.awaitTermination();

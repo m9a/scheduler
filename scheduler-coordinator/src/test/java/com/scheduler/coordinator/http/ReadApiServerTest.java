@@ -33,7 +33,7 @@ class ReadApiServerTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        jobManager = new JobManager();
+        jobManager = new JobManager(new com.scheduler.coordinator.persistence.InMemoryJobStore());
         workerHandler = new WorkerHandler(jobManager);
         server = new ReadApiServer(jobManager, workerHandler, null); // API-only
         server.start(0); // ephemeral port

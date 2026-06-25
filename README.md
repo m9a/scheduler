@@ -214,19 +214,67 @@ When a task throws an exception, the SDK marks it FAILED and returns immediately
 
 ### Timeout
 
-The timeout is configurable via `jobExecutionTimeoutMinutes` in `worker.yaml` (default 10). When the timeout expires, `process.waitFor()` returns false and the process is killed with `destroyForcibly()`.
+The timeout is configurable via `jobExecutionTimeoutMinutes` in `worker_config.yaml` (default 10). When the timeout expires, `process.waitFor()` returns false and the process is killed with `destroyForcibly()`.
 
 ### Worker crash
 
 WorkerAgent sends periodic heartbeats to the coordinator (`heartbeatIntervalSeconds`). If a worker stops sending heartbeats (crash, network partition), the coordinator's heartbeat monitor detects the dead worker and fails all its in-flight jobs with `HEARTBEAT_LOST`. (Covered end-to-end by `IntegrationTest#testWorkerHeartbeatLost`.)
 
-### Job stall
+### Job stall detection
 
-Separately, the **worker** watches each running job's liveness (`JobLivenessMonitor`). A job that shows no activity within `liveness.startupTimeoutSeconds` of launch, or goes silent for `maxMissedPings × pingIntervalSeconds`, is flagged unresponsive; with `autoKill` the worker gracefully stops the container and reports the job `KILLED` / `UNRESPONSIVE`. (Covered by `IntegrationTest#testJobStallUnresponsive`.)
+The **worker** owns job liveness (it sees the job's frames), via `JobLivenessMonitor`, one per running job:
+
+- **Liveness signal** — every frame the SDK sends over the WebSocket (status, telemetry, or a periodic liveness ping) counts as activity and refreshes the job's last-activity time.
+- **Cadence** — the monitor ticks every `liveness.pingIntervalSeconds` (default 15s).
+- **The check** — a job is *unresponsive* when either: it shows **no activity within `startupTimeoutSeconds`** of launch (default 30s, never started), **or** it goes **silent for `maxMissedPings × pingIntervalSeconds`** after starting (default 3 × 15s = 45s).
+- **Action & owner** — on a stall, **the worker** (not the coordinator) gracefully stops the container (`shutdownGraceSeconds` grace) when `autoKill` is set, then reports the job `KILLED` / `UNRESPONSIVE`. Disabling `autoKill` keeps detection (surfaced as last-activity) but takes no action. (Covered by `IntegrationTest#testJobStallUnresponsive`.)
+
+### When the service kills a container
+
+Three triggers can end a running container. Two are worker-driven (it owns the job); the third is the coordinator acting only because the worker is gone.
+
+| Trigger | Detected by | Config (default) | Action | Status propagated |
+|---------|-------------|------------------|--------|-------------------|
+| **Job stall** (unresponsive) | Worker — `JobLivenessMonitor` | `liveness.startupTimeoutSeconds` (30), `pingIntervalSeconds` (15), `maxMissedPings` (3), `shutdownGraceSeconds` (10), `autoKill` (true) | Graceful container stop | `KILLED` / `UNRESPONSIVE` |
+| **Hard deadline** (timeout) | Worker — `JobLauncher` | `jobExecutionTimeoutMinutes` (10) | `destroyForcibly()` | `TIMEOUT` (kill in flight) → `KILLED` / `PROCESS_TIMEOUT` |
+| **Worker dead** (heartbeat lost) | Coordinator — heartbeat monitor | worker `heartbeatIntervalSeconds` (5); coordinator `heartbeatTimeoutSeconds` (15), `heartbeatScanIntervalSeconds` (5) | No container kill — worker is gone | job `FAILED` / `HEARTBEAT_LOST` |
+
+`TIMEOUT` precedes `KILLED` so the coordinator shows *why* the kill started before the kill is confirmed. The worker-dead case never kills a container (the coordinator can't reach it) — it only fails the job state.
 
 ### Coordinator idempotency
 
 The coordinator ignores status updates for jobs already in a terminal state (COMPLETED, FAILED, KILLED, CANCELLED). Duplicate RUNNING updates are also safe — `canTransitionTo` rejects same-state transitions.
+
+## Coordinator Failover & State Persistence
+
+The coordinator keeps job state in memory for speed but **mirrors it to an embedded SQLite database**, written through on every state transition, so a restart recovers rather than losing everything.
+
+- **Why embedded SQLite (not Postgres):** there is exactly **one** coordinator by design (see non-goals). On a reliable host, a single local file gives ACID durability with no external dependency or network hop. Postgres would only be warranted for multiple coordinators or off-host durability — neither of which this architecture needs.
+- **What's persisted:** each job's definition (image, params, resources, inputs), lifecycle state + timestamps + failure info, per-task status, and its assigned worker.
+- **What's not** (regenerated after restart): the worker registry (workers re-register), job liveness and live telemetry (resume on the next report), and the queue (rebuilt from `QUEUED` jobs).
+- **Memory vs DB:** only **active** (non-terminal) jobs are held in memory; terminal jobs are served from SQLite (e.g. the UI's job list).
+- **On restart:** non-terminal jobs are reloaded; in-flight jobs are held "pending reconciliation" through a startup grace window while workers re-register and resync their current task state (matched by job ID), so healthy jobs aren't prematurely failed.
+
+### When the database is written
+
+Writes happen only on a **state transition**, through the one synchronized path in `JobManager`:
+
+- **Job submitted** → row inserted as `QUEUED` (no worker yet).
+- **Job claimed by a worker** → `STARTING`, with the assigned worker id recorded.
+- **Job state change** → `RUNNING` / `COMPLETED` / `FAILED` / `TIMEOUT` / `KILLED` / `CANCELLED`.
+- **Task state change** → the job row is re-saved with the updated task (even when the job's own state doesn't change).
+- **Worker heartbeat lost** → the coordinator writes the job `FAILED` (`HEARTBEAT_LOST`).
+- **Retention sweep** → terminal rows past `retentionDays` are deleted.
+
+Not written (regenerated, not persisted): telemetry/liveness reports, and duplicate no-op status updates (e.g. a repeated `RUNNING`).
+
+### Job retention
+
+Terminal jobs are kept for `retentionDays` (default 7). A periodic sweep **deletes** jobs whose `completed_at` is older than the window, keeping the `jobs` table bounded.
+
+### Storage abstraction
+
+There's nothing to "bring up" for SQLite — it's an embedded library, not a server: no process, port, or credentials. The coordinator opens the file at `coordinator.dbPath` on startup and creates the schema on first open. The store sits behind a `JobStore` interface that speaks only domain types (`JobStatus`); `SqliteJobStore` is the only place that knows SQL or schema, and `JobManager` depends on the interface. Swapping to Postgres (or another backend) is one new `JobStore` implementation, injected at startup — no changes to `JobManager` or the core.
 
 ## Input/Output Files
 
@@ -295,14 +343,14 @@ or if the file fails to parse.
 
 | Process | Env var | File |
 |---------|---------|------|
-| Coordinator | `CONTROL_PLANE_CONFIG` | `control-plane.yaml` |
-| Worker | `WORKER_CONFIG` | `worker.yaml` |
-| CLI | `CONTROL_PLANE_CONFIG` | `control-plane.yaml` (coordinator endpoint + readiness URLs) |
+| Coordinator | `CONTROL_PLANE_CONFIG` | `control_plane_config.yaml` |
+| Worker | `WORKER_CONFIG` | `worker_config.yaml` |
+| CLI | `CONTROL_PLANE_CONFIG` | `control_plane_config.yaml` (coordinator endpoint + readiness URLs) |
 
 The worker is **not** part of the control plane, so its settings live in
-`worker.yaml`, never in `control-plane.yaml`.
+`worker_config.yaml`, never in `control_plane_config.yaml`.
 
-### Coordinator — `control-plane.yaml`
+### Coordinator — `control_plane_config.yaml`
 
 | Key | Meaning |
 |-----|---------|
@@ -312,7 +360,7 @@ The worker is **not** part of the control plane, so its settings live in
 | `minio.endpoint` / `accessKey` / `secretKey` / `bucket` | object store connection |
 | `mlflow.enabled`, `metrics.enabled`, `*.port`, `registry.url` | infra-stack toggles/ports for `control-plane.sh` + CLI readiness |
 
-### Worker — `worker.yaml`
+### Worker — `worker_config.yaml`
 
 | Key | Meaning |
 |-----|---------|
@@ -333,7 +381,7 @@ The worker is **not** part of the control plane, so its settings live in
 | `liveness.shutdownGraceSeconds` | SIGTERM→SIGKILL grace on a graceful stop |
 
 `scripts/control-plane.sh up|down|status` derives compose profiles/variables from
-`control-plane.yaml` and logs the resolved compose to `.control-plane-resolved.yml`.
+`control_plane_config.yaml` and logs the resolved compose to `.control-plane-resolved.yml`.
 
 ## Metrics & Observability
 

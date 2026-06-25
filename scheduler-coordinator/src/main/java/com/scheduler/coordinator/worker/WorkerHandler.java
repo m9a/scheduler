@@ -59,9 +59,16 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> responseObserver) {
-        String workerId = UUID.randomUUID().toString();
+        // Worker owns its identity (stable across restarts, see task #14). Fall back to
+        // a generated id only if an older worker sends none — and log it as anomalous.
+        String workerId = request.getWorkerId();
+        if (workerId == null || workerId.isBlank()) {
+            workerId = UUID.randomUUID().toString();
+            log.warn("registerWorker from hostname={} sent no worker_id; generated {}",
+                    request.getHostname(), workerId);
+        }
         com.scheduler.proto.v1.ResourceRequirements resources = request.getResources();
-        log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, assigned workerId={}",
+        log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, workerId={}",
                 request.getHostname(), resources.getMemoryMb(), resources.getCpuCores(), resources.getGpu(), workerId);
         workers.register(new WorkerInfo(
                 workerId,

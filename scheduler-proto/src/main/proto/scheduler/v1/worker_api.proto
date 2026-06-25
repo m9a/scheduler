@@ -12,6 +12,7 @@ import "scheduler/v1/job_callback.proto";
 message RegisterWorkerRequest {
   string hostname = 1;
   scheduler.v1.ResourceRequirements resources = 2;
+  string worker_id = 3;
 }
 
 // Coordinator -> Worker

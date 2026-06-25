@@ -2,6 +2,7 @@ package com.scheduler.coordinator;
 
 import com.scheduler.core.*;
 import com.scheduler.core.exception.JobNotFoundException;
+import com.scheduler.coordinator.persistence.JobStore;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.JobState;
@@ -41,6 +42,11 @@ public class JobManager {
 
     private static final Logger log = LoggerFactory.getLogger(JobManager.class);
 
+    // Durable mirror — written through on every state transition so a restart
+    // recovers (see README "Coordinator Failover & State Persistence"). The
+    // manager depends only on the interface; the SQLite impl is injected.
+    private final JobStore store;
+
     // All submitted jobs by ID. Written by submit(), claimNextJob() (state → STARTING),
     // handleStatusUpdate() (state changes), and failJobsForWorker() (state → FAILED).
     private final ConcurrentHashMap<String, JobStatus> jobs = new ConcurrentHashMap<>();
@@ -61,6 +67,10 @@ public class JobManager {
     // removed when the job goes terminal.
     private final ConcurrentHashMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
 
+    public JobManager(JobStore store) {
+        this.store = store;
+    }
+
 
     public synchronized JobStatus submit(String jobId, Job job) {
         JobStatus execution = new JobStatus(
@@ -74,6 +84,7 @@ public class JobManager {
 
         jobs.put(execution.id(), execution);
         queue.add(execution.id());
+        store.save(execution, null);  // QUEUED, no worker yet
         CoordinatorMetrics.JOBS_SUBMITTED.inc();
         return execution;
     }
@@ -140,6 +151,7 @@ public class JobManager {
                 JobStatus claimed = job.claim();
                 jobs.put(jobId, claimed);
                 jobWorker.put(jobId, worker.id());
+                store.save(claimed, worker.id());  // STARTING, now assigned
                 CoordinatorMetrics.QUEUE_WAIT.observe(
                         Duration.between(claimed.createdAt(), Instant.now()).toMillis() / 1000.0);
                 return Optional.of(claimed);
@@ -172,11 +184,17 @@ public class JobManager {
             return;
         }
 
+        // Captured before applyJobStatus, which clears the assignment on a terminal
+        // transition — we still want to persist which worker ran the job.
+        String assignedWorker = jobWorker.get(jobId);
+        boolean changed = false;
+
         if (update.getTaskState() != TaskState.TASK_STATE_UNSPECIFIED) {
             applyTaskStatus(job, update.getTaskIndex(),
                     update.getTaskName().isEmpty() ? null : update.getTaskName(),
                     update.getTaskState(),
                     update.getErrorMessage().isEmpty() ? null : update.getErrorMessage());
+            changed = true;
         }
 
         JobState jobState = update.getJobState();
@@ -185,6 +203,12 @@ public class JobManager {
                     ? update.getFailureReason() : null;
             String detail = update.getFailureDetail().isEmpty() ? null : update.getFailureDetail();
             applyJobStatus(jobId, job, jobState, reason, detail);
+            changed = true;
+        }
+
+        // One write-through per applied update — a no-op (duplicate RUNNING) skips it.
+        if (changed) {
+            store.save(jobs.get(jobId), assignedWorker);
         }
     }
 
@@ -280,6 +304,7 @@ public class JobManager {
             // last reported state (the worker is dead and can't report a terminal).
             JobStatus failed = job.fail(reason, null);
             jobs.put(jobId, failed);
+            store.save(failed, workerId);  // persist the dead-worker fail
             jobWorker.remove(jobId);
             lastActivityMillis.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(

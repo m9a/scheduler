@@ -59,11 +59,12 @@ class CoordinatorClient implements AutoCloseable {
         this.asyncStub = WorkerServiceGrpc.newStub(channel);
     }
 
-    /** Registers this worker and its resources; returns the coordinator-assigned worker ID. */
-    String register(String hostname, int memoryMb, int cpuCores, boolean gpu, Set<String> capabilities) {
-        log.info("Registering with coordinator: hostname={}, memory={}, cpu={}, gpu={}, capabilities={}",
-                hostname, memoryMb, cpuCores, gpu, capabilities);
+    /** Registers this worker (with its own stable id) and resources; returns the id the coordinator acked. */
+    String register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu, Set<String> capabilities) {
+        log.info("Registering with coordinator: workerId={}, hostname={}, memory={}, cpu={}, gpu={}, capabilities={}",
+                workerId, hostname, memoryMb, cpuCores, gpu, capabilities);
         RegisterWorkerResponse response = blockingStub.registerWorker(RegisterWorkerRequest.newBuilder()
+                .setWorkerId(workerId)
                 .setHostname(hostname)
                 // Same shape as what jobs require — see ResourceRequirements in common.proto.
                 .setResources(ResourceRequirements.newBuilder()

@@ -1,4 +1,4 @@
-# Sample control-plane.yaml for CoordinatorConfig loader tests.
+# Sample control_plane_config.yaml for CoordinatorConfig loader tests.
 # The coordinator only reads the coordinator/minio sections; mlflow/metrics are
 # present to prove unknown sections are ignored, not rejected.
 mlflow:

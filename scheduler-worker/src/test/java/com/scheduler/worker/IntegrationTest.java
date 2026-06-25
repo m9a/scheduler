@@ -660,7 +660,7 @@ class IntegrationTest {
     }
 
     private static void startCoordinatorAndWorker() throws Exception {
-        JobManager jobManager = new JobManager();
+        JobManager jobManager = TestJobManager.create();
 
         coordinatorServer = ServerBuilder.forPort(0)
                 .addService(new ClientHandler(jobManager, objectStore))

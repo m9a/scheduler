@@ -70,7 +70,7 @@ class WorkerJobLifecycleTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        JobManager jobManager = new JobManager();
+        JobManager jobManager = TestJobManager.create();
 
         server = ServerBuilder.forPort(0)
                 .addService(new ClientHandler(jobManager, null))
@@ -203,7 +203,7 @@ class WorkerJobLifecycleTest {
         server.shutdown().awaitTermination(5, TimeUnit.SECONDS);
 
         // Stand up a coordinator with aggressive heartbeat settings (2s timeout, 500ms scan)
-        JobManager jobManager = new JobManager();
+        JobManager jobManager = TestJobManager.create();
         WorkerHandler workerHandler = new WorkerHandler(jobManager);
         workerHandler.startHeartbeatMonitor(Duration.ofSeconds(2), Duration.ofMillis(500));
 

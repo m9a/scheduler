@@ -35,6 +35,25 @@ public class TaskStatus {
         this.state = TaskState.TASK_STATE_PENDING;
     }
 
+    /**
+     * Rehydrates a task from persisted state (the coordinator's SQLite mirror).
+     * Sets the full snapshot directly, bypassing {@link #transition} validation —
+     * the state was already validated when first reported, so loading it back is
+     * not a new transition. Telemetry ({@code reports}) is not persisted, so it
+     * starts empty and refills from the next report after restart.
+     */
+    public static TaskStatus restore(String id, int taskIndex, String taskName, TaskState state,
+                                     Instant startedAt, Instant completedAt,
+                                     String errorMessage, Integer exitCode) {
+        TaskStatus task = new TaskStatus(id, taskIndex, taskName);
+        task.state = state;
+        task.startedAt = startedAt;
+        task.completedAt = completedAt;
+        task.errorMessage = errorMessage;
+        task.exitCode = exitCode;
+        return task;
+    }
+
     public String id() { return id; }
     public int taskIndex() { return taskIndex; }
     public String taskName() { return taskName; }

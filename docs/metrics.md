@@ -8,7 +8,7 @@ training metric *history* goes to MLflow.)
 
 ## Enabling / disabling
 
-The control-plane stacks are toggled in one place: **`control-plane.yaml`** at
+The control-plane stacks are toggled in one place: **`control_plane_config.yaml`** at
 the repo root.
 
 ```yaml
@@ -31,7 +31,7 @@ scripts/control-plane.sh down
 
 The coordinator reads the same file for its own settings, located via the
 `CONTROL_PLANE_CONFIG` env var:
-`CONTROL_PLANE_CONFIG=control-plane.yaml java -jar scheduler-coordinator.jar`.
+`CONTROL_PLANE_CONFIG=control_plane_config.yaml java -jar scheduler-coordinator.jar`.
 
 | UI | URL |
 |----|-----|
