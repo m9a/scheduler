@@ -3,6 +3,7 @@ package com.scheduler.coordinator.worker;
 import com.scheduler.coordinator.CoordinatorMetrics;
 import com.scheduler.coordinator.JobManager;
 import com.scheduler.coordinator.ProtoMapper;
+import com.scheduler.coordinator.persistence.WorkerStore;
 import com.scheduler.core.FailureMessages;
 import com.scheduler.core.JobStatus;
 import com.scheduler.core.WorkerInfo;
@@ -51,10 +52,11 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     private static final Logger log = LoggerFactory.getLogger(WorkerHandler.class);
 
     private final JobManager jobManager;
-    private final WorkerRegistry workers = new WorkerRegistry();
+    private final WorkerRegistry workers;
 
-    public WorkerHandler(JobManager jobManager) {
+    public WorkerHandler(JobManager jobManager, WorkerStore workerStore) {
         this.jobManager = jobManager;
+        this.workers = new WorkerRegistry(workerStore);
     }
 
     @Override

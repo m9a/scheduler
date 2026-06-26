@@ -155,6 +155,38 @@ Worker                                     Coordinator
   │ ════════════════════════════════════════► │  + liveness ticks (lossy, latest-wins)
 ```
 
+### Why one bidirectional stream (protocol direction)
+
+The worker↔coordinator exchange above started as plain unary RPCs
+(`RegisterWorker`, `PullJob`, `Heartbeat`) plus two per-job client streams
+(status, telemetry). It works, but it is effectively **one-directional**: the
+worker only ever *pushes*, and the coordinator can answer a worker-initiated call
+but cannot **push** to the worker. Every coordinator→worker signal therefore has
+to piggyback on a heartbeat/pull *response*, with latency bounded by the poll
+interval.
+
+That is tolerable for one occasional signal, but cancel / drain / preempt / "please
+re-register after my restart" are all genuine coordinator→worker commands —
+bolting each onto the heartbeat response does not scale.
+
+**Direction (in progress):** collapse the worker↔coordinator exchange onto a
+**single long-lived gRPC bidirectional stream per worker**. The stream is
+worker-initiated, because only the worker can dial across the tailnet (see
+Deployment & Security):
+
+- worker → coordinator: register/resync handshake (opening message), heartbeat
+  keepalive, status updates, telemetry.
+- coordinator → worker: control commands (resync, drain, cancel/kill).
+- **Liveness becomes stream health** — a broken stream is an immediate, *symmetric*
+  signal (both ends observe it), so neither side has to infer the peer vanished.
+- **Job claim stays pull-based** even on the stream, to keep the
+  no-orphaned-assignment property the recovery model relies on (a queued job is
+  never handed out unless the worker asks for it).
+
+Why gRPC and not WebSocket here: this boundary is Java↔Java and already on gRPC
+with typed protos, deadlines, and tailnet auth. WebSocket stays on the
+language-agnostic SDK↔worker boundary only (next section).
+
 ### Job (SDK) ↔ Worker — `job_callback.proto` (one WebSocket)
 
 A single binary WebSocket per job container; each frame is prefixed by a one-byte
@@ -245,13 +277,35 @@ Three triggers can end a running container. Two are worker-driven (it owns the j
 
 The coordinator ignores status updates for jobs already in a terminal state (COMPLETED, FAILED, KILLED, CANCELLED). Duplicate RUNNING updates are also safe — `canTransitionTo` rejects same-state transitions.
 
+## Worker Identity
+
+Each worker owns a **stable id** that survives its own restarts. On first boot the
+worker generates a UUID and writes it to a local checkpoint file
+(`worker_checkpoint.yaml`, path from `worker_config.yaml` → `checkpointPath`); on
+every later boot it reads the same id back and sends it on every `RegisterWorker`.
+The checkpoint file is the worker's own local state — distinct from the
+user-authored `worker_config.yaml`.
+
+Why it matters: the coordinator persists each in-flight job's **assigned worker
+id**. After a restart of either side, the coordinator has to match a
+re-registering worker to the jobs it owns. A fresh random id per boot would make
+every reconnect look like a brand-new worker — the coordinator could never
+distinguish "the same worker came back" from "a different worker appeared," and
+would wrongly fail a live worker's jobs while seeding its registry. A stable,
+worker-owned id is what makes reconnect-and-reconcile correct (matching is still
+done by job id, so the stable id is an optimization that avoids ambiguity, not the
+sole correctness lever).
+
+One agent runs per host, so the id is just a generated UUID — there is no
+host/machine-id derivation.
+
 ## Coordinator Failover & State Persistence
 
 The coordinator keeps job state in memory for speed but **mirrors it to an embedded SQLite database**, written through on every state transition, so a restart recovers rather than losing everything.
 
 - **Why embedded SQLite (not Postgres):** there is exactly **one** coordinator by design (see non-goals). On a reliable host, a single local file gives ACID durability with no external dependency or network hop. Postgres would only be warranted for multiple coordinators or off-host durability — neither of which this architecture needs.
-- **What's persisted:** each job's definition (image, params, resources, inputs), lifecycle state + timestamps + failure info, per-task status, and its assigned worker.
-- **What's not** (regenerated after restart): the worker registry (workers re-register), job liveness and live telemetry (resume on the next report), and the queue (rebuilt from `QUEUED` jobs).
+- **What's persisted:** each job's definition (image, params, resources, inputs), lifecycle state + timestamps + failure info, per-task status, and its assigned worker; plus the **worker registry** (id + placement info), mirrored on register and removed on eviction so the heartbeat monitor has a worker list to watch immediately on restart.
+- **What's not** (regenerated after restart): job liveness and live telemetry (resume on the next report), and the queue (rebuilt from `QUEUED` jobs).
 - **Memory vs DB:** only **active** (non-terminal) jobs are held in memory; terminal jobs are served from SQLite (e.g. the UI's job list).
 - **On restart:** non-terminal jobs are reloaded; in-flight jobs are held "pending reconciliation" through a startup grace window while workers re-register and resync their current task state (matched by job ID), so healthy jobs aren't prematurely failed.
 
@@ -264,6 +318,7 @@ Writes happen only on a **state transition**, through the one synchronized path 
 - **Job state change** → `RUNNING` / `COMPLETED` / `FAILED` / `TIMEOUT` / `KILLED` / `CANCELLED`.
 - **Task state change** → the job row is re-saved with the updated task (even when the job's own state doesn't change).
 - **Worker heartbeat lost** → the coordinator writes the job `FAILED` (`HEARTBEAT_LOST`).
+- **Worker registers / is evicted** → the worker row is written / deleted (a separate `workers` table in the same db file).
 - **Retention sweep** → terminal rows past `retentionDays` are deleted.
 
 Not written (regenerated, not persisted): telemetry/liveness reports, and duplicate no-op status updates (e.g. a repeated `RUNNING`).

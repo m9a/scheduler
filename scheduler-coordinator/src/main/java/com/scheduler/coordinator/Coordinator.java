@@ -3,6 +3,7 @@ package com.scheduler.coordinator;
 import com.scheduler.coordinator.client.ClientHandler;
 import com.scheduler.coordinator.http.ReadApiServer;
 import com.scheduler.coordinator.persistence.SqliteJobStore;
+import com.scheduler.coordinator.persistence.SqliteWorkerStore;
 import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.core.ObjectStore;
 import io.grpc.Server;
@@ -51,9 +52,11 @@ public class Coordinator {
         ObjectStore objectStore = createObjectStore(config.getMinio());
         // Durable job-state mirror (SQLite file) — JobManager writes through to it.
         SqliteJobStore jobStore = new SqliteJobStore(Path.of(config.getCoordinator().getDbPath()));
+        // Durable worker registry (same db file) — re-seeds the monitor on restart.
+        SqliteWorkerStore workerStore = new SqliteWorkerStore(Path.of(config.getCoordinator().getDbPath()));
         JobManager jobManager = new JobManager(jobStore);
         ClientHandler clientHandler = new ClientHandler(jobManager, objectStore);
-        WorkerHandler workerHandler = new WorkerHandler(jobManager);
+        WorkerHandler workerHandler = new WorkerHandler(jobManager, workerStore);
         workerHandler.startHeartbeatMonitor(heartbeatTimeout, heartbeatScanInterval);
 
         // Prometheus scrapes gRPC port + 1 (e.g. 9090 → 9091/metrics).
@@ -86,6 +89,7 @@ public class Coordinator {
             metrics.stop();
             server.shutdown();
             jobStore.close();
+            workerStore.close();
         }));
 
         server.awaitTermination();
