@@ -664,7 +664,7 @@ class IntegrationTest {
 
         coordinatorServer = ServerBuilder.forPort(0)
                 .addService(new ClientHandler(jobManager, objectStore))
-                .addService(new WorkerHandler(jobManager))
+                .addService(TestJobManager.workerHandler(jobManager))
                 .build()
                 .start();
 

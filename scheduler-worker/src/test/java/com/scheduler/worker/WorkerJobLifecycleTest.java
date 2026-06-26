@@ -74,7 +74,7 @@ class WorkerJobLifecycleTest {
 
         server = ServerBuilder.forPort(0)
                 .addService(new ClientHandler(jobManager, null))
-                .addService(new WorkerHandler(jobManager))
+                .addService(TestJobManager.workerHandler(jobManager))
                 .build()
                 .start();
 
@@ -204,7 +204,7 @@ class WorkerJobLifecycleTest {
 
         // Stand up a coordinator with aggressive heartbeat settings (2s timeout, 500ms scan)
         JobManager jobManager = TestJobManager.create();
-        WorkerHandler workerHandler = new WorkerHandler(jobManager);
+        WorkerHandler workerHandler = TestJobManager.workerHandler(jobManager);
         workerHandler.startHeartbeatMonitor(Duration.ofSeconds(2), Duration.ofMillis(500));
 
         server = ServerBuilder.forPort(0)

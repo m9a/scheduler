@@ -100,6 +100,9 @@ public class SqliteJobStore implements JobStore {
 
     private void initSchema() throws SQLException {
         try (Statement st = conn.createStatement()) {
+            // The worker store opens a second connection to this same file; wait out
+            // SQLite's single-writer lock instead of failing with SQLITE_BUSY.
+            st.execute("PRAGMA busy_timeout = 5000");
             st.executeUpdate("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id             TEXT    PRIMARY KEY,
