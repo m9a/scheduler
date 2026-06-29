@@ -20,7 +20,15 @@ import com.scheduler.proto.worker.RegisterWorkerRequest;
 import com.scheduler.proto.worker.RegisterWorkerResponse;
 import com.scheduler.proto.worker.ReportTelemetryResponse;
 import com.scheduler.proto.worker.StatusUpdateResponse;
+import com.scheduler.proto.worker.SubscribeRequest;
+import com.scheduler.proto.worker.SystemCommand;
+import com.scheduler.proto.worker.JobCommand;
+import com.scheduler.proto.worker.Resync;
+import com.scheduler.proto.worker.Drain;
+import com.scheduler.proto.worker.Cancel;
+import com.scheduler.proto.worker.Preempt;
 import com.scheduler.proto.worker.WorkerServiceGrpc;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,6 +61,8 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     private final JobManager jobManager;
     private final WorkerRegistry workers;
+    // Open coordinator → worker push streams, keyed by worker id.
+    private final WorkerCommandStreams commandStreams = new WorkerCommandStreams();
 
     public WorkerHandler(JobManager jobManager, WorkerStore workerStore) {
         this.jobManager = jobManager;
@@ -184,10 +194,68 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     public void heartbeat(HeartbeatRequest request, StreamObserver<HeartbeatResponse> responseObserver) {
         log.debug("Received heartbeat from workerId={}", request.getWorkerId());
         workers.updateHeartbeat(request.getWorkerId());
-        responseObserver.onNext(HeartbeatResponse.newBuilder()
-                .setShouldDrain(false)
-                .build());
+        responseObserver.onNext(HeartbeatResponse.getDefaultInstance());
         responseObserver.onCompleted();
+    }
+
+    /**
+     * Worker subscribes once; the coordinator keeps the stream open and pushes
+     * system commands (resync, drain) on it. The handler does not complete the call
+     * — it stashes the observer and returns, so the stream stays open for later
+     * pushes. The cancel handler drops it when the worker disconnects.
+     */
+    @Override
+    public void systemCommands(SubscribeRequest request, StreamObserver<SystemCommand> responseObserver) {
+        String workerId = request.getWorkerId();
+        log.info("Received systemCommands subscribe from workerId={}", workerId);
+        commandStreams.addSysStream(workerId, responseObserver);
+        if (responseObserver instanceof ServerCallStreamObserver<SystemCommand> serverStream) {
+            serverStream.setOnCancelHandler(() -> {
+                log.info("systemCommands stream closed by workerId={}", workerId);
+                commandStreams.removeSysStream(workerId);
+            });
+        }
+    }
+
+    /** Job-command counterpart of {@link #systemCommands} (cancel, preempt). */
+    @Override
+    public void jobCommands(SubscribeRequest request, StreamObserver<JobCommand> responseObserver) {
+        String workerId = request.getWorkerId();
+        log.info("Received jobCommands subscribe from workerId={}", workerId);
+        commandStreams.addJobStream(workerId, responseObserver);
+        if (responseObserver instanceof ServerCallStreamObserver<JobCommand> serverStream) {
+            serverStream.setOnCancelHandler(() -> {
+                log.info("jobCommands stream closed by workerId={}", workerId);
+                commandStreams.removeJobStream(workerId);
+            });
+        }
+    }
+
+    // ── coordinator → worker push (used by recovery/scheduling logic) ──────────
+    // Each returns false if the worker has no open stream (it will resync on reconnect).
+
+    /** Ask a worker to re-register and re-declare its current jobs (boot/resync recovery). */
+    public boolean requestResync(String workerId) {
+        return commandStreams.sendSysCmd(workerId,
+                SystemCommand.newBuilder().setResync(Resync.getDefaultInstance()).build());
+    }
+
+    /** Tell a worker to stop (or resume) pulling new jobs. */
+    public boolean drain(String workerId, boolean drain) {
+        return commandStreams.sendSysCmd(workerId,
+                SystemCommand.newBuilder().setDrain(Drain.newBuilder().setDrain(drain)).build());
+    }
+
+    /** Tell a worker to cancel a specific running job. */
+    public boolean cancelJob(String workerId, String jobId, FailureReason reason) {
+        return commandStreams.sendJobCmd(workerId,
+                JobCommand.newBuilder().setCancel(Cancel.newBuilder().setJobId(jobId).setReason(reason)).build());
+    }
+
+    /** Tell a worker to preempt a specific running job (stop to free resources). */
+    public boolean preemptJob(String workerId, String jobId) {
+        return commandStreams.sendJobCmd(workerId,
+                JobCommand.newBuilder().setPreempt(Preempt.newBuilder().setJobId(jobId)).build());
     }
 
     /** Read at Prometheus scrape time by CoordinatorMetrics. */
@@ -200,12 +268,24 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
         return workers.list();
     }
 
+    /** Loads persisted workers into the registry on boot (see {@link WorkerRegistry#seed}). */
+    public void seedWorkers(java.time.Instant lastHeartbeat) {
+        workers.seed(lastHeartbeat);
+    }
+
+    /** First scan after {@code scanInterval} — for a fresh start with no seeded workers. */
+    public void startHeartbeatMonitor(Duration heartbeatTimeout, Duration scanInterval) {
+        startHeartbeatMonitor(heartbeatTimeout, scanInterval, scanInterval);
+    }
+
     /**
      * Starts the liveness monitor in {@link WorkerRegistry}; a dead worker's
-     * in-flight jobs are failed with HEARTBEAT_LOST.
+     * in-flight jobs are failed with HEARTBEAT_LOST. The first scan is held off for
+     * {@code initialDelay} — on boot this is the re-registration window, so seeded
+     * workers can reconnect before any eviction.
      */
-    public void startHeartbeatMonitor(Duration heartbeatTimeout, Duration scanInterval) {
-        workers.startMonitor(heartbeatTimeout, scanInterval, worker -> {
+    public void startHeartbeatMonitor(Duration heartbeatTimeout, Duration scanInterval, Duration initialDelay) {
+        workers.startMonitor(heartbeatTimeout, scanInterval, initialDelay, worker -> {
             int failed = jobManager.failJobsForWorker(worker.id(), FailureReason.FAILURE_REASON_HEARTBEAT_LOST);
             if (failed > 0) {
                 log.warn("Failed {} job(s) for dead worker: workerId={}", failed, worker.id());

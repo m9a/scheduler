@@ -42,6 +42,19 @@ class WorkerRegistry {
         store.save(worker);
     }
 
+    /**
+     * Loads persisted workers into the in-memory registry on boot, stamping each
+     * with {@code lastHeartbeat} (the boot time) so a reloaded worker gets a fresh
+     * grace window rather than being evicted for a stale timestamp. Not written
+     * through — these rows are already in the store.
+     */
+    void seed(Instant lastHeartbeat) {
+        for (WorkerInfo worker : store.loadAll()) {
+            workers.put(worker.id(), worker.withLastHeartbeat(lastHeartbeat));
+        }
+        log.info("Seeded {} worker(s) from store on boot", workers.size());
+    }
+
     Optional<WorkerInfo> find(String workerId) {
         return Optional.ofNullable(workers.get(workerId));
     }
@@ -62,9 +75,12 @@ class WorkerRegistry {
     /**
      * Starts a background thread that periodically scans all registered workers
      * and evicts any whose last heartbeat is older than the timeout, invoking
-     * {@code onDeadWorker} for each before removal.
+     * {@code onDeadWorker} for each before removal. The first scan is delayed by
+     * {@code initialDelay} — on boot this is the re-registration window, so seeded
+     * workers have time to reconnect before any eviction.
      */
-    void startMonitor(Duration heartbeatTimeout, Duration scanInterval, Consumer<WorkerInfo> onDeadWorker) {
+    void startMonitor(Duration heartbeatTimeout, Duration scanInterval, Duration initialDelay,
+                      Consumer<WorkerInfo> onDeadWorker) {
         monitor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-monitor");
             t.setDaemon(true);
@@ -85,7 +101,7 @@ class WorkerRegistry {
             } catch (Exception e) {
                 log.error("Heartbeat monitor scan failed: {}", e.getMessage(), e);
             }
-        }, scanInterval.toMillis(), scanInterval.toMillis(), TimeUnit.MILLISECONDS);
+        }, initialDelay.toMillis(), scanInterval.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     void shutdownMonitor() {

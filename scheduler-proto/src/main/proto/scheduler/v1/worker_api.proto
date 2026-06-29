@@ -45,7 +45,43 @@ message HeartbeatRequest {
 
 // Coordinator -> Worker
 message HeartbeatResponse {
-  bool should_drain = 1;
+}
+
+// Worker -> Coordinator
+message SubscribeRequest {
+  string worker_id = 1;
+}
+
+// Coordinator -> Worker
+message SystemCommand {
+  oneof kind {
+    Resync resync = 1;
+    Drain drain = 2;
+  }
+}
+
+// Coordinator -> Worker
+message JobCommand {
+  oneof kind {
+    Cancel cancel = 1;
+    Preempt preempt = 2;
+  }
+}
+
+message Resync {
+}
+
+message Drain {
+  bool drain = 1;
+}
+
+message Cancel {
+  string job_id = 1;
+  scheduler.v1.FailureReason reason = 2;
+}
+
+message Preempt {
+  string job_id = 1;
 }
 
 service WorkerService {
@@ -59,4 +95,8 @@ service WorkerService {
   rpc ReportTelemetry(stream scheduler.job.v1.Report) returns (ReportTelemetryResponse);
   // Worker -> Coordinator
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Coordinator -> Worker
+  rpc SystemCommands(SubscribeRequest) returns (stream SystemCommand);
+  // Coordinator -> Worker
+  rpc JobCommands(SubscribeRequest) returns (stream JobCommand);
 }

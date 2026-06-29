@@ -41,6 +41,9 @@ public class CoordinatorConfig {
         private String dbPath = "scheduler.db";
         private int heartbeatTimeoutSeconds = 15;
         private int heartbeatScanIntervalSeconds = 5;
+        // After a restart, hold the heartbeat monitor this long so re-registering
+        // workers aren't evicted (and their in-flight jobs failed) before they reconnect.
+        private int reregistrationTimeoutSeconds = 30;
 
         public int getPort() { return port; }
         public void setPort(int port) { this.port = port; }
@@ -54,6 +57,8 @@ public class CoordinatorConfig {
         public void setHeartbeatTimeoutSeconds(int v) { this.heartbeatTimeoutSeconds = v; }
         public int getHeartbeatScanIntervalSeconds() { return heartbeatScanIntervalSeconds; }
         public void setHeartbeatScanIntervalSeconds(int v) { this.heartbeatScanIntervalSeconds = v; }
+        public int getReregistrationTimeoutSeconds() { return reregistrationTimeoutSeconds; }
+        public void setReregistrationTimeoutSeconds(int v) { this.reregistrationTimeoutSeconds = v; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

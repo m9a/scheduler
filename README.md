@@ -134,8 +134,8 @@ Client                                Coordinator
 
 ### Worker ↔ Coordinator — `worker_api.proto` (`WorkerService`)
 
-Two unary calls to register/claim, a periodic heartbeat, and **two per-job client
-streams** (status + telemetry).
+Unary register/claim/heartbeat, two per-job client streams (status + telemetry),
+and two coordinator→worker command streams (system + job).
 
 ```
 Worker                                     Coordinator
@@ -153,39 +153,74 @@ Worker                                     Coordinator
   │                                           │
   │  ReportTelemetry(stream Report)           │  one stream per job — metrics/events
   │ ════════════════════════════════════════► │  + liveness ticks (lossy, latest-wins)
+  │                                           │
+  │  SystemCommands(workerId)   (subscribe)   │  push: resync, drain
+  │ ◄════════════════════════════════════════ │
+  │                                           │
+  │  JobCommands(workerId)      (subscribe)   │  push: cancel, preempt
+  │ ◄════════════════════════════════════════ │
 ```
 
-### Why one bidirectional stream (protocol direction)
+### Transport & protocol choices
 
-The worker↔coordinator exchange above started as plain unary RPCs
-(`RegisterWorker`, `PullJob`, `Heartbeat`) plus two per-job client streams
-(status, telemetry). It works, but it is effectively **one-directional**: the
-worker only ever *pushes*, and the coordinator can answer a worker-initiated call
-but cannot **push** to the worker. Every coordinator→worker signal therefore has
-to piggyback on a heartbeat/pull *response*, with latency bounded by the poll
-interval.
+The protocol mixes RPC shapes by interaction:
 
-That is tolerable for one occasional signal, but cancel / drain / preempt / "please
-re-register after my restart" are all genuine coordinator→worker commands —
-bolting each onto the heartbeat response does not scale.
+- **Unary** for request/response: register, claim, heartbeat.
+- **Client streams** for worker→coordinator data: status, telemetry.
+- **Server streams** for coordinator→worker push. The worker subscribes once; the
+  coordinator pushes commands when it needs to act.
 
-**Direction (in progress):** collapse the worker↔coordinator exchange onto a
-**single long-lived gRPC bidirectional stream per worker**. The stream is
-worker-initiated, because only the worker can dial across the tailnet (see
-Deployment & Security):
+Push is split into **two** command streams by originator:
 
-- worker → coordinator: register/resync handshake (opening message), heartbeat
-  keepalive, status updates, telemetry.
-- coordinator → worker: control commands (resync, drain, cancel/kill).
-- **Liveness becomes stream health** — a broken stream is an immediate, *symmetric*
-  signal (both ends observe it), so neither side has to infer the peer vanished.
-- **Job claim stays pull-based** even on the stream, to keep the
-  no-orphaned-assignment property the recovery model relies on (a queued job is
-  never handed out unless the worker asks for it).
+- **System commands** — coordinator-driven worker lifecycle (resync, drain).
+- **Job commands** — user- or policy-driven, per job (cancel, preempt).
 
-Why gRPC and not WebSocket here: this boundary is Java↔Java and already on gRPC
-with typed protos, deadlines, and tailnet auth. WebSocket stays on the
-language-agnostic SDK↔worker boundary only (next section).
+They stay separate so the two planes read cleanly and can be authorized and audited
+on their own. Both are one-way (coordinator → worker); replies ride existing calls
+(resync → `RegisterWorker`, cancel → terminal status on `ReportStatus`).
+
+**Job claim stays pull-based.** A queued job is never handed out unless the worker
+asks, so a coordinator restart can't orphan an assignment.
+
+All of this rides **one HTTP/2 connection** per worker (gRPC multiplexes streams).
+The worker dials the coordinator — only the worker can, across the tailnet (see
+Deployment & Security). Liveness is the heartbeat plus the command stream's health.
+
+### Coordinator → worker push (the trick)
+
+gRPC clients always initiate a call — a server cannot dial a client. The worker is
+the client, so to let the **coordinator** push (resync, drain, cancel, preempt) the
+worker opens a **server-streaming** RPC and holds it open: it sends one
+`SubscribeRequest`, then the coordinator sends commands down that stream whenever it
+needs to. The worker runs no server of its own. If the stream drops, the worker
+**resubscribes** (opens a fresh one) after a short delay.
+
+### Coordinator Threading Model
+
+The coordinator is a gRPC **server**, so it runs **one thread per in-flight RPC**,
+plus background threads (e.g. the heartbeat monitor). It is not single-threaded.
+
+A single worker's command stream can therefore be written from **several threads at
+once**:
+
+- a client's **cancel** request, on its own RPC thread;
+- the **heartbeat monitor**, pushing resync/drain;
+- **boot recovery**, requesting resync.
+
+Sending a command means calling `onNext`, which writes the message as frames on that
+one stream. `StreamObserver` is **not thread-safe**: if two threads call `onNext` on
+the same stream at once, their frames interleave and the message is corrupted. So
+each worker's stream **serializes its sends** (one lock per stream).
+
+### Why gRPC
+
+- Java↔Java control plane: typed stubs generated both ends, no hand-rolled framing.
+- Many independent streams over one connection — clean plane separation, per-stream
+  flow control.
+- Deadlines, cancellation, and auth interceptors are built in.
+- A WebSocket would be one byte channel — everything multiplexed by hand, back to a
+  single envelope. We keep WebSocket for the polyglot SDK↔worker hop only, where a
+  simple socket beats pulling gRPC into every SDK.
 
 ### Job (SDK) ↔ Worker — `job_callback.proto` (one WebSocket)
 
@@ -299,6 +334,34 @@ sole correctness lever).
 One agent runs per host, so the id is just a generated UUID — there is no
 host/machine-id derivation.
 
+## Worker Lifecycle
+
+The worker is a client of the coordinator. On startup (`WorkerAgent.run`):
+
+1. **Restore identity** — read the stable `workerId` from `worker_checkpoint.yaml`
+   (created on first boot). See Worker Identity.
+2. **Register** — unary `RegisterWorker(workerId, resources)`. This blocks until it
+   succeeds; everything below depends on it.
+3. **Start heartbeat** — a background loop sends `Heartbeat` every few seconds so the
+   coordinator's monitor knows the worker is alive.
+4. **Subscribe to commands** — open the two server-streams (`SystemCommands`,
+   `JobCommands`). The coordinator pushes on them. On stream error/close the worker
+   **resubscribes** after a short delay, until it reconnects or shuts down.
+5. **Claim jobs** — loop: `PullJob`; run the job; repeat. Skipped while draining.
+
+Streams come in two scopes:
+
+- **One per worker** (long-lived): the two command streams.
+- **One per job**: `ReportStatus` and `ReportTelemetry`, opened while a job runs.
+
+**Re-registration** happens either when the worker restarts, or when the coordinator
+pushes a `Resync` command to a still-running worker (the worker calls `RegisterWorker`
+again). It is distinct from **resubscribe**, which only re-opens a dropped command
+stream and does not re-register.
+
+If the coordinator is down at startup, `register` fails and the worker exits; the
+supervisor (Docker restart policy) relaunches it until registration succeeds.
+
 ## Coordinator Failover & State Persistence
 
 The coordinator keeps job state in memory for speed but **mirrors it to an embedded SQLite database**, written through on every state transition, so a restart recovers rather than losing everything.
@@ -307,7 +370,7 @@ The coordinator keeps job state in memory for speed but **mirrors it to an embed
 - **What's persisted:** each job's definition (image, params, resources, inputs), lifecycle state + timestamps + failure info, per-task status, and its assigned worker; plus the **worker registry** (id + placement info), mirrored on register and removed on eviction so the heartbeat monitor has a worker list to watch immediately on restart.
 - **What's not** (regenerated after restart): job liveness and live telemetry (resume on the next report), and the queue (rebuilt from `QUEUED` jobs).
 - **Memory vs DB:** only **active** (non-terminal) jobs are held in memory; terminal jobs are served from SQLite (e.g. the UI's job list).
-- **On restart:** non-terminal jobs are reloaded; in-flight jobs are held "pending reconciliation" through a startup grace window while workers re-register and resync their current task state (matched by job ID), so healthy jobs aren't prematurely failed.
+- **On restart:** non-terminal jobs are reloaded (`QUEUED` re-queued, in-flight jobs' worker assignments rebuilt) and the worker registry is seeded from the store. The heartbeat monitor holds off for `reregistrationTimeoutSeconds` so workers can reconnect before any in-flight job is failed. (Job-level resync — workers re-declaring their current jobs — is the next step.)
 
 ### When the database is written
 
@@ -412,6 +475,7 @@ The worker is **not** part of the control plane, so its settings live in
 | `coordinator.port` | gRPC port (metrics served on `port+1`) |
 | `coordinator.heartbeatTimeoutSeconds` | declare a worker dead after this long without a heartbeat |
 | `coordinator.heartbeatScanIntervalSeconds` | how often the monitor scans for dead workers |
+| `coordinator.reregistrationTimeoutSeconds` | after a restart, how long the monitor holds off before evicting, so workers can reconnect |
 | `minio.endpoint` / `accessKey` / `secretKey` / `bucket` | object store connection |
 | `mlflow.enabled`, `metrics.enabled`, `*.port`, `registry.url` | infra-stack toggles/ports for `control-plane.sh` + CLI readiness |
 

@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -65,16 +66,18 @@ class WorkerJobLifecycleTest {
     private Server server;
     private ManagedChannel clientChannel;
     private ClientServiceGrpc.ClientServiceBlockingStub clientStub;
+    private WorkerHandler workerHandler;
     private TestableWorkerAgent worker;
     private Thread workerThread;
 
     @BeforeEach
     void setUp() throws Exception {
         JobManager jobManager = TestJobManager.create();
+        workerHandler = TestJobManager.workerHandler(jobManager);
 
         server = ServerBuilder.forPort(0)
                 .addService(new ClientHandler(jobManager, null))
-                .addService(TestJobManager.workerHandler(jobManager))
+                .addService(workerHandler)
                 .build()
                 .start();
 
@@ -287,7 +290,47 @@ class WorkerJobLifecycleTest {
         assertEquals(JobState.JOB_STATE_COMPLETED, job2.getState());
     }
 
+    // Verifies the coordinator → worker push path end-to-end: the worker subscribes
+    // (so a push is deliverable), and a drain command actually reaches and changes it.
+    @Test
+    void commandStreamSubscribeAndDrain() throws Exception {
+        worker.setSpawnBehavior((details, url, onTimeout) -> 0);  // no job submitted; worker stays idle
+        startWorker();
+
+        String workerId = awaitWorkerId();
+        awaitTrue(() -> workerHandler.requestResync(workerId), 5, TimeUnit.SECONDS,
+                "worker should subscribe to the system command stream");
+
+        assertTrue(workerHandler.drain(workerId, true), "drain push should be deliverable");
+        awaitTrue(worker::isDraining, 5, TimeUnit.SECONDS, "drain command should reach the worker");
+    }
+
     // -- helpers --
+
+    private String awaitWorkerId() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            String id = worker.workerId();
+            if (id != null) {
+                return id;
+            }
+            Thread.sleep(50);
+        }
+        fail("worker did not register within timeout");
+        return null;
+    }
+
+    private void awaitTrue(BooleanSupplier condition, long timeout, TimeUnit unit, String message)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + unit.toNanos(timeout);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        fail(message);
+    }
 
     private static WorkerConfig testConfig(int coordinatorPort) throws IOException {
         Path configPath = Path.of(WorkerJobLifecycleTest.class.getClassLoader()
