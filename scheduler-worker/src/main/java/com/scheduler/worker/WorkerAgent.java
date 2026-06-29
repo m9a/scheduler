@@ -5,6 +5,8 @@ import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.Job;
 import com.scheduler.proto.v1.JobState;
+import com.scheduler.proto.worker.JobCommand;
+import com.scheduler.proto.worker.SystemCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -80,6 +82,10 @@ public class WorkerAgent implements AutoCloseable {
     private final long heartbeatIntervalMs;
     private final long pollIntervalMs;
     private volatile boolean running;
+    // Set by a drain command — the loop stops pulling new jobs while true.
+    private volatile boolean draining;
+    // Id of the job currently executing (null when idle) — lets a job command target it.
+    private volatile String currentJobId;
     private String workerId;
 
     public WorkerAgent(WorkerConfig config, ObjectStore objectStore,
@@ -149,9 +155,12 @@ public class WorkerAgent implements AutoCloseable {
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
         coordinator.startHeartbeat(workerId, heartbeatIntervalMs);
+        // Open the coordinator → worker push channels (resync/drain, cancel/preempt).
+        coordinator.subscribeSystemCommands(workerId, this::onSystemCommand);
+        coordinator.subscribeJobCommands(workerId, this::onJobCommand);
         running = true;
         while (running) {
-            Optional<Job> job = coordinator.pullJob(workerId);
+            Optional<Job> job = draining ? Optional.empty() : coordinator.pullJob(workerId);
             if (job.isPresent()) {
                 executeJob(job.get());
             } else {
@@ -198,6 +207,8 @@ public class WorkerAgent implements AutoCloseable {
         Path outputDir = Path.of("/tmp/jobs", job.getId(), "output");
         Path logFile = Path.of("/tmp/jobs", job.getId(), "stdout.log");
 
+        // Published so a cancel/preempt command can target the running job.
+        currentJobId = job.getId();
         try {
             Files.createDirectories(inputDir);
             Files.createDirectories(outputDir);
@@ -207,8 +218,55 @@ public class WorkerAgent implements AutoCloseable {
         } catch (IOException e) {
             log.error("Failed to set up file staging for jobId={}: {}", job.getId(), e.getMessage(), e);
         } finally {
+            currentJobId = null;
             launcher.cleanupTempDirs(job.getId());
             log.info("Finished job: jobId={}, name={}", job.getId(), job.getName());
+        }
+    }
+
+    /** True once a drain command has told this worker to stop pulling new jobs. */
+    boolean isDraining() {
+        return draining;
+    }
+
+    // ── coordinator → worker command dispatch (pushed on the command streams) ──
+
+    private void onSystemCommand(SystemCommand command) {
+        switch (command.getKindCase()) {
+            case RESYNC -> {
+                log.info("Received resync command from coordinator: workerId={}", workerId);
+                // Re-assert identity now; re-declaring current jobs is added with resync (P5).
+                coordinator.register(workerId, hostname, memory, cpu, gpu, capabilities);
+            }
+            case DRAIN -> {
+                draining = command.getDrain().getDrain();
+                log.info("Received drain command from coordinator: workerId={}, draining={}", workerId, draining);
+            }
+            case KIND_NOT_SET -> log.warn("Received empty SystemCommand from coordinator: workerId={}", workerId);
+        }
+    }
+
+    private void onJobCommand(JobCommand command) {
+        switch (command.getKindCase()) {
+            case CANCEL -> stopRunningJob(command.getCancel().getJobId(), "cancel");
+            case PREEMPT -> stopRunningJob(command.getPreempt().getJobId(), "preempt");
+            case KIND_NOT_SET -> log.warn("Received empty JobCommand from coordinator: workerId={}", workerId);
+        }
+    }
+
+    /**
+     * Stops the running container if the command targets the job this worker is
+     * actually executing. The container's exit then drives the terminal status the
+     * worker reports (the coordinator owns turning that into the final state).
+     */
+    private void stopRunningJob(String jobId, String action) {
+        String current = currentJobId;
+        if (jobId.equals(current)) {
+            log.info("Received {} command for running jobId={}; stopping container", action, jobId);
+            launcher.stopContainer(jobId);
+        } else {
+            log.warn("Ignoring {} command for jobId={}: not the job this worker is running (current={})",
+                    action, jobId, current);
         }
     }
 

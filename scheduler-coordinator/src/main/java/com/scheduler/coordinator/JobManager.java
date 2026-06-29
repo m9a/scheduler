@@ -71,6 +71,36 @@ public class JobManager {
         this.store = store;
     }
 
+    /**
+     * Rebuilds in-memory state from the durable store on boot. Reloads non-terminal
+     * jobs, re-queues {@code QUEUED} ones (claim is pull-based with no ack, so a
+     * queued job was never handed to a worker), and rebuilds the jobId→worker map
+     * for in-flight jobs so the heartbeat monitor and resync can act on them.
+     * Terminal jobs stay only in the store; live telemetry/liveness resume on the
+     * next report. Call once at startup, before the gRPC server accepts requests.
+     */
+    public synchronized void recover() {
+        List<JobStore.PersistedJob> reloaded = store.loadNonTerminal();
+        int queued = 0;
+        int inFlight = 0;
+        for (JobStore.PersistedJob persisted : reloaded) {
+            JobStatus job = persisted.status();
+            jobs.put(job.id(), job);
+            if (job.state() == JobState.JOB_STATE_QUEUED) {
+                queue.add(job.id());
+                queued++;
+            } else if (persisted.assignedWorkerId() != null) {
+                jobWorker.put(job.id(), persisted.assignedWorkerId());
+                inFlight++;
+            } else {
+                log.warn("Recovered non-terminal job with no assigned worker: jobId={}, state={}",
+                        job.id(), job.state());
+            }
+        }
+        log.info("Recovered {} non-terminal job(s) from store: {} queued, {} in-flight",
+                reloaded.size(), queued, inFlight);
+    }
+
 
     public synchronized JobStatus submit(String jobId, Job job) {
         JobStatus execution = new JobStatus(

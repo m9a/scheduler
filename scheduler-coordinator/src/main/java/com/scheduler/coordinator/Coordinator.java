@@ -57,7 +57,14 @@ public class Coordinator {
         JobManager jobManager = new JobManager(jobStore);
         ClientHandler clientHandler = new ClientHandler(jobManager, objectStore);
         WorkerHandler workerHandler = new WorkerHandler(jobManager, workerStore);
-        workerHandler.startHeartbeatMonitor(heartbeatTimeout, heartbeatScanInterval);
+
+        // Boot recovery: rebuild job state from SQLite and seed the worker registry,
+        // then hold the heartbeat monitor for the re-registration window so workers
+        // can reconnect before their in-flight jobs could be failed.
+        Duration reregistrationWindow = Duration.ofSeconds(config.getCoordinator().getReregistrationTimeoutSeconds());
+        jobManager.recover();
+        workerHandler.seedWorkers(java.time.Instant.now());
+        workerHandler.startHeartbeatMonitor(heartbeatTimeout, heartbeatScanInterval, reregistrationWindow);
 
         // Prometheus scrapes gRPC port + 1 (e.g. 9090 → 9091/metrics).
         CoordinatorMetrics.init(jobManager, workerHandler);

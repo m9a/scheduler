@@ -18,6 +18,22 @@ class WorkerRegistryTest {
                 Instant.now(), lastHeartbeat);
     }
 
+    // On boot, persisted workers are loaded into the registry with a fresh heartbeat
+    // so the monitor has a worker list to watch (and won't evict them immediately).
+    @Test
+    void seedLoadsPersistedWorkers() {
+        InMemoryWorkerStore store = new InMemoryWorkerStore();
+        store.save(worker("w-1", Instant.ofEpochMilli(1)));
+        store.save(worker("w-2", Instant.ofEpochMilli(1)));
+
+        WorkerRegistry registry = new WorkerRegistry(store);
+        Instant boot = Instant.now();
+        registry.seed(boot);
+
+        assertEquals(2, registry.count());
+        assertEquals(boot, registry.find("w-1").orElseThrow().lastHeartbeat());
+    }
+
     @Test
     void registerPersists() {
         InMemoryWorkerStore store = new InMemoryWorkerStore();
@@ -38,7 +54,7 @@ class WorkerRegistryTest {
         registry.register(worker("dead", Instant.now().minusSeconds(60)));
 
         AtomicReference<String> evicted = new AtomicReference<>();
-        registry.startMonitor(Duration.ofMillis(1), Duration.ofMillis(20),
+        registry.startMonitor(Duration.ofMillis(1), Duration.ofMillis(20), Duration.ofMillis(20),
                 w -> evicted.set(w.id()));
         try {
             long deadline = System.currentTimeMillis() + 2000;

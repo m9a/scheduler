@@ -9,6 +9,9 @@ import com.scheduler.proto.worker.RegisterWorkerRequest;
 import com.scheduler.proto.worker.RegisterWorkerResponse;
 import com.scheduler.proto.worker.ReportTelemetryResponse;
 import com.scheduler.proto.worker.StatusUpdateResponse;
+import com.scheduler.proto.worker.SubscribeRequest;
+import com.scheduler.proto.worker.SystemCommand;
+import com.scheduler.proto.worker.JobCommand;
 import com.scheduler.proto.worker.WorkerServiceGrpc;
 import com.scheduler.proto.v1.Job;
 import com.scheduler.proto.v1.ResourceRequirements;
@@ -24,6 +27,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 /**
  * <b>Worker → Coordinator leg.</b> The single owner of the gRPC channel to the
@@ -40,16 +45,26 @@ import java.util.concurrent.TimeUnit;
  *   startHeartbeat()     Heartbeat            (5s loop, daemon thread)
  *   openTelemetryStream() ReportTelemetry     (client stream, one per job, lossy)
  *   openStatusStream()   ReportStatus         (client stream, one per job)
+ *   subscribeSystemCommands() SystemCommands  (server stream, coordinator → worker push)
+ *   subscribeJobCommands()    JobCommands     (server stream, coordinator → worker push)
  * </pre>
  */
 class CoordinatorClient implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(CoordinatorClient.class);
 
+    // Fixed delay before re-opening a dropped command stream — keeps reconnect simple.
+    private static final long RESUBSCRIBE_DELAY_MS = 2000;
+
     private final ManagedChannel channel;
     private final WorkerServiceGrpc.WorkerServiceBlockingStub blockingStub;
     private final WorkerServiceGrpc.WorkerServiceStub asyncStub;
     private ScheduledExecutorService heartbeatExecutor;
+    // Reschedules dropped command-stream subscriptions; created on first subscribe.
+    private ScheduledExecutorService commandExecutor;
+    // Set by close() when the worker is shutting down — distinct from a stream
+    // closing (which triggers a resubscribe). Stops pending resubscribes from firing.
+    private volatile boolean shuttingDown;
 
     CoordinatorClient(String host, int port) {
         this.channel = ManagedChannelBuilder.forAddress(host, port)
@@ -108,6 +123,71 @@ class CoordinatorClient implements AutoCloseable {
                 log.warn("Failed to send heartbeat: workerId={}, error={}", workerId, e.getMessage());
             }
         }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Subscribes to the coordinator's system-command push stream (resync, drain).
+     * The call returns immediately; {@code handler} runs on a gRPC thread per pushed
+     * command. A dropped stream is re-subscribed after a fixed delay.
+     */
+    void subscribeSystemCommands(String workerId, Consumer<SystemCommand> handler) {
+        ensureCommandExecutor();
+        subscribe("system", workerId, asyncStub::systemCommands, handler);
+    }
+
+    /** Job-command counterpart of {@link #subscribeSystemCommands} (cancel, preempt). */
+    void subscribeJobCommands(String workerId, Consumer<JobCommand> handler) {
+        ensureCommandExecutor();
+        subscribe("job", workerId, asyncStub::jobCommands, handler);
+    }
+
+    private synchronized void ensureCommandExecutor() {
+        if (commandExecutor == null) {
+            commandExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "command-resubscriber");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+    }
+
+    private <T> void subscribe(String name, String workerId,
+                               BiConsumer<SubscribeRequest, StreamObserver<T>> rpc, Consumer<T> handler) {
+        if (shuttingDown) {
+            return;
+        }
+        StreamObserver<T> observer = new StreamObserver<>() {
+            @Override
+            public void onNext(T command) {
+                try {
+                    handler.accept(command);
+                } catch (Exception e) {
+                    log.error("Error handling {} command: {}", name, e.getMessage(), e);
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                resubscribe(name, workerId, rpc, handler, t.getMessage());
+            }
+
+            @Override
+            public void onCompleted() {
+                resubscribe(name, workerId, rpc, handler, "stream closed by coordinator");
+            }
+        };
+        log.info("Subscribing to {} command stream: workerId={}", name, workerId);
+        rpc.accept(SubscribeRequest.newBuilder().setWorkerId(workerId).build(), observer);
+    }
+
+    private <T> void resubscribe(String name, String workerId,
+                                 BiConsumer<SubscribeRequest, StreamObserver<T>> rpc, Consumer<T> handler, String why) {
+        if (shuttingDown) {
+            return;
+        }
+        log.warn("{} command stream lost ({}); resubscribing in {}ms", name, why, RESUBSCRIBE_DELAY_MS);
+        commandExecutor.schedule(() -> subscribe(name, workerId, rpc, handler),
+                RESUBSCRIBE_DELAY_MS, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -183,8 +263,12 @@ class CoordinatorClient implements AutoCloseable {
 
     @Override
     public void close() throws InterruptedException {
+        shuttingDown = true;  // stop any pending re-subscribe from firing
         if (heartbeatExecutor != null) {
             heartbeatExecutor.shutdown();
+        }
+        if (commandExecutor != null) {
+            commandExecutor.shutdown();
         }
         channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
     }
