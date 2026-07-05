@@ -20,16 +20,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /**
- * Runs the job container and handles its files — no communication with either
- * the job process or the coordinator (those are {@link JobCallbackServer} and
- * {@link CoordinatorClient} respectively). Called only by
- * {@link WorkerAgent#executeJob}: stage inputs from the object store, spawn
- * {@code docker run} and wait (with timeout), upload outputs/logs, clean up.
+ * Runs the job container and handles its files. It does not talk to the job
+ * process or the coordinator — {@link JobCallbackHandler} and
+ * {@link CoordinatorClient} do that. Only {@link WorkerAgent#executeJob} calls it.
+ *
+ * <p>The container runs <b>detached</b> ({@code docker run -d}, no {@code --rm}).
+ * The Docker daemon owns it, not the worker process. A worker crash does not kill
+ * the job, and an exited container keeps its exit code readable. Everything is
+ * addressed by the {@code job-{id}} name, so a restarted worker can re-attach with
+ * the same calls.
  *
  * <pre>
- * WorkerAgent ──► JobLauncher ──docker run──► job container
+ * WorkerAgent ──► JobLauncher ──docker──► job container (daemon-owned)
  *   stageInputFiles()    object store → /tmp/jobs/{id}/input
- *   spawn()              docker run --name job-{id} ... (blocks until exit/timeout)
+ *   spawn()              docker run -d --name job-{id} ...   (returns at once)
+ *                        docker logs -f  → stdout.log        (follower thread)
+ *                        docker wait     → exit code         (blocks until exit)
+ *                        docker rm       after the exit code is read
  *   uploadOutputs()      /tmp/jobs/{id}/output + stdout.log → object store
  *   cleanupTempDirs()    rm /tmp/jobs/{id}
  * </pre>
@@ -38,68 +45,135 @@ class JobLauncher {
 
     private static final Logger log = LoggerFactory.getLogger(JobLauncher.class);
 
+    // spawn() return code for a successful job (docker exit codes are >= 0).
+    static final int EXIT_SUCCESS = 0;
+
     private final ObjectStore objectStore;
-    private final Duration jobExecutionTimeout;
     private final String dockerNetwork;
     private final String mlflowTrackingUri;
     private final int shutdownGraceSeconds;
+    // Bound for `docker run -d` — it includes the image pull, which can be slow.
+    // From worker config `docker.imagePullTimeoutMinutes`.
+    private final Duration imagePullTimeout;
 
-    JobLauncher(ObjectStore objectStore, Duration jobExecutionTimeout,
-                String dockerNetwork, String mlflowTrackingUri, int shutdownGraceSeconds) {
+    JobLauncher(ObjectStore objectStore, String dockerNetwork, String mlflowTrackingUri,
+                int shutdownGraceSeconds, Duration imagePullTimeout) {
         this.objectStore = objectStore;
-        this.jobExecutionTimeout = jobExecutionTimeout;
         this.dockerNetwork = dockerNetwork;
         this.mlflowTrackingUri = mlflowTrackingUri;
         this.shutdownGraceSeconds = shutdownGraceSeconds;
+        this.imagePullTimeout = imagePullTimeout;
     }
 
     /**
-     * Spawns the job container with volume mounts for input/output, tees its
-     * stdout/stderr to a log file and the logger, then waits for exit.
-     * Returns the exit code, or -1 if the job hit the execution timeout.
+     * Launches the container detached, follows its logs, and blocks on
+     * {@code docker wait} until the container exits. Returns its exit code.
      *
-     * <p>{@code onTimeout} fires when the deadline is hit, <b>before</b> the kill
-     * starts — the agent reports TIMEOUT there so the coordinator shows the job
-     * as "kill in flight" during the docker rm below, which can take seconds.
-     * The KILLED report happens in the agent once spawn returns -1 (kill confirmed).
+     * <p>There is no run deadline — a training job may legitimately run for days.
+     * A container that goes silent is killed by the {@link JobLivenessMonitor},
+     * and cancel/preempt commands stop it via {@link #stopContainer}; both make
+     * the wait return.
      */
     int spawn(JobDetails details, Path inputDir, Path outputDir, Path logFile,
-              Map<String, String> params, Runnable onTimeout) throws IOException, InterruptedException {
+              Map<String, String> params) throws IOException, InterruptedException {
         List<String> command = buildCommand(details, inputDir, outputDir, params, dockerNetwork, mlflowTrackingUri);
-        log.info("Starting job process: {}", String.join(" ", command));
+        log.info("Starting job container: {}", String.join(" ", command));
 
-        ProcessBuilder pb = new ProcessBuilder(command)
-                .redirectErrorStream(true);
+        String containerName = "job-" + details.jobId();
 
-        Process process = pb.start();
-
-        // Tee stdout/stderr to both log file and logger
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-             BufferedWriter logWriter = Files.newBufferedWriter(logFile)) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                log.info("[job:{}] {}", details.jobId(), line);
-                logWriter.write(line);
-                logWriter.newLine();
-            }
+        // Step 1: create the container. `docker run -d` pulls the image if absent,
+        // creates the container, and returns — the job has not produced anything
+        // yet at this point. If the pull/create exceeds imagePullTimeout, we give
+        // up and throw; the agent reports the job FAILED / PROCESS_START_FAILED.
+        // No TIMEOUT state is involved — the job never started.
+        Process run = new ProcessBuilder(command).redirectErrorStream(true).start();
+        if (!run.waitFor(imagePullTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+            run.destroyForcibly();
+            // The daemon may have created the container despite the client dying.
+            removeContainer(details.jobId());
+            throw new IOException("docker run -d did not return within " + imagePullTimeout
+                    + " for " + containerName);
+        }
+        // The output is tiny (container id or an error) — safe to read after exit.
+        String runOutput = new String(run.getInputStream().readAllBytes()).trim();
+        if (run.exitValue() != 0) {
+            throw new IOException("docker run -d failed for " + containerName + ": " + runOutput);
         }
 
-        boolean finished = process.waitFor(jobExecutionTimeout.toMillis(), TimeUnit.MILLISECONDS);
-        if (!finished) {
-            log.warn("Job process timed out after {}: jobId={}", jobExecutionTimeout, details.jobId());
-            onTimeout.run();
-            // Graceful stop so the job's @OnShutdown hook can run before SIGKILL.
-            stopContainer(details.jobId());
-            if (!process.waitFor(shutdownGraceSeconds + 5L, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                removeContainer(details.jobId());
-            }
-            return -1;
-        }
+        Thread logFollower = followLogs(details.jobId(), containerName, logFile);
 
-        int exitCode = process.exitValue();
-        log.info("Job process finished: jobId={}, exitCode={}", details.jobId(), exitCode);
+        // Step 2: block until the container exits. `docker wait` prints the exit
+        // code when the container stops, and returns at once if it already exited.
+        // This wait has no time bound on purpose — a training job may run for days.
+        // It cannot hang forever, because something always makes the container
+        // exit: the job finishing, the liveness monitor killing a silent container,
+        // or a cancel/preempt stopping it. Each of those ends this wait.
+        Process wait = new ProcessBuilder("docker", "wait", containerName)
+                .redirectErrorStream(true)
+                .start();
+        wait.waitFor();
+
+        String waitOutput = new String(wait.getInputStream().readAllBytes()).trim();
+        int exitCode;
+        try {
+            exitCode = Integer.parseInt(waitOutput);
+        } catch (NumberFormatException e) {
+            finalizeContainer(details.jobId(), logFollower);
+            throw new IOException("docker wait returned no exit code for " + containerName + ": " + waitOutput);
+        }
+        finalizeContainer(details.jobId(), logFollower);
+        log.info("Job container finished: jobId={}, exitCode={}", details.jobId(), exitCode);
         return exitCode;
+    }
+
+    /**
+     * Cleanup shared by every spawn() exit: flush the last log lines (before the
+     * agent uploads stdout.log), then remove the container. Outputs live on the
+     * mounted volume, not inside the container, so removal loses nothing.
+     */
+    private void finalizeContainer(String jobId, Thread logFollower) throws InterruptedException {
+        awaitLogFollower(logFollower, jobId);
+        removeContainer(jobId);
+    }
+
+    /**
+     * Follows the container's output with {@code docker logs -f} on a daemon
+     * thread. Each line goes to the worker log and the job's log file. It reads by
+     * container name, so it also works for a re-attached container. The thread
+     * ends on its own when the container stops.
+     */
+    private Thread followLogs(String jobId, String containerName, Path logFile) {
+        Thread follower = new Thread(() -> {
+            try {
+                Process logs = new ProcessBuilder("docker", "logs", "-f", containerName)
+                        .redirectErrorStream(true)
+                        .start();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(logs.getInputStream()));
+                     BufferedWriter logWriter = Files.newBufferedWriter(logFile)) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        log.info("[job:{}] {}", jobId, line);
+                        logWriter.write(line);
+                        logWriter.newLine();
+                    }
+                } finally {
+                    logs.destroyForcibly();
+                }
+            } catch (IOException e) {
+                log.warn("Log follower for jobId={} ended with error: {}", jobId, e.getMessage());
+            }
+        }, "job-logs-" + jobId);
+        follower.setDaemon(true);
+        follower.start();
+        return follower;
+    }
+
+    /** Bounded join: a wedged `docker logs` must never hold up job finalization. */
+    private void awaitLogFollower(Thread follower, String jobId) throws InterruptedException {
+        follower.join(TimeUnit.SECONDS.toMillis(10));
+        if (follower.isAlive()) {
+            log.warn("Log follower for jobId={} still running after 10s; abandoning it (daemon thread)", jobId);
+        }
     }
 
     void stageInputFiles(Job job) {
@@ -152,9 +226,9 @@ class JobLauncher {
     }
 
     /**
-     * Gracefully stops a job's container ({@code docker stop}: SIGTERM, then
-     * SIGKILL after {@code shutdownGraceSeconds}) — giving the job's
-     * {@code @OnShutdown} hook time to run before the container is killed.
+     * Gracefully stops a job's container: {@code docker stop} sends SIGTERM, then
+     * SIGKILL after {@code shutdownGraceSeconds}. This gives the job's
+     * {@code @OnShutdown} hook time to run.
      */
     void stopContainer(String jobId) {
         String containerName = "job-" + jobId;
@@ -191,7 +265,9 @@ class JobLauncher {
         List<String> command = new ArrayList<>();
         command.add("docker");
         command.add("run");
-        command.add("--rm");
+        // Detached, no --rm: the daemon owns the container, and an exited container
+        // must keep its exit code readable until spawn() removes it.
+        command.add("-d");
         command.add("--name");
         command.add("job-" + details.jobId());
 

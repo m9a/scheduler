@@ -13,12 +13,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * <b>Worker → Coordinator leg.</b> The open ReportStatus gRPC stream for one job:
- * pushes the {@link StatusUpdate} proto straight to the coordinator — no
- * conversion, it's the same proto the SDK sent (see CLAUDE.md "One status
- * message"). Opened per job by {@link CoordinatorClient#openStatusStream};
- * written to by {@link WorkerAgent} — its per-job status handler (task updates
- * stamped with job RUNNING) and its terminal/TIMEOUT updates.
+ * <b>Worker → Coordinator leg.</b> The open ReportStatus gRPC stream for one job.
+ * It pushes the {@link StatusUpdate} proto straight to the coordinator — no
+ * conversion, it is the same proto the SDK sent (see CLAUDE.md "One status
+ * message"). {@link CoordinatorClient#openStatusStream} opens one per job;
+ * {@link WorkerAgent} writes task updates and terminal updates to it.
  *
  * <pre>
  * WorkerAgent ──► CoordinatorStatusStream ──gRPC stream──► Coordinator

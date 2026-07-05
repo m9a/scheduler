@@ -14,11 +14,18 @@ public class WorkerConfig {
     private Coordinator coordinator = new Coordinator();
     private String hostname;
     private int port;
+    // Port for the Prometheus /metrics endpoint; 0 disables it. The default matches
+    // the control plane's scrape config (metrics/prometheus.yml).
+    private int metricsPort = 9092;
     // Path to this worker's checkpoint file (worker_checkpoint.yaml) — holds the
     // stable workerId. Required: no default, the worker fails fast if it's absent.
     private String checkpointPath;
-    // Hard deadline for a job container before the worker kills it (TIMEOUT).
-    private int jobExecutionTimeoutMinutes = 10;
+    // Path to the worker's durable status store (SQLite) — mirrors the status it forwards
+    // so a coordinator that missed updates during an outage re-learns state on reconnect.
+    private String statusDbPath;
+    // How long a terminal-unacked status row survives before the retention sweep drops it
+    // (guards against a permanently-dead coordinator growing the store forever).
+    private int statusRetentionDays = 7;
     private Resources resources = new Resources();
     private Docker docker = new Docker();
     private Minio minio = new Minio();
@@ -37,7 +44,10 @@ public class WorkerConfig {
         require(coordinator.pollIntervalSeconds > 0, "coordinator.pollIntervalSeconds");
         require(hostname != null && !hostname.isBlank(), "hostname");
         require(checkpointPath != null && !checkpointPath.isBlank(), "checkpointPath");
-        require(jobExecutionTimeoutMinutes > 0, "jobExecutionTimeoutMinutes");
+        require(statusDbPath != null && !statusDbPath.isBlank(), "statusDbPath");
+        require(statusRetentionDays > 0, "statusRetentionDays");
+        require(metricsPort > 0, "metricsPort");
+        require(docker.imagePullTimeoutMinutes > 0, "docker.imagePullTimeoutMinutes");
         require(resources.memory > 0, "resources.memory");
         require(resources.cpu > 0, "resources.cpu");
         require(minio.endpoint != null && !minio.endpoint.isBlank(), "minio.endpoint");
@@ -59,11 +69,17 @@ public class WorkerConfig {
     public int getPort() { return port; }
     public void setPort(int port) { this.port = port; }
 
+    public int getMetricsPort() { return metricsPort; }
+    public void setMetricsPort(int metricsPort) { this.metricsPort = metricsPort; }
+
     public String getCheckpointPath() { return checkpointPath; }
     public void setCheckpointPath(String checkpointPath) { this.checkpointPath = checkpointPath; }
 
-    public int getJobExecutionTimeoutMinutes() { return jobExecutionTimeoutMinutes; }
-    public void setJobExecutionTimeoutMinutes(int v) { this.jobExecutionTimeoutMinutes = v; }
+    public String getStatusDbPath() { return statusDbPath; }
+    public void setStatusDbPath(String statusDbPath) { this.statusDbPath = statusDbPath; }
+
+    public int getStatusRetentionDays() { return statusRetentionDays; }
+    public void setStatusRetentionDays(int v) { this.statusRetentionDays = v; }
 
     public Resources getResources() { return resources; }
     public void setResources(Resources resources) { this.resources = resources; }
@@ -146,9 +162,14 @@ public class WorkerConfig {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class Docker {
         private String network;
+        // Bound for `docker run -d`, which includes pulling the image. On expiry
+        // the job fails (PROCESS_START_FAILED) — the container never started.
+        private int imagePullTimeoutMinutes = 10;
 
         public String getNetwork() { return network; }
         public void setNetwork(String network) { this.network = network; }
+        public int getImagePullTimeoutMinutes() { return imagePullTimeoutMinutes; }
+        public void setImagePullTimeoutMinutes(int v) { this.imagePullTimeoutMinutes = v; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

@@ -37,7 +37,7 @@ stamp.
 ```
 QUEUED → STARTING → RUNNING → COMPLETED
               ↘         ↘ FAILED
-            FAILED      ↘ TIMEOUT → KILLED
+            FAILED      ↘ KILLED
 ```
 
 | State | Set by | Trigger |
@@ -48,8 +48,7 @@ QUEUED → STARTING → RUNNING → COMPLETED
 | COMPLETED | worker | container exit 0 |
 | FAILED | worker | container exit ≠ 0 (a task that threw exits the container non-zero), or `docker run` failed to start |
 | FAILED | coordinator | worker missed health checks (heartbeat lost) — the only state the coordinator writes |
-| TIMEOUT | worker | execution deadline hit; kill has been initiated |
-| KILLED | worker | container kill confirmed (always preceded by TIMEOUT, or future cancel) |
+| KILLED | worker | container killed for unresponsiveness (stall detection), or future cancel |
 | CANCELLED | coordinator | client cancel — no CancelJob RPC yet, currently unreachable |
 
 ### Task states
@@ -256,36 +255,129 @@ Job stalls  ─► no activity     ─► worker JobLivenessMonitor ─► kill 
 3. Worker calls `PullJob` → `WorkerHandler` → `JobManager.claimNextJob()` → job STARTING
 4. WorkerAgent stages input files from MinIO to `/tmp/jobs/<jobId>/input/`
 5. WorkerAgent opens a gRPC status stream to the coordinator
-6. WorkerAgent spawns: `docker run --rm -v input:/workspace/input:ro -v output:/workspace/output -e EXECUTION_PAYLOAD=<base64> <artifactUri>`
-7. Inside the container, the SDK (`JobProcess.run()`) executes tasks sequentially, sending binary proto `StatusUpdate` messages to WorkerAgent's WebSocket server for each task (RUNNING → COMPLETED/FAILED)
+6. WorkerAgent launches the container **detached**: `docker run -d --name job-<jobId> -v input:/workspace/input:ro -v output:/workspace/output -e EXECUTION_PAYLOAD=<base64> <artifactUri>`
+7. Inside the container, the SDK (`JobProcess.run()`) reads `EXECUTION_PAYLOAD` (which carries the worker's WebSocket URL), dials the worker, then executes tasks sequentially, sending binary proto `StatusUpdate` messages for each task (RUNNING → COMPLETED/FAILED)
 8. WorkerAgent forwards each status update to the coordinator via the gRPC stream. On the first RUNNING task, it also sends a job-level RUNNING update.
-9. When the container exits, WorkerAgent interprets the exit code (see Failure Handling) and sends a terminal job status
+9. WorkerAgent blocks on `docker wait job-<jobId>`; the exit code it prints decides the terminal job status (see Failure Handling), sent on the same gRPC status stream
 10. WorkerAgent uploads output files from `/tmp/jobs/<jobId>/output/` and `stdout.log` to MinIO
-11. WorkerAgent cleans up temp directories, closes the gRPC stream, and loops back to step 3
+11. WorkerAgent removes the container (`docker rm`), cleans up temp directories, closes the gRPC stream, and loops back to step 3
+
+### Job vs container lifecycle (detached mode)
+
+The job and its container have **separate lifecycles**, on purpose.
+
+- The container is launched with `docker run -d` and **owned by the Docker daemon**,
+  not by the worker process. The worker is an observer, not the parent.
+- Everything the worker needs is addressed by the container's **name** (`job-<jobId>`,
+  derived from the job id — nothing extra to persist):
+  - **Logs** — a follower thread runs `docker logs -f`, teeing each line to the worker
+    log and to `stdout.log` (uploaded to MinIO at job end).
+  - **Exit code** — `docker wait` blocks until the container stops and prints its exit
+    code. It also answers if the container *already* exited. The worker maps that code
+    to the terminal `StatusUpdate` (COMPLETED / FAILED) it sends the coordinator.
+  - **Stats** — `WorkerMetrics` samples `docker stats` (and `nvidia-smi`) by name; see
+    Metrics & Observability.
+- **Why detached:** if the worker process dies, the container — a long training run —
+  keeps running, and an exited container's exit code stays readable. A restarted worker
+  can find the container by name and resume watching it with the *same* `docker wait` /
+  `docker logs` calls it uses normally (re-attach — being built, see worker-recovery.md).
+- **Container removal:** the worker removes the container explicitly, only after it has
+  what it needs — after reading the exit code (or after a stall/cancel kill). There is
+  no `--rm`; a container never silently deletes its own evidence.
+- The SDK's WebSocket is **initiated by the SDK** (the worker's URL travels in
+  `EXECUTION_PAYLOAD`), so a container can in principle re-dial a restarted worker —
+  that reconnect is part of the re-attach work.
 
 ## Failure Handling
 
 ### Exit codes
 
+The exit code is read from `docker wait` (the daemon reports it when the container
+stops) and mapped by the worker to the terminal `StatusUpdate` it sends the
+coordinator on the job's gRPC status stream:
+
 | Exit code | Interpretation |
 |-----------|---------------|
 | 0 | Job COMPLETED — all tasks succeeded |
-| -1 | Job KILLED — process timed out (`jobExecutionTimeoutMinutes`, default 10), destroyed with `destroyForcibly()` |
-| Any other | Job FAILED — "Job process exited with code N" |
+| Any other | Job FAILED — "Job process exited with code N" (unless the liveness monitor killed the container → KILLED / UNRESPONSIVE) |
 
-If `spawnJobProcess` throws `IOException` (container failed to start) or `InterruptedException`, the job is marked FAILED with the exception message.
+If `spawnJobProcess` throws `IOException` (`docker run -d` failed — bad image, daemon
+error) or `InterruptedException`, the job is marked FAILED with the exception message.
 
 ### Task failure
 
 When a task throws an exception, the SDK marks it FAILED and returns immediately — remaining tasks are never started. The container exits, WorkerAgent sees the non-zero exit code and marks the job FAILED.
 
-### Timeout
+### Timeouts
 
-The timeout is configurable via `jobExecutionTimeoutMinutes` in `worker_config.yaml` (default 10). When the timeout expires, `process.waitFor()` returns false and the process is killed with `destroyForcibly()`.
+There is no run deadline. A training job may run for days. Its duration cannot be
+predicted, so nothing caps it. The guards below watch behavior instead.
+
+| Timeout | Config (default) | What it watches | Who acts | On expiry | Job/container state change |
+|---------|------------------|-----------------|----------|-----------|----------------------------|
+| Image pull | worker `docker.imagePullTimeoutMinutes` (10 min) | `docker run -d`, including the image pull | JobLauncher (worker) | Abort the start. Remove any half-created container. | STARTING → FAILED (`PROCESS_START_FAILED`) |
+| Job startup | worker `liveness.startupTimeoutSeconds` (30 s) | First SDK activity after launch | JobLivenessMonitor (worker) | Gracefully stop the container (when `autoKill`) | STARTING/RUNNING → KILLED (`UNRESPONSIVE`) |
+| Job silence | worker `liveness.maxMissedPings` × `pingIntervalSeconds` (3 × 15 s = 45 s) | SDK activity after the first frame | JobLivenessMonitor (worker) | Gracefully stop the container (when `autoKill`) | RUNNING → KILLED (`UNRESPONSIVE`) |
+| Stop grace | worker `liveness.shutdownGraceSeconds` (10 s) | SIGTERM → SIGKILL window inside any graceful stop | Docker (told by JobLauncher) | Force kill | none — part of the stop |
+| Worker silence | coordinator `heartbeatTimeoutSeconds` (15 s) | Time since the worker's last heartbeat | Heartbeat monitor (coordinator) | Evict the worker. Fail its jobs. The container is not killed — it keeps running, unwatched. | RUNNING → FAILED (`HEARTBEAT_LOST`) |
+| Boot grace | coordinator `reregistrationTimeoutSeconds` (30 s) | Time workers get to re-register after a coordinator restart | Heartbeat monitor (coordinator) | Sweeps begin | none |
+
+One missed heartbeat changes nothing. Silence is what counts: ~3 consecutive
+missed 5 s beats reach the 15 s budget and trigger eviction. Eviction does not
+drain the worker — drain is a separate command.
+
+Cadences, for reference (they pace checks, they don't expire): worker heartbeat
+send `heartbeatIntervalSeconds` (5 s) · coordinator sweep
+`heartbeatScanIntervalSeconds` (5 s) · job pull `pollIntervalSeconds` (5 s) ·
+liveness tick `pingIntervalSeconds` (15 s).
+
+### Worker health check (heartbeats)
+
+Two clocks, one on each side:
+
+- **Worker sends.** A background loop sends `Heartbeat` every
+  `heartbeatIntervalSeconds` (default 5).
+- **Coordinator watches.** Each received beat stamps the worker's `lastHeartbeat` —
+  the silence clock restarts on every beat.
+- **Monitor sweeps.** Every `heartbeatScanIntervalSeconds` (default 5) the monitor
+  scans the registry. A worker silent longer than `heartbeatTimeoutSeconds`
+  (default 15) is evicted and its in-flight jobs are failed (`HEARTBEAT_LOST`).
+- **No explicit miss counter.** The timeout *is* the miss budget:
+  `timeout / interval` ≈ consecutive missed beats tolerated (15 / 5 = 3).
+- **Rule of thumb.** Keep `timeout ≥ 3 × interval`, so one lost packet or a GC
+  pause doesn't kill a healthy worker.
+- **Boot grace.** After a coordinator restart the first sweep waits
+  `reregistrationTimeoutSeconds` (default 30), so seeded workers can re-register
+  before any eviction.
+
+```
+Worker                                  Coordinator
+  │ ── Heartbeat ──────────────────────► lastHeartbeat = now
+  │      every heartbeatIntervalSeconds (5)
+  │ ── Heartbeat ──────────────────────► lastHeartbeat = now
+  │                                          │
+  ✕ (crash / partition)                      │ monitor sweep, every
+                                             │ heartbeatScanIntervalSeconds (5):
+                                             │ now − lastHeartbeat > 15s ?
+                                             ▼
+                                       evict worker; jobs → FAILED (HEARTBEAT_LOST)
+```
+
+This is worker-level health only. Job-level stall detection is separate and
+worker-owned (`JobLivenessMonitor`, which *does* have an explicit miss counter,
+`liveness.maxMissedPings`) — see "Job stall detection".
 
 ### Worker crash
 
-WorkerAgent sends periodic heartbeats to the coordinator (`heartbeatIntervalSeconds`). If a worker stops sending heartbeats (crash, network partition), the coordinator's heartbeat monitor detects the dead worker and fails all its in-flight jobs with `HEARTBEAT_LOST`. (Covered end-to-end by `IntegrationTest#testWorkerHeartbeatLost`.)
+If a worker stops sending heartbeats (crash, network partition), the health check
+above fails all its in-flight jobs with `HEARTBEAT_LOST`. (Covered end-to-end by
+`IntegrationTest#testWorkerHeartbeatLost`.)
+
+The job's **container is not affected** by the worker dying: it runs detached under the
+Docker daemon and keeps going (see "Job vs container lifecycle"). Today the job is
+still failed via `HEARTBEAT_LOST` if the worker stays down past the timeout; recovery
+that re-attaches a restarted worker to its still-running containers is in progress
+(worker-recovery.md).
 
 ### Job stall detection
 
@@ -298,15 +390,14 @@ The **worker** owns job liveness (it sees the job's frames), via `JobLivenessMon
 
 ### When the service kills a container
 
-Three triggers can end a running container. Two are worker-driven (it owns the job); the third is the coordinator acting only because the worker is gone.
+Two triggers can end a running container. One is worker-driven (it owns the job); the other is the coordinator acting only because the worker is gone. There is no run deadline (see "Timeouts").
 
 | Trigger | Detected by | Config (default) | Action | Status propagated |
 |---------|-------------|------------------|--------|-------------------|
 | **Job stall** (unresponsive) | Worker — `JobLivenessMonitor` | `liveness.startupTimeoutSeconds` (30), `pingIntervalSeconds` (15), `maxMissedPings` (3), `shutdownGraceSeconds` (10), `autoKill` (true) | Graceful container stop | `KILLED` / `UNRESPONSIVE` |
-| **Hard deadline** (timeout) | Worker — `JobLauncher` | `jobExecutionTimeoutMinutes` (10) | `destroyForcibly()` | `TIMEOUT` (kill in flight) → `KILLED` / `PROCESS_TIMEOUT` |
 | **Worker dead** (heartbeat lost) | Coordinator — heartbeat monitor | worker `heartbeatIntervalSeconds` (5); coordinator `heartbeatTimeoutSeconds` (15), `heartbeatScanIntervalSeconds` (5) | No container kill — worker is gone | job `FAILED` / `HEARTBEAT_LOST` |
 
-`TIMEOUT` precedes `KILLED` so the coordinator shows *why* the kill started before the kill is confirmed. The worker-dead case never kills a container (the coordinator can't reach it) — it only fails the job state.
+The worker-dead case never kills a container (the coordinator can't reach it) — it only fails the job state.
 
 ### Coordinator idempotency
 
@@ -378,7 +469,7 @@ Writes happen only on a **state transition**, through the one synchronized path 
 
 - **Job submitted** → row inserted as `QUEUED` (no worker yet).
 - **Job claimed by a worker** → `STARTING`, with the assigned worker id recorded.
-- **Job state change** → `RUNNING` / `COMPLETED` / `FAILED` / `TIMEOUT` / `KILLED` / `CANCELLED`.
+- **Job state change** → `RUNNING` / `COMPLETED` / `FAILED` / `KILLED` / `CANCELLED`.
 - **Task state change** → the job row is re-saved with the updated task (even when the job's own state doesn't change).
 - **Worker heartbeat lost** → the coordinator writes the job `FAILED` (`HEARTBEAT_LOST`).
 - **Worker registers / is evicted** → the worker row is written / deleted (a separate `workers` table in the same db file).
@@ -488,9 +579,10 @@ The worker is **not** part of the control plane, so its settings live in
 | `coordinator.pollIntervalSeconds` | how often the worker polls for a job to claim |
 | `hostname` | address advertised to the coordinator |
 | `port` | WebSocket callback port (`0` = ephemeral) |
-| `jobExecutionTimeoutMinutes` | hard deadline before the worker kills a job (TIMEOUT) |
+| `metricsPort` | Prometheus `/metrics` port (default 9092, matches `metrics/prometheus.yml`) |
 | `resources.memory` / `cpu` / `gpu` / `capabilities` | what the worker advertises for placement |
 | `docker.network` | docker network the job containers join |
+| `docker.imagePullTimeoutMinutes` | bound on `docker run -d` incl. the image pull (default 10); on expiry the job FAILS (`PROCESS_START_FAILED`) |
 | `minio.*` | object store connection (fetch inputs, upload outputs) |
 | `mlflow.trackingUri` | MLflow URI injected into job containers |
 | `liveness.startupTimeoutSeconds` | job must show activity within this of launch |

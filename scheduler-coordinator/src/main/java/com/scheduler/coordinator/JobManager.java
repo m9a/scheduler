@@ -24,12 +24,12 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * <b>The coordinator's state core</b> — passive store for job lifecycle, shared
- * by both edges. The worker owns the full job lifecycle (start, monitor, kill,
- * report); this class applies whatever the worker sends and answers client reads.
- * It writes state on its own in exactly one case — {@link #failJobsForWorker},
- * when a worker's heartbeat is lost (see CLAUDE.md "State ownership").
- * No transport: both gRPC handlers unpack protos before calling in.
+ * <b>The coordinator's state core.</b> A passive store for job lifecycle, shared
+ * by both edges. The worker owns the job lifecycle; this class applies what the
+ * worker sends and answers client reads. It writes state on its own in exactly
+ * one case: {@link #failJobsForWorker}, when a worker's heartbeat is lost (see
+ * CLAUDE.md "State ownership"). No transport — both gRPC handlers unpack protos
+ * before calling in.
  *
  * <pre>
  * ClientHandler  (Client → Coordinator edge) ──► submit(), getJob()
@@ -42,9 +42,9 @@ public class JobManager {
 
     private static final Logger log = LoggerFactory.getLogger(JobManager.class);
 
-    // Durable mirror — written through on every state transition so a restart
-    // recovers (see README "Coordinator Failover & State Persistence"). The
-    // manager depends only on the interface; the SQLite impl is injected.
+    // Durable mirror. Every state transition writes through, so a restart recovers
+    // (see README "Coordinator Failover & State Persistence"). The manager depends
+    // only on the interface; the SQLite impl is injected.
     private final JobStore store;
 
     // All submitted jobs by ID. Written by submit(), claimNextJob() (state → STARTING),
@@ -72,12 +72,11 @@ public class JobManager {
     }
 
     /**
-     * Rebuilds in-memory state from the durable store on boot. Reloads non-terminal
-     * jobs, re-queues {@code QUEUED} ones (claim is pull-based with no ack, so a
-     * queued job was never handed to a worker), and rebuilds the jobId→worker map
-     * for in-flight jobs so the heartbeat monitor and resync can act on them.
-     * Terminal jobs stay only in the store; live telemetry/liveness resume on the
-     * next report. Call once at startup, before the gRPC server accepts requests.
+     * Rebuilds in-memory state from the store on boot. Reloads non-terminal jobs,
+     * re-queues {@code QUEUED} ones (claim is pull-based, so a queued job was never
+     * handed out), and rebuilds the jobId→worker map for in-flight jobs. Terminal
+     * jobs stay in the store only. Call once at startup, before the gRPC server
+     * accepts requests.
      */
     public synchronized void recover() {
         List<JobStore.PersistedJob> reloaded = store.loadNonTerminal();
@@ -192,17 +191,15 @@ public class JobManager {
 
 
     /**
-     * Applies a status update from the worker — one {@link StatusUpdate}
-     * proto, job section always present, task section only when a task changed
-     * (see README "Job Lifecycle"). The task section is applied <b>before</b> the
-     * job section so a terminal update sees the final task states.
+     * Applies one {@link StatusUpdate} from the worker: job section always
+     * present, task section only when a task changed (see README "Job Lifecycle").
+     * The task section is applied first, so a terminal update sees the final task
+     * states.
      *
-     * <p>The coordinator never infers state here — it applies exactly what the
-     * worker sends and de-dupes a no-op (same-state) update. A repeated
-     * job-RUNNING (the worker stamps it on every task update) is therefore a
-     * no-op once the job is RUNNING. Updates for already-terminal jobs are
-     * dropped — they're late messages arriving after the heartbeat monitor
-     * already failed the job.
+     * <p>The coordinator never infers state. It applies what the worker sends and
+     * de-dupes same-state updates — a repeated job-RUNNING is a no-op. Updates for
+     * already-terminal jobs are dropped; they are late messages arriving after the
+     * heartbeat monitor failed the job.
      */
     public synchronized void handleStatusUpdate(StatusUpdate update) {
         String jobId = update.getJobId();
@@ -214,8 +211,8 @@ public class JobManager {
             return;
         }
 
-        // Captured before applyJobStatus, which clears the assignment on a terminal
-        // transition — we still want to persist which worker ran the job.
+        // Capture before applyJobStatus clears the assignment on a terminal
+        // transition — we still persist which worker ran the job.
         String assignedWorker = jobWorker.get(jobId);
         boolean changed = false;
 
@@ -246,7 +243,6 @@ public class JobManager {
                                 FailureReason failureReason, String failureDetail) {
         JobStatus updated = switch (jobState) {
             case JOB_STATE_RUNNING -> job.start();
-            case JOB_STATE_TIMEOUT -> job.timeout(failureReason, failureDetail);
             case JOB_STATE_COMPLETED -> job.complete();
             case JOB_STATE_FAILED -> job.fail(failureReason, failureDetail);
             case JOB_STATE_KILLED -> job.kill(failureReason, failureDetail);
@@ -276,21 +272,21 @@ public class JobManager {
     }
 
     /**
-     * Merges a telemetry batch forwarded by the worker into the task's latest-wins
-     * snapshot. Creates the TaskStatus if telemetry arrives before the first status
-     * update (status and telemetry travel on separate RPCs, so order isn't guaranteed).
+     * Merges a telemetry batch from the worker into the task's latest-wins
+     * snapshot. Creates the TaskStatus if telemetry arrives before the first
+     * status update — the two travel on separate RPCs, so order isn't guaranteed.
      */
     public synchronized void handleReport(String jobId, int taskIndex, long timestampMs, List<ReportEntry> entries) {
         CoordinatorMetrics.TELEMETRY_REPORTS.inc();
         JobStatus job = getJob(jobId);
         if (JobStates.isTerminal(job.state())) {
-            // Telemetry flushed at task end can trail the terminal status; the final
-            // values still matter, but a job failed by the heartbeat monitor stays failed.
+            // Telemetry flushed at task end can trail the terminal status. The final
+            // values still matter, but a failed job stays failed.
             log.debug("Applying late report to terminal job: jobId={}, taskIndex={}", jobId, taskIndex);
         } else {
-            // Every report doubles as a liveness signal — the worker owns liveness and
-            // stamps each Report with the job's last-activity time (see CLAUDE.md "State
-            // ownership"). Max-wins since unary reports can arrive out of order.
+            // Every report doubles as a liveness signal. The worker owns liveness
+            // and stamps each Report with last-activity time. Max-wins, because
+            // reports can arrive out of order.
             lastActivityMillis.merge(jobId, timestampMs, Math::max);
         }
         // A liveness-only report carries no entries — don't materialize a phantom task.
@@ -309,13 +305,11 @@ public class JobManager {
 
 
     /**
-     * Fails all non-terminal jobs assigned to the given worker.
-     * Called by the heartbeat monitor when a worker stops sending heartbeats —
-     * the only case where the coordinator (not the worker) writes job state,
-     * because the worker is dead and can't (see CLAUDE.md "State ownership").
-     * Tasks are left at their last reported state.
-     * Synchronized on the same lock as handleStatusUpdate so a late status
-     * update and a heartbeat-triggered failure can't race.
+     * Fails all non-terminal jobs assigned to a worker. The heartbeat monitor
+     * calls this when a worker goes silent — the only case where the coordinator
+     * writes job state, because the worker is dead and can't (see CLAUDE.md
+     * "State ownership"). Tasks keep their last reported state. Shares the lock
+     * with handleStatusUpdate, so a late update and a failure can't race.
      */
     public synchronized int failJobsForWorker(String workerId, FailureReason reason) {
         int count = 0;
@@ -330,8 +324,8 @@ public class JobManager {
                 lastActivityMillis.remove(jobId);
                 continue;
             }
-            // Only the job state is written here; any in-progress task keeps its
-            // last reported state (the worker is dead and can't report a terminal).
+            // Only the job state changes. An in-progress task keeps its last
+            // reported state — the dead worker can't report a terminal one.
             JobStatus failed = job.fail(reason, null);
             jobs.put(jobId, failed);
             store.save(failed, workerId);  // persist the dead-worker fail

@@ -16,11 +16,11 @@ import java.util.function.Consumer;
 
 /**
  * The coordinator's record of which workers exist and when each was last heard
- * from — pure worker state, no transport. {@link WorkerHandler} writes to it as
- * RPCs arrive (register, heartbeat); the liveness monitor started by
- * {@link #startMonitor} scans it and evicts workers whose heartbeat went silent,
- * invoking the supplied callback (wired to {@code JobManager.failJobsForWorker})
- * for each dead worker. {@code CoordinatorMetrics} reads {@link #count} at scrape time.
+ * from. Pure worker state, no transport. {@link WorkerHandler} writes to it as
+ * RPCs arrive (register, heartbeat). The monitor from {@link #startMonitor}
+ * scans it and evicts workers whose heartbeat went silent, calling the supplied
+ * callback (wired to {@code JobManager.failJobsForWorker}) for each dead worker.
+ * {@code CoordinatorMetrics} reads {@link #count} at scrape time.
  */
 class WorkerRegistry {
 
@@ -43,10 +43,10 @@ class WorkerRegistry {
     }
 
     /**
-     * Loads persisted workers into the in-memory registry on boot, stamping each
-     * with {@code lastHeartbeat} (the boot time) so a reloaded worker gets a fresh
-     * grace window rather than being evicted for a stale timestamp. Not written
-     * through — these rows are already in the store.
+     * Loads persisted workers into the in-memory registry on boot. Each gets
+     * stamped with {@code lastHeartbeat} (the boot time), so a reloaded worker
+     * gets a fresh grace window instead of being evicted for a stale timestamp.
+     * Not written through — these rows are already in the store.
      */
     void seed(Instant lastHeartbeat) {
         for (WorkerInfo worker : store.loadAll()) {
@@ -73,13 +73,13 @@ class WorkerRegistry {
     }
 
     /**
-     * Starts a background thread that periodically scans all registered workers
-     * and evicts any whose last heartbeat is older than the timeout, invoking
-     * {@code onDeadWorker} for each before removal. The first scan is delayed by
-     * {@code initialDelay} — on boot this is the re-registration window, so seeded
-     * workers have time to reconnect before any eviction.
+     * Starts a background thread that scans all workers on an interval. It evicts
+     * any worker whose last heartbeat is older than the timeout, calling
+     * {@code onDeadWorker} first. The first scan waits {@code firstScanDelay} — on
+     * boot that is the re-registration window, so seeded workers have time to
+     * reconnect before any eviction.
      */
-    void startMonitor(Duration heartbeatTimeout, Duration scanInterval, Duration initialDelay,
+    void startMonitor(Duration heartbeatSilenceTimeout, Duration heartbeatScanInterval, Duration firstScanDelay,
                       Consumer<WorkerInfo> onDeadWorker) {
         monitor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-monitor");
@@ -88,7 +88,7 @@ class WorkerRegistry {
         });
         monitor.scheduleAtFixedRate(() -> {
             try {
-                Instant cutoff = Instant.now().minus(heartbeatTimeout);
+                Instant cutoff = Instant.now().minus(heartbeatSilenceTimeout);
                 for (WorkerInfo worker : workers.values()) {
                     if (worker.lastHeartbeat().isBefore(cutoff)) {
                         log.warn("Worker heartbeat lost: workerId={}, hostname={}, lastHeartbeat={}",
@@ -101,7 +101,7 @@ class WorkerRegistry {
             } catch (Exception e) {
                 log.error("Heartbeat monitor scan failed: {}", e.getMessage(), e);
             }
-        }, initialDelay.toMillis(), scanInterval.toMillis(), TimeUnit.MILLISECONDS);
+        }, firstScanDelay.toMillis(), heartbeatScanInterval.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     void shutdownMonitor() {

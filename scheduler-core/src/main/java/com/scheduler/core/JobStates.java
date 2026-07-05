@@ -29,13 +29,12 @@ public final class JobStates {
         return switch (from) {
             case JOB_STATE_QUEUED -> to == JobState.JOB_STATE_STARTING || to == JobState.JOB_STATE_CANCELLED;
             // You can fail to start, but you can't succeed without running.
-            case JOB_STATE_STARTING -> to == JobState.JOB_STATE_RUNNING || to == JobState.JOB_STATE_TIMEOUT
+            case JOB_STATE_STARTING -> to == JobState.JOB_STATE_RUNNING
                     || to == JobState.JOB_STATE_FAILED || to == JobState.JOB_STATE_KILLED
                     || to == JobState.JOB_STATE_CANCELLED;
-            case JOB_STATE_RUNNING -> to == JobState.JOB_STATE_TIMEOUT || to == JobState.JOB_STATE_COMPLETED
+            case JOB_STATE_RUNNING -> to == JobState.JOB_STATE_COMPLETED
                     || to == JobState.JOB_STATE_FAILED || to == JobState.JOB_STATE_KILLED
                     || to == JobState.JOB_STATE_CANCELLED;
-            case JOB_STATE_TIMEOUT -> to == JobState.JOB_STATE_KILLED || to == JobState.JOB_STATE_FAILED;
             // Terminal states and UNSPECIFIED have no outgoing transitions.
             default -> false;
         };

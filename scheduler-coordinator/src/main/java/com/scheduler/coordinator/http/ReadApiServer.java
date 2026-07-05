@@ -24,23 +24,20 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 
 /**
- * The coordinator's single HTTP surface for the monitoring UI: it both serves
- * the UI's static files (at {@code /}) and answers a pull-only JSON read API (at
- * {@code /api/*}). One origin for files + data means the browser needs no CORS,
- * and there is no separate web server or reverse proxy to keep in step (the UI
- * polls; live follow stays on the gRPC client path).
+ * The coordinator's single HTTP surface for the monitoring UI. It serves the
+ * UI's static files (at {@code /}) and a pull-only JSON read API (at
+ * {@code /api/*}). One origin for files + data: no CORS, no separate web server
+ * to keep in step. The UI polls; live follow stays on the gRPC client path.
  *
- * <p>Runs in-process in the coordinator on its own port, reading the same
- * {@link JobManager} (job state) and {@link WorkerHandler} (worker liveness) the
- * gRPC handlers serve, so the two surfaces can't drift. JSON is hand-mapped from
- * the domain records — deliberately decoupled from the wire proto so a proto
- * change doesn't reshape the UI contract.
+ * <p>Runs in-process on its own port. It reads the same {@link JobManager} and
+ * {@link WorkerHandler} the gRPC handlers use, so the two surfaces can't drift.
+ * JSON is hand-mapped from the domain records — decoupled from the wire proto,
+ * so a proto change doesn't reshape the UI contract.
  *
- * <p>The API lives under {@code /api} so it never collides with UI asset paths;
- * everything else falls through to the static handler, which serves files from
- * {@code uiDir} and returns {@code index.html} for unknown routes (SPA
- * fallback). When {@code uiDir} is null/missing the server is API-only and logs
- * why — the coordinator still runs without a built UI present.
+ * <p>The API lives under {@code /api}, so it never collides with UI asset paths.
+ * Everything else falls through to the static handler: files from {@code uiDir},
+ * {@code index.html} for unknown routes (SPA fallback). When {@code uiDir} is
+ * null or missing, the server is API-only and logs why.
  */
 public class ReadApiServer {
 

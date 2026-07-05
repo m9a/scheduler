@@ -7,6 +7,7 @@ import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.Job;
 import com.scheduler.proto.v1.JobState;
+import com.scheduler.worker.persistence.InMemoryWorkerStatusStore;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.junit.jupiter.api.Test;
@@ -59,7 +60,7 @@ class HeartbeatIntegrationTest {
         // Worker that blocks the spawn so the job stays in-flight while we kill heartbeats.
         TestableWorkerAgent worker = new TestableWorkerAgent(testConfig(server.getPort()));
         CountDownLatch spawnBlocked = new CountDownLatch(1);
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             spawnBlocked.await();
             return 0;
         });
@@ -144,7 +145,7 @@ class HeartbeatIntegrationTest {
 
         // Silent "container": runs a few seconds without ever sending activity, long
         // enough for the monitor to flag it. Exit 0 — unresponsiveness takes precedence.
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             Thread.sleep(3000);
             return 0;
         });
@@ -191,7 +192,7 @@ class HeartbeatIntegrationTest {
 
     @FunctionalInterface
     interface SpawnBehavior {
-        int execute(JobDetails details, String workerAgentUrl, Runnable onTimeout)
+        int execute(JobDetails details, String workerAgentUrl)
                 throws IOException, InterruptedException;
     }
 
@@ -200,7 +201,7 @@ class HeartbeatIntegrationTest {
         private volatile SpawnBehavior spawnBehavior;
 
         TestableWorkerAgent(WorkerConfig config) throws IOException {
-            super(config, null, Duration.ofSeconds(10));
+            super(config, null, new InMemoryWorkerStatusStore());
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {
@@ -209,8 +210,8 @@ class HeartbeatIntegrationTest {
 
         @Override
         int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
-                            Map<String, String> params, Runnable onTimeout) throws IOException, InterruptedException {
-            return spawnBehavior.execute(details, workerAgentUrl(), onTimeout);
+                            Map<String, String> params) throws IOException, InterruptedException {
+            return spawnBehavior.execute(details, workerAgentUrl());
         }
     }
 }

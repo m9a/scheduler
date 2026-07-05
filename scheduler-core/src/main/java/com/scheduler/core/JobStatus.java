@@ -55,13 +55,6 @@ public record JobStatus(
                 createdAt, startedAt, Instant.now(), reason, detail);
     }
 
-    /** Deadline hit, kill initiated — records the reason now; kill() follows once confirmed. */
-    public JobStatus timeout(FailureReason reason, String detail) {
-        withState(JobState.JOB_STATE_TIMEOUT);
-        return new JobStatus(id, job, JobState.JOB_STATE_TIMEOUT, taskStatuses,
-                createdAt, startedAt, completedAt, reason, detail);
-    }
-
     public JobStatus kill(FailureReason reason, String detail) {
         withState(JobState.JOB_STATE_KILLED);
         return new JobStatus(id, job, JobState.JOB_STATE_KILLED, taskStatuses,
