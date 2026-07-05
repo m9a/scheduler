@@ -34,27 +34,25 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
- * SQLite-backed {@link JobStore} — the coordinator's durable mirror, one local
- * file, no external dependency (single coordinator, see README "Coordinator
- * Failover & State Persistence"). All job state is one {@code jobs} row:
- * definition + lifecycle as columns, tasks as a JSON blob. Proto enums are
- * stored as their stable wire number ({@code getNumber()} / {@code forNumber()}),
- * timestamps as epoch millis. This is the only class that knows SQL/schema;
- * callers see only the {@link JobStore} interface and domain types.
+ * SQLite-backed {@link JobStore} — the coordinator's durable mirror. One local
+ * file, no external dependency (single coordinator; see README "Coordinator
+ * Failover & State Persistence"). Each job is one {@code jobs} row: definition +
+ * lifecycle as columns, tasks as a JSON blob. Proto enums are stored by wire
+ * number, timestamps as epoch millis. Only this class knows SQL; callers see the
+ * {@link JobStore} interface and domain types.
  *
- * <p>Statements are prepared once in the constructor and reused, so SQLite
- * compiles and caches each plan instead of re-parsing per call. Methods are
- * synchronized: SQLite is single-writer and coordinator writes are already
- * serialized through {@code JobManager}'s lock, so one shared connection and one
- * set of reusable statements is both simplest and safe.
+ * <p>Statements are prepared once and reused, so SQLite caches each plan.
+ * Methods are synchronized: SQLite is single-writer and coordinator writes are
+ * already serialized through {@code JobManager}'s lock, so one shared connection
+ * is simplest and safe.
  */
 public class SqliteJobStore implements JobStore {
 
     private static final Logger log = LoggerFactory.getLogger(SqliteJobStore.class);
 
-    // Terminal job-state numbers, as a literal IN-list for retention/boot filters.
-    // Derived from JobStates so it can't drift from the lifecycle rules. These are
-    // code-derived integers, never user input — safe to inline in SQL.
+    // Terminal job-state numbers as a literal IN-list for retention/boot filters.
+    // Derived from JobStates, so it can't drift from the lifecycle rules. These
+    // are code-derived integers, never user input — safe to inline in SQL.
     private static final String TERMINAL_NUMBERS = Arrays.stream(JobState.values())
             .filter(s -> s != JobState.UNRECOGNIZED && JobStates.isTerminal(s))
             .map(s -> String.valueOf(s.getNumber()))

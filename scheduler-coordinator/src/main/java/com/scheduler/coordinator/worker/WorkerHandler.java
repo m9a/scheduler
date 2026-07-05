@@ -23,7 +23,6 @@ import com.scheduler.proto.worker.StatusUpdateResponse;
 import com.scheduler.proto.worker.SubscribeRequest;
 import com.scheduler.proto.worker.SystemCommand;
 import com.scheduler.proto.worker.JobCommand;
-import com.scheduler.proto.worker.Resync;
 import com.scheduler.proto.worker.Drain;
 import com.scheduler.proto.worker.Cancel;
 import com.scheduler.proto.worker.Preempt;
@@ -41,10 +40,10 @@ import java.util.UUID;
 
 /**
  * <b>Worker → Coordinator edge.</b> Implements the WorkerService gRPC API that
- * workers (the other side is the worker's {@code CoordinatorClient}) call into.
- * Pure transport: unpacks protos via {@link ProtoMapper}, delegates to
- * {@link JobManager} (job state) and {@link WorkerRegistry} (worker liveness),
- * and packs the replies — no scheduling or lifecycle logic of its own.
+ * workers call; the other side is the worker's {@code CoordinatorClient}.
+ * Pure transport: it unpacks protos, delegates to {@link JobManager} (job state)
+ * and {@link WorkerRegistry} (worker liveness), and packs the replies. No
+ * scheduling or lifecycle logic of its own.
  *
  * <pre>
  * Worker ──gRPC──► WorkerHandler ──► JobManager        WorkerRegistry
@@ -71,8 +70,8 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> responseObserver) {
-        // Worker owns its identity (stable across restarts, see task #14). Fall back to
-        // a generated id only if an older worker sends none — and log it as anomalous.
+        // The worker owns its identity (stable across restarts). Generate an id
+        // only if an older worker sends none — and log that as anomalous.
         String workerId = request.getWorkerId();
         if (workerId == null || workerId.isBlank()) {
             workerId = UUID.randomUUID().toString();
@@ -159,9 +158,8 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public StreamObserver<Report> reportTelemetry(StreamObserver<ReportTelemetryResponse> responseObserver) {
-        // One telemetry stream per job (the worker's CoordinatorTelemetryStream). Each
-        // Report is applied to the task's latest-wins snapshot; the single response is
-        // sent once the worker closes the stream at job end.
+        // One telemetry stream per job. Each Report lands in the task's latest-wins
+        // snapshot. The single response goes out when the worker closes the stream.
         return new StreamObserver<>() {
             @Override
             public void onNext(Report report) {
@@ -199,10 +197,10 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     /**
-     * Worker subscribes once; the coordinator keeps the stream open and pushes
-     * system commands (resync, drain) on it. The handler does not complete the call
-     * — it stashes the observer and returns, so the stream stays open for later
-     * pushes. The cancel handler drops it when the worker disconnects.
+     * The worker subscribes once; the coordinator pushes system commands (drain)
+     * on the open stream. This handler stashes the observer and returns without
+     * completing the call, so the stream stays open for later pushes. The cancel
+     * handler drops it when the worker disconnects.
      */
     @Override
     public void systemCommands(SubscribeRequest request, StreamObserver<SystemCommand> responseObserver) {
@@ -233,12 +231,6 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     // ── coordinator → worker push (used by recovery/scheduling logic) ──────────
     // Each returns false if the worker has no open stream (it will resync on reconnect).
-
-    /** Ask a worker to re-register and re-declare its current jobs (boot/resync recovery). */
-    public boolean requestResync(String workerId) {
-        return commandStreams.sendSysCmd(workerId,
-                SystemCommand.newBuilder().setResync(Resync.getDefaultInstance()).build());
-    }
 
     /** Tell a worker to stop (or resume) pulling new jobs. */
     public boolean drain(String workerId, boolean drain) {
@@ -273,19 +265,19 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
         workers.seed(lastHeartbeat);
     }
 
-    /** First scan after {@code scanInterval} — for a fresh start with no seeded workers. */
-    public void startHeartbeatMonitor(Duration heartbeatTimeout, Duration scanInterval) {
-        startHeartbeatMonitor(heartbeatTimeout, scanInterval, scanInterval);
+    /** First scan after {@code heartbeatScanInterval} — for a fresh start with no seeded workers. */
+    public void startHeartbeatMonitor(Duration heartbeatSilenceTimeout, Duration heartbeatScanInterval) {
+        startHeartbeatMonitor(heartbeatSilenceTimeout, heartbeatScanInterval, heartbeatScanInterval);
     }
 
     /**
-     * Starts the liveness monitor in {@link WorkerRegistry}; a dead worker's
-     * in-flight jobs are failed with HEARTBEAT_LOST. The first scan is held off for
-     * {@code initialDelay} — on boot this is the re-registration window, so seeded
+     * Starts the liveness monitor in {@link WorkerRegistry}. A dead worker's
+     * in-flight jobs are failed with HEARTBEAT_LOST. The first scan waits
+     * {@code firstScanDelay} — on boot that is the re-registration window, so seeded
      * workers can reconnect before any eviction.
      */
-    public void startHeartbeatMonitor(Duration heartbeatTimeout, Duration scanInterval, Duration initialDelay) {
-        workers.startMonitor(heartbeatTimeout, scanInterval, initialDelay, worker -> {
+    public void startHeartbeatMonitor(Duration heartbeatSilenceTimeout, Duration heartbeatScanInterval, Duration firstScanDelay) {
+        workers.startMonitor(heartbeatSilenceTimeout, heartbeatScanInterval, firstScanDelay, worker -> {
             int failed = jobManager.failJobsForWorker(worker.id(), FailureReason.FAILURE_REASON_HEARTBEAT_LOST);
             if (failed > 0) {
                 log.warn("Failed {} job(s) for dead worker: workerId={}", failed, worker.id());

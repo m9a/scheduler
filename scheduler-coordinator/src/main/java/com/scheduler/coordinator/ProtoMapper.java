@@ -12,12 +12,12 @@ import java.util.HashSet;
 import java.util.List;
 
 /**
- * Assembles the client-facing wire shapes from the coordinator's domain objects
- * and vice versa: the submit request → immutable {@link Job} definition, and the
- * runtime {@link JobStatus} snapshot → the client {@code Job} proto (which merges
- * the definition with live state). This is genuine definition/snapshot ⇄ wire
- * assembly, not a status/enum copy — state and telemetry now use the proto types
- * directly with no conversion (see CLAUDE.md "One status message").
+ * Assembles client-facing wire shapes from the coordinator's domain objects and
+ * back: submit request → immutable {@link Job} definition, and runtime
+ * {@link JobStatus} snapshot → client {@code Job} proto (definition merged with
+ * live state). This is real definition/snapshot ⇄ wire assembly, not an enum
+ * copy — state and telemetry use the proto types directly (see CLAUDE.md
+ * "One status message").
  */
 public final class ProtoMapper {
 

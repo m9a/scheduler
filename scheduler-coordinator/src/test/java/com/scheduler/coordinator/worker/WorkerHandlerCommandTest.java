@@ -35,13 +35,11 @@ class WorkerHandlerCommandTest {
         Collector<SystemCommand> stream = new Collector<>();
         handler.systemCommands(SubscribeRequest.newBuilder().setWorkerId("w1").build(), stream);
 
-        assertTrue(handler.requestResync("w1"));
         assertTrue(handler.drain("w1", true));
 
-        assertEquals(2, stream.received.size());
-        assertEquals(SystemCommand.KindCase.RESYNC, stream.received.get(0).getKindCase());
-        assertEquals(SystemCommand.KindCase.DRAIN, stream.received.get(1).getKindCase());
-        assertTrue(stream.received.get(1).getDrain().getDrain());
+        assertEquals(1, stream.received.size());
+        assertEquals(SystemCommand.KindCase.DRAIN, stream.received.get(0).getKindCase());
+        assertTrue(stream.received.get(0).getDrain().getDrain());
     }
 
     @Test
@@ -62,7 +60,7 @@ class WorkerHandlerCommandTest {
     @Test
     void pushWithoutSubscribe() {
         WorkerHandler handler = newHandler();
-        assertFalse(handler.requestResync("ghost"));
+        assertFalse(handler.drain("ghost", true));
         assertFalse(handler.cancelJob("ghost", "job-1", FailureReason.FAILURE_REASON_UNSPECIFIED));
     }
 }

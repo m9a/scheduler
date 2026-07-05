@@ -2,6 +2,8 @@ package com.scheduler.worker;
 
 import com.scheduler.core.ObjectStore;
 import com.scheduler.proto.job.StatusUpdate;
+import com.scheduler.worker.persistence.SqliteWorkerStatusStore;
+import com.scheduler.worker.persistence.WorkerStatusStore;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.Job;
 import com.scheduler.proto.v1.JobState;
@@ -26,15 +28,15 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The worker's main agent — the orchestrator that wires the two communication
- * legs together and drives the job lifecycle. The coordinator is a passive
- * state store that applies whatever this agent sends.
+ * The worker's main agent. It wires the two communication legs together and
+ * drives the job lifecycle. The coordinator is a passive state store; it applies
+ * whatever this agent sends.
  *
  * <p>Each leg is owned by one class; this class only connects them:
  * <pre>
  *                Job → Worker leg                Worker → Coordinator leg
  *                ────────────────                ────────────────────────
- *  Job container ──WebSocket──► JobCallbackServer            CoordinatorClient ──gRPC──► Coordinator
+ *  Job container ──WebSocket──► JobCallbackHandler            CoordinatorClient ──gRPC──► Coordinator
  *    [0x01] task status              │                            ▲   register / pullJob / heartbeat
  *    [0x03] telemetry                │                            │   CoordinatorTelemetryStream (per job)
  *                                    ▼                            │
@@ -46,26 +48,27 @@ import java.util.concurrent.TimeUnit;
  *
  * <p><b>Main loop</b> ({@link #run()}): register → pull job → execute → repeat.
  * Per job ({@link #executeJob}): stage inputs → open status stream → wire handler
- * → spawn container → wait → report COMPLETED/FAILED/KILLED (TIMEOUT → KILLED
- * on deadline) → upload outputs.
+ * → spawn container → wait → report COMPLETED/FAILED/KILLED → upload outputs.
  */
 public class WorkerAgent implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerAgent.class);
-    // Fixed Prometheus port, matching metrics/prometheus.yml in the scheduler repo.
-    static final int METRICS_PORT = 9092;
 
     // Worker → Coordinator leg: all gRPC to the coordinator goes through this.
     private final CoordinatorClient coordinator;
 
     // Job → Worker leg: WebSocket server receiving status/telemetry from job containers.
-    private final JobCallbackServer jobCallbacks;
+    private final JobCallbackHandler jobCallbacks;
 
     // Job execution: docker run + object-store file staging. No communication.
     private final JobLauncher launcher;
 
     // Observes job containers from outside (docker stats / nvidia-smi → /metrics).
     private final WorkerMetrics metrics;
+
+    // Durable mirror of every status update this agent sends. Survives a worker
+    // crash: recover() reads it on boot, register flushes it to the coordinator.
+    private final WorkerStatusStore statusStore;
 
     // Path to the worker's checkpoint file (worker_checkpoint.yaml) — source of the stable workerId.
     private final String checkpointPath;
@@ -77,10 +80,11 @@ public class WorkerAgent implements AutoCloseable {
     private final boolean gpu;
     private final Set<String> capabilities;
 
-    private final Duration jobExecutionTimeout;
     private final JobLivenessMonitor.Config livenessConfig;
-    private final long heartbeatIntervalMs;
-    private final long pollIntervalMs;
+    // How often the heartbeat loop pings the coordinator.
+    private final long heartbeatSendIntervalMs;
+    // How long the idle loop sleeps between pullJob calls.
+    private final long jobPullIntervalMs;
     private volatile boolean running;
     // Set by a drain command — the loop stops pulling new jobs while true.
     private volatile boolean draining;
@@ -88,8 +92,15 @@ public class WorkerAgent implements AutoCloseable {
     private volatile String currentJobId;
     private String workerId;
 
-    public WorkerAgent(WorkerConfig config, ObjectStore objectStore,
-                       Duration jobExecutionTimeout) throws IOException {
+    public WorkerAgent(WorkerConfig config, ObjectStore objectStore) throws IOException {
+        this(config, objectStore, new SqliteWorkerStatusStore(Path.of(config.getStatusDbPath())));
+    }
+
+    // Package-private so tests can inject an in-memory status store.
+    WorkerAgent(WorkerConfig config, ObjectStore objectStore, WorkerStatusStore statusStore) throws IOException {
+        this.statusStore = statusStore;
+        // One retention sweep per boot bounds what a dead coordinator leaves behind.
+        statusStore.prune(Duration.ofDays(config.getStatusRetentionDays()));
         this.coordinator = new CoordinatorClient(
                 config.getCoordinator().getHost(), config.getCoordinator().getPort());
         this.checkpointPath = config.getCheckpointPath();
@@ -100,22 +111,22 @@ public class WorkerAgent implements AutoCloseable {
         this.capabilities = config.getResources().getCapabilities() == null
                 ? Set.of()
                 : Set.copyOf(config.getResources().getCapabilities());
-        this.jobExecutionTimeout = jobExecutionTimeout;
-        this.heartbeatIntervalMs = config.getCoordinator().getHeartbeatIntervalSeconds() * 1000L;
-        this.pollIntervalMs = config.getCoordinator().getPollIntervalSeconds() * 1000L;
-        WorkerConfig.Liveness lv = config.getLiveness();
+        this.heartbeatSendIntervalMs = config.getCoordinator().getHeartbeatIntervalSeconds() * 1000L;
+        this.jobPullIntervalMs = config.getCoordinator().getPollIntervalSeconds() * 1000L;
+        WorkerConfig.Liveness liveness = config.getLiveness();
         this.livenessConfig = new JobLivenessMonitor.Config(
-                lv.getStartupTimeoutSeconds() * 1000L,
-                lv.getPingIntervalSeconds() * 1000L,
-                lv.getMaxMissedPings(),
-                lv.isAutoKill());
-        this.launcher = new JobLauncher(objectStore, jobExecutionTimeout,
+                liveness.getStartupTimeoutSeconds() * 1000L,
+                liveness.getPingIntervalSeconds() * 1000L,
+                liveness.getMaxMissedPings(),
+                liveness.isAutoKill());
+        this.launcher = new JobLauncher(objectStore,
                 config.getDocker().getNetwork(), config.getMlflow().getTrackingUri(),
-                lv.getShutdownGraceSeconds());
+                liveness.getShutdownGraceSeconds(),
+                Duration.ofMinutes(config.getDocker().getImagePullTimeoutMinutes()));
 
-        // Bind to all NICs so Docker containers on the bridge network can reach
-        // this server via the host's real hostname (passed in workerAgentUrl).
-        this.jobCallbacks = new JobCallbackServer(new InetSocketAddress("0.0.0.0", config.getPort()));
+        // Bind to all NICs. Containers on the bridge network reach this server via
+        // the host's real hostname (passed in workerAgentUrl).
+        this.jobCallbacks = new JobCallbackHandler(new InetSocketAddress("0.0.0.0", config.getPort()));
         this.jobCallbacks.start();
         try {
             this.jobCallbacks.awaitReady();
@@ -125,15 +136,15 @@ public class WorkerAgent implements AutoCloseable {
         }
         log.info("WebSocket server listening on {}", workerAgentUrl());
 
-        // Always serve /metrics on the fixed port — whether anything scrapes it is
-        // decided by the control-plane config (the `metrics` compose profile), not
-        // per-worker config. A failed bind (e.g. a second worker on this host) must
-        // never take the worker down, but say why.
+        // /metrics for Prometheus (runs in the control plane's `metrics` compose
+        // profile and scrapes this port). Always on. A failed bind (e.g. a second
+        // worker on this host) must never take the worker down.
         this.metrics = new WorkerMetrics(config.getResources().isGpu());
         try {
-            metrics.start(METRICS_PORT);
+            metrics.start(config.getMetricsPort());
         } catch (IOException e) {
-            log.warn("Metrics endpoint disabled — could not bind :{}: {}", METRICS_PORT, e.getMessage());
+            log.warn("Metrics endpoint unavailable — could not bind :{}: {}",
+                    config.getMetricsPort(), e.getMessage());
         }
     }
 
@@ -142,19 +153,18 @@ public class WorkerAgent implements AutoCloseable {
      * pull job → execute → report status → repeat.
      * Blocks until {@link #stop()} is called or the thread is interrupted.
      *
-     * <p><b>Limitation:</b> runs one job at a time because {@code executeJob} blocks
-     * on the container process. To run multiple jobs concurrently, submit
-     * {@code executeJob} calls to a bounded thread pool. That also requires
-     * multiplexing the status handler by jobId instead of replacing it per job.
+     * <p><b>Limitation:</b> runs one job at a time — {@code executeJob} blocks on
+     * the container. Concurrent jobs would need a bounded thread pool and a status
+     * handler keyed by jobId instead of one replaced per job.
      */
     public void run() {
-        // Stable identity from the checkpoint file (generated on first boot) so the
-        // same id survives restarts and the coordinator can reconcile our jobs.
+        // The checkpoint file holds the stable id (generated on first boot). The
+        // same id survives restarts, so the coordinator can reconcile our jobs.
         workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
         coordinator.register(workerId, hostname, memory, cpu, gpu, capabilities);
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
-        coordinator.startHeartbeat(workerId, heartbeatIntervalMs);
+        coordinator.startHeartbeat(workerId, heartbeatSendIntervalMs);
         // Open the coordinator → worker push channels (resync/drain, cancel/preempt).
         coordinator.subscribeSystemCommands(workerId, this::onSystemCommand);
         coordinator.subscribeJobCommands(workerId, this::onJobCommand);
@@ -165,7 +175,7 @@ public class WorkerAgent implements AutoCloseable {
                 executeJob(job.get());
             } else {
                 try {
-                    Thread.sleep(pollIntervalMs);
+                    Thread.sleep(jobPullIntervalMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -185,16 +195,16 @@ public class WorkerAgent implements AutoCloseable {
     }
 
     /**
-     * Returns the WebSocket URL job processes use to reach {@link JobCallbackServer}.
-     * Uses the real hostname (not localhost) so Docker containers on the bridge
-     * network can route back to the worker; passed in via EXECUTION_PAYLOAD.
+     * The WebSocket URL job processes use to reach {@link JobCallbackHandler}.
+     * Uses the real hostname (not localhost) so containers on the bridge network
+     * can route back to the worker. Travels in EXECUTION_PAYLOAD.
      */
     public String workerAgentUrl() {
         return "ws://" + hostname + ":" + jobCallbacks.getPort();
     }
 
     /** Registers the per-job handler for task status arriving on the Job → Worker leg. */
-    public void onStatusUpdate(JobCallbackServer.StatusHandler handler) {
+    public void onStatusUpdate(JobCallbackHandler.StatusHandler handler) {
         jobCallbacks.setStatusHandler(handler);
     }
 
@@ -209,6 +219,9 @@ public class WorkerAgent implements AutoCloseable {
 
         // Published so a cancel/preempt command can target the running job.
         currentJobId = job.getId();
+        // First durable trace of ownership: the job entry, still STARTING (the
+        // coordinator set that at claim). recover() finds it if we crash here.
+        statusStore.update(jobUpdate(job.getId(), JobState.JOB_STATE_STARTING, null, null));
         try {
             Files.createDirectories(inputDir);
             Files.createDirectories(outputDir);
@@ -233,11 +246,6 @@ public class WorkerAgent implements AutoCloseable {
 
     private void onSystemCommand(SystemCommand command) {
         switch (command.getKindCase()) {
-            case RESYNC -> {
-                log.info("Received resync command from coordinator: workerId={}", workerId);
-                // Re-assert identity now; re-declaring current jobs is added with resync (P5).
-                coordinator.register(workerId, hostname, memory, cpu, gpu, capabilities);
-            }
             case DRAIN -> {
                 draining = command.getDrain().getDrain();
                 log.info("Received drain command from coordinator: workerId={}, draining={}", workerId, draining);
@@ -255,9 +263,8 @@ public class WorkerAgent implements AutoCloseable {
     }
 
     /**
-     * Stops the running container if the command targets the job this worker is
-     * actually executing. The container's exit then drives the terminal status the
-     * worker reports (the coordinator owns turning that into the final state).
+     * Stops the container if the command targets the job this worker is running.
+     * The container's exit then drives the terminal status the worker reports.
      */
     private void stopRunningJob(String jobId, String action) {
         String current = currentJobId;
@@ -270,50 +277,72 @@ public class WorkerAgent implements AutoCloseable {
         }
     }
 
-    /**
-     * Opens the per-job status stream, runs the container, reports the one terminal
-     * job update its outcome implies, then finalizes the stream. The status handler
-     * stamps job RUNNING onto each task update the container sends — the SDK only
-     * knows task state; the coordinator moves STARTING → RUNNING on the first and
-     * de-dupes the rest.
-     */
+    /** The per-job reporting pipes: the two coordinator streams and the liveness monitor. */
+    private record JobReporting(CoordinatorStatusStream statusStream,
+                                CoordinatorTelemetryStream telemetryStream,
+                                JobLivenessMonitor liveness) {}
+
+    /** Opens the reporting pipes, runs the container, sends the terminal update, closes the pipes. */
     private void runJobContainer(Job job, Path inputDir, Path outputDir, Path logFile) {
-        CoordinatorStatusStream statusStream = coordinator.openStatusStream(job.getId());
-        onStatusUpdate(update -> statusStream.report(
-                update.toBuilder().setJobState(JobState.JOB_STATE_RUNNING).build()));
-
-        // Per-job telemetry stream: both the SDK's reports and the liveness ticks ride
-        // it (the report handler is rebound per job, like the status handler).
-        CoordinatorTelemetryStream telemetryStream = coordinator.openTelemetryStream(job.getId());
-        jobCallbacks.setReportHandler(telemetryStream::report);
-
-        // Worker-owned liveness: every inbound SDK frame bumps the monitor, which
-        // forwards last-activity to the coordinator and, if the container goes
-        // silent past the thresholds, gracefully stops it (the worker owns the job).
-        JobLivenessMonitor liveness = new JobLivenessMonitor(job.getId(), telemetryStream::report, livenessConfig,
-                () -> launcher.stopContainer(job.getId()));
-        jobCallbacks.setActivityListener(liveness::recordActivity);
-        liveness.start();
-
+        JobReporting reporting = openReporting(job);
         metrics.jobStarted(job.getId(), job.getName());
-        StatusUpdate terminal = awaitContainerOutcome(job, inputDir, outputDir, logFile, statusStream, liveness);
+        StatusUpdate terminal = awaitContainerOutcome(job, inputDir, outputDir, logFile,
+                reporting.liveness());
         try {
-            statusStream.report(terminal);
+            statusStore.update(terminal);
+            reporting.statusStream().report(terminal);
         } finally {
-            liveness.close();
-            jobCallbacks.setActivityListener(null);
-            // Stop routing telemetry before closing the stream; a late frame after this
-            // is dropped by CoordinatorTelemetryStream (lossy by design).
-            jobCallbacks.setReportHandler(null);
-            telemetryStream.complete();
-            awaitTelemetryClose(telemetryStream);
-            metrics.jobFinished(job.getId(), job.getName(), outcomeLabel(terminal.getJobState()));
-            statusStream.complete();
-            awaitStreamClose(statusStream);
+            closeReporting(job, terminal.getJobState(), reporting);
         }
     }
 
-    private void awaitTelemetryClose(CoordinatorTelemetryStream telemetryStream) {
+    /**
+     * Opens the two per-job coordinator streams, starts the liveness monitor, and
+     * binds the WebSocket handlers to them. The status handler stamps job RUNNING
+     * onto each task update — the SDK only knows task state. The coordinator moves
+     * STARTING → RUNNING on the first and de-dupes the rest.
+     */
+    private JobReporting openReporting(Job job) {
+        CoordinatorStatusStream statusStream = coordinator.openStatusStream(job.getId());
+        onStatusUpdate(update -> relayTaskStatus(statusStream, update));
+
+        // The SDK's reports and the liveness ticks both ride the telemetry stream.
+        CoordinatorTelemetryStream telemetryStream = coordinator.openTelemetryStream(job.getId());
+        jobCallbacks.setReportHandler(telemetryStream::report);
+
+        // KILL PATH 1 — liveness. Every inbound SDK frame bumps the monitor; a
+        // container silent past the thresholds is gracefully stopped.
+        JobLivenessMonitor liveness = new JobLivenessMonitor(job.getId(), telemetryStream::report,
+                livenessConfig, () -> launcher.stopContainer(job.getId()));
+        jobCallbacks.setActivityListener(liveness::recordActivity);
+        liveness.start();
+
+        return new JobReporting(statusStream, telemetryStream, liveness);
+    }
+
+    /** Unbinds the WebSocket handlers, then closes the monitor and both streams. */
+    private void closeReporting(Job job, JobState terminalState, JobReporting reporting) {
+        reporting.liveness().close();
+        jobCallbacks.setActivityListener(null);
+        // Stop routing telemetry before closing the stream. A late frame after
+        // this is dropped — telemetry is lossy by design.
+        jobCallbacks.setReportHandler(null);
+        reporting.telemetryStream().complete();
+        awaitTelemetryClose(reporting.telemetryStream());
+        metrics.jobFinished(job.getId(), job.getName(), metricsOutcomeLabel(terminalState));
+        reporting.statusStream().complete();
+        // The coordinator's close ack confirms it saw the terminal update — the
+        // one coarse ack per job. Only then do the job's rows leave the store.
+        if (awaitStatusClose(reporting.statusStream())) {
+            statusStore.ack(job.getId());
+        } else {
+            log.warn("No close ack from coordinator for jobId={}; keeping status rows for the register flush",
+                    job.getId());
+        }
+    }
+
+    /** Bounded wait for the close ack; never blocks job teardown for long. */
+    private static void awaitTelemetryClose(CoordinatorTelemetryStream telemetryStream) {
         try {
             telemetryStream.awaitCompletion(10, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
@@ -321,46 +350,48 @@ public class WorkerAgent implements AutoCloseable {
         }
     }
 
+    /** Bounded wait for the close ack; never blocks job teardown for long. */
+    private static boolean awaitStatusClose(CoordinatorStatusStream statusStream) {
+        try {
+            return statusStream.awaitCompletion(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
     /**
-     * Runs the container to exit and maps the result to its terminal job update:
-     * exit 0 → COMPLETED, deadline kill (-1) → KILLED, any other exit → FAILED, a
-     * spawn failure → FAILED. On the deadline the launcher's onTimeout hook reports
-     * TIMEOUT first (kill in flight); KILLED follows here. A task still
-     * mid-execution keeps its last reported state — the worker does not fail it.
+     * Runs the container to exit and builds the terminal job update. The one
+     * early-kill path is the liveness check (see {@link #openReporting}); there
+     * is no run deadline. A task still mid-execution keeps its last reported
+     * state — the worker does not fail it.
      */
     private StatusUpdate awaitContainerOutcome(Job job, Path inputDir, Path outputDir, Path logFile,
-                                               CoordinatorStatusStream statusStream, JobLivenessMonitor liveness) {
+                                               JobLivenessMonitor liveness) {
         String jobId = job.getId();
+        int exitCode;
         try {
-            int exitCode = spawnJobProcess(jobDetails(job), inputDir, outputDir, logFile, job.getParamsMap(), () ->
-                    statusStream.report(jobUpdate(jobId, JobState.JOB_STATE_TIMEOUT,
-                            FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, jobExecutionTimeout.toString())));
-            // The liveness monitor may have stopped the container for going silent;
-            // that takes precedence over the (kill-induced) exit code.
-            if (liveness.isUnresponsive()) {
-                WorkerMetrics.JOBS_KILLED_UNRESPONSIVE.inc();
-                return jobUpdate(jobId, JobState.JOB_STATE_KILLED,
-                        FailureReason.FAILURE_REASON_UNRESPONSIVE,
-                        "no liveness from the container");
-            }
-            return switch (exitCode) {
-                case -1 -> jobUpdate(jobId, JobState.JOB_STATE_KILLED,
-                        FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, jobExecutionTimeout.toString());
-                case 0 -> jobUpdate(jobId, JobState.JOB_STATE_COMPLETED, null, null);
-                default -> {
-                    log.warn("Job process exited with non-zero code: jobId={}, exitCode={}", jobId, exitCode);
-                    yield jobUpdate(jobId, JobState.JOB_STATE_FAILED,
-                            FailureReason.FAILURE_REASON_PROCESS_EXITED, "exit code " + exitCode);
-                }
-            };
+            exitCode = spawnJobProcess(jobDetails(job), inputDir, outputDir, logFile, job.getParamsMap());
         } catch (IOException | InterruptedException e) {
             log.error("Failed to execute job: jobId={}, error={}", jobId, e.getMessage(), e);
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            return jobUpdate(jobId, JobState.JOB_STATE_FAILED,
-                    FailureReason.FAILURE_REASON_PROCESS_START_FAILED, e.getMessage());
+            return failedUpdate(jobId, FailureReason.FAILURE_REASON_PROCESS_START_FAILED, e.getMessage());
         }
+
+        // KILL PATH — liveness. The monitor stopped a silent container; its
+        // verdict beats the kill-induced exit code.
+        if (liveness.isUnresponsive()) {
+            WorkerMetrics.JOBS_KILLED_UNRESPONSIVE.inc();
+            return killedUpdate(jobId, FailureReason.FAILURE_REASON_UNRESPONSIVE,
+                    "no liveness from the container");
+        }
+        if (exitCode == JobLauncher.EXIT_SUCCESS) {
+            return completedUpdate(jobId);
+        }
+        log.warn("Job process exited with non-zero code: jobId={}, exitCode={}", jobId, exitCode);
+        return failedUpdate(jobId, FailureReason.FAILURE_REASON_PROCESS_EXITED, "exit code " + exitCode);
     }
 
     private JobDetails jobDetails(Job job) {
@@ -370,8 +401,8 @@ public class WorkerAgent implements AutoCloseable {
         return new JobDetails(job.getId(), job.getArtifactUri(), payload.encode(), memoryMb, cpuCores);
     }
 
-    /** Prometheus outcome label for a terminal job state. */
-    private static String outcomeLabel(JobState terminalState) {
+    /** Maps a terminal job state to its Prometheus job-outcome label. */
+    private static String metricsOutcomeLabel(JobState terminalState) {
         return switch (terminalState) {
             case JOB_STATE_COMPLETED -> "completed";
             case JOB_STATE_KILLED -> "killed";
@@ -379,12 +410,30 @@ public class WorkerAgent implements AutoCloseable {
         };
     }
 
-    private void awaitStreamClose(CoordinatorStatusStream statusStream) {
-        try {
-            statusStream.awaitCompletion(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+    /**
+     * Stamps job RUNNING onto a task update from the SDK and forwards it to the
+     * coordinator. Registered as the per-job status handler in
+     * {@link #openReporting}. Persists before sending: a crash between the two
+     * re-asserts the update on the next register instead of losing it.
+     */
+    private void relayTaskStatus(CoordinatorStatusStream statusStream, StatusUpdate update) {
+        StatusUpdate stamped = update.toBuilder().setJobState(JobState.JOB_STATE_RUNNING).build();
+        statusStore.update(stamped);
+        statusStream.report(stamped);
+    }
+
+    // ── job-level status updates ─────────────────────────────────────────────
+
+    private static StatusUpdate completedUpdate(String jobId) {
+        return jobUpdate(jobId, JobState.JOB_STATE_COMPLETED, null, null);
+    }
+
+    private static StatusUpdate failedUpdate(String jobId, FailureReason reason, String detail) {
+        return jobUpdate(jobId, JobState.JOB_STATE_FAILED, reason, detail);
+    }
+
+    private static StatusUpdate killedUpdate(String jobId, FailureReason reason, String detail) {
+        return jobUpdate(jobId, JobState.JOB_STATE_KILLED, reason, detail);
     }
 
     /** Builds a job-level {@link StatusUpdate} proto (no task section). */
@@ -401,14 +450,11 @@ public class WorkerAgent implements AutoCloseable {
 
     /**
      * Runs the job container via {@link JobLauncher} and blocks until exit.
-     * {@code onTimeout} fires when the execution deadline is hit, before the
-     * kill starts (see {@link JobLauncher#spawn}). Package-private override
-     * seam: tests subclass the agent and replace this to simulate job
-     * processes without docker.
+     * Package-private so tests can override it and simulate jobs without docker.
      */
     int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
-                        Map<String, String> params, Runnable onTimeout) throws IOException, InterruptedException {
-        return launcher.spawn(details, inputDir, outputDir, logFile, params, onTimeout);
+                        Map<String, String> params) throws IOException, InterruptedException {
+        return launcher.spawn(details, inputDir, outputDir, logFile, params);
     }
 
     // ── lifecycle ────────────────────────────────────────────────────────────
@@ -420,6 +466,7 @@ public class WorkerAgent implements AutoCloseable {
         jobCallbacks.stop();
         log.info("WebSocket server stopped");
         coordinator.close();
+        statusStore.close();
     }
 
     public static void main(String[] args) throws IOException {
@@ -443,8 +490,15 @@ public class WorkerAgent implements AutoCloseable {
 
         ObjectStore objectStore = createObjectStore(config.getMinio());
 
-        Duration jobExecutionTimeout = Duration.ofMinutes(config.getJobExecutionTimeoutMinutes());
-        WorkerAgent agent = new WorkerAgent(config, objectStore, jobExecutionTimeout);
+        WorkerAgent agent = new WorkerAgent(config, objectStore);
+        registerShutdownHook(agent);
+        agent.run();
+    }
+
+    // TODO: graceful shutdown — drain first (stop pulling, let the running job and
+    // its streams finish or hand the job back), then close. Today this closes
+    // everything at once; see TODO.md #16 (worker drain/drained state machine).
+    private static void registerShutdownHook(WorkerAgent agent) {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutting down worker");
             try {
@@ -452,9 +506,7 @@ public class WorkerAgent implements AutoCloseable {
             } catch (Exception e) {
                 log.error("Error shutting down worker: {}", e.getMessage());
             }
-        }));
-
-        agent.run();
+        }, "worker-shutdown"));
     }
 
     private static ObjectStore createObjectStore(WorkerConfig.Minio minio) {

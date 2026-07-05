@@ -6,10 +6,11 @@ coordinator:
 
 hostname: localhost
 port: 0
+metricsPort: 0
 
 checkpointPath: target/worker_checkpoint.yaml
-
-jobExecutionTimeoutMinutes: 10
+statusDbPath: target/worker_status.db
+statusRetentionDays: 7
 
 resources:
   memory: 8192

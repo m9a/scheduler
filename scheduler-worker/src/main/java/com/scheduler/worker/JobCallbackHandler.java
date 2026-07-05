@@ -14,35 +14,32 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * <b>Job → Worker leg.</b> WebSocket server receiving everything job containers
- * send back to this worker: task status updates and key-value telemetry, as
- * binary frames over a single persistent connection per job. The senders are
- * the SDKs inside the container ({@code JobReporter} in Java, {@code Reporter}
- * in Python), which get this server's URL via the EXECUTION_PAYLOAD env var.
+ * <b>Job → Worker leg.</b> WebSocket server for everything job containers send
+ * back to this worker: task status and key-value telemetry, as binary frames on
+ * one persistent connection per job. The sender is the SDK inside the container
+ * ({@code JobReporter} in Java, {@code Reporter} in Python); it gets this
+ * server's URL via the EXECUTION_PAYLOAD env var.
  *
  * <p>Each frame starts with a one-byte type tag, then the proto payload:
  * <pre>
- * Job container (SDK) ──WebSocket──► JobCallbackServer
+ * Job container (SDK) ──WebSocket──► JobCallbackHandler
  *   [0x01][StatusUpdate]              → StatusHandler (forwards to coordinator, per job)
  *   [0x03][Report]                    → ReportHandler (forwarded to coordinator)
  *   [0x02]                  ◄── ack, sent back after a status frame is handled
  * </pre>
  *
- * <p>Status frames are acked so the SDK can confirm delivery on the single
- * persistent connection: a lost status update corrupts job state, and a
- * half-open socket can swallow a send without erroring. Telemetry is not acked
- * (lossy by design).
+ * <p>Status frames are acked: a lost status update corrupts job state, and a
+ * half-open socket can swallow a send without erroring. Telemetry is not acked —
+ * lossy by design.
  *
- * Owned by {@link WorkerAgent}, which wires the two handlers differently because
- * their coordinator-side transports differ. Status travels on a per-job
- * client-streaming RPC, so the status handler is rebound each job to point at
- * that job's stream. Telemetry is a stateless unary forward keyed by job_id in
- * the payload, so a single report handler ({@code coordinator::forwardTelemetry})
- * serves every job for the worker's lifetime.
+ * <p>{@link WorkerAgent} owns this server and wires the two handlers differently.
+ * Status travels on a per-job stream, so the status handler is rebound each job.
+ * Telemetry is keyed by job_id in the payload, so one report handler serves every
+ * job.
  */
-class JobCallbackServer extends WebSocketServer {
+class JobCallbackHandler extends WebSocketServer {
 
-    private static final Logger log = LoggerFactory.getLogger(JobCallbackServer.class);
+    private static final Logger log = LoggerFactory.getLogger(JobCallbackHandler.class);
 
     // Frame type tags — must match the SDKs' framing constants
     // (Java StatusUpdate.TYPE_TAG_STATUS / ReportSender.TYPE_TAG_REPORT, Python reporter.py).
@@ -71,7 +68,7 @@ class JobCallbackServer extends WebSocketServer {
     private volatile Runnable activityListener;
     private final CountDownLatch ready = new CountDownLatch(1);
 
-    JobCallbackServer(InetSocketAddress address) {
+    JobCallbackHandler(InetSocketAddress address) {
         super(address);
         setReuseAddr(true);
     }

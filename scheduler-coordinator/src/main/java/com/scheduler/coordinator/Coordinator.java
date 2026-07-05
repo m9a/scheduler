@@ -46,7 +46,7 @@ public class Coordinator {
         }
         log.info("Loaded config from CONTROL_PLANE_CONFIG={}", configPath);
         int port = config.getCoordinator().getPort();
-        Duration heartbeatTimeout = Duration.ofSeconds(config.getCoordinator().getHeartbeatTimeoutSeconds());
+        Duration heartbeatSilenceTimeout = Duration.ofSeconds(config.getCoordinator().getHeartbeatTimeoutSeconds());
         Duration heartbeatScanInterval = Duration.ofSeconds(config.getCoordinator().getHeartbeatScanIntervalSeconds());
 
         ObjectStore objectStore = createObjectStore(config.getMinio());
@@ -64,7 +64,7 @@ public class Coordinator {
         Duration reregistrationWindow = Duration.ofSeconds(config.getCoordinator().getReregistrationTimeoutSeconds());
         jobManager.recover();
         workerHandler.seedWorkers(java.time.Instant.now());
-        workerHandler.startHeartbeatMonitor(heartbeatTimeout, heartbeatScanInterval, reregistrationWindow);
+        workerHandler.startHeartbeatMonitor(heartbeatSilenceTimeout, heartbeatScanInterval, reregistrationWindow);
 
         // Prometheus scrapes gRPC port + 1 (e.g. 9090 → 9091/metrics).
         CoordinatorMetrics.init(jobManager, workerHandler);

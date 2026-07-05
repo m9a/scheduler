@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Worker-owned per-job liveness tracking and stall detection. Every inbound SDK
  * frame (status/report/liveness ping) calls {@link #recordActivity()} via
- * {@link JobCallbackServer}'s activity listener. On each tick the monitor:
+ * {@link JobCallbackHandler}'s activity listener. On each tick the monitor:
  * <ol>
  *   <li>forwards the latest activity time to the coordinator (surfaced on
  *       {@code GetJobStatus});</li>

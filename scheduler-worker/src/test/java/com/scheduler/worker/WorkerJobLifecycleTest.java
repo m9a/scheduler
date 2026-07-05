@@ -6,6 +6,7 @@ import com.scheduler.coordinator.worker.WorkerHandler;
 import com.scheduler.proto.v1.*;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.client.*;
+import com.scheduler.worker.persistence.InMemoryWorkerStatusStore;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
@@ -21,6 +22,7 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -39,17 +41,21 @@ class WorkerJobLifecycleTest {
 
     @FunctionalInterface
     interface SpawnBehavior {
-        // onTimeout simulates the launcher's deadline hook: call it, then return -1,
-        // to behave like a container that hit the execution timeout.
-        int execute(JobDetails details, String workerAgentUrl, Runnable onTimeout)
+        int execute(JobDetails details, String workerAgentUrl)
                 throws IOException, InterruptedException;
     }
 
     static class TestableWorkerAgent extends WorkerAgent {
+        final InMemoryWorkerStatusStore statusStore;
         private volatile SpawnBehavior spawnBehavior;
 
         TestableWorkerAgent(WorkerConfig config) throws IOException {
-            super(config, null, Duration.ofSeconds(10));
+            this(config, new InMemoryWorkerStatusStore());
+        }
+
+        private TestableWorkerAgent(WorkerConfig config, InMemoryWorkerStatusStore store) throws IOException {
+            super(config, null, store);
+            this.statusStore = store;
         }
 
         void setSpawnBehavior(SpawnBehavior behavior) {
@@ -58,8 +64,8 @@ class WorkerJobLifecycleTest {
 
         @Override
         int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
-                            Map<String, String> params, Runnable onTimeout) throws IOException, InterruptedException {
-            return spawnBehavior.execute(details, workerAgentUrl(), onTimeout);
+                            Map<String, String> params) throws IOException, InterruptedException {
+            return spawnBehavior.execute(details, workerAgentUrl());
         }
     }
 
@@ -104,7 +110,7 @@ class WorkerJobLifecycleTest {
 
     @Test
     void processExitZero() throws Exception {
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
             postTaskState(url, details.jobId(), 0, "extract", "COMPLETED", null);
             return 0;
@@ -121,7 +127,7 @@ class WorkerJobLifecycleTest {
 
     @Test
     void processExitNonZero() throws Exception {
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
             return 1;
         });
@@ -142,7 +148,7 @@ class WorkerJobLifecycleTest {
 
     @Test
     void processExitNonZeroNoUpdates() throws Exception {
-        worker.setSpawnBehavior((details, url, onTimeout) -> 42);
+        worker.setSpawnBehavior((details, url) -> 42);
 
         String jobId = submitJob("no-updates");
         startWorker();
@@ -153,33 +159,8 @@ class WorkerJobLifecycleTest {
     }
 
     @Test
-    void processTimeout() throws Exception {
-        // Hold the spawn between the deadline hook and the kill confirmation so
-        // the test can observe the intermediate TIMEOUT state.
-        CountDownLatch killConfirmed = new CountDownLatch(1);
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
-            onTimeout.run();
-            killConfirmed.await();
-            return -1;
-        });
-
-        String jobId = submitJob("timeout");
-        startWorker();
-
-        Job job = pollUntilStatus(jobId, JobState.JOB_STATE_TIMEOUT, 10, TimeUnit.SECONDS);
-        assertEquals(FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, job.getFailureReason());
-
-        killConfirmed.countDown();
-        job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
-        assertEquals(JobState.JOB_STATE_KILLED, job.getState());
-        assertEquals(FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, job.getFailureReason());
-        assertTrue(job.getErrorMessage().contains("timed out"));
-        assertEquals(0, job.getTasksCount());
-    }
-
-    @Test
     void taskFailed() throws Exception {
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
             postTaskState(url, details.jobId(), 0, "extract", "FAILED", "out of memory");
             return 1;
@@ -226,7 +207,7 @@ class WorkerJobLifecycleTest {
 
         // Block the spawn so the job stays in-flight while we kill the worker
         CountDownLatch spawnBlocked = new CountDownLatch(1);
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             spawnBlocked.await();
             return 0;
         });
@@ -262,16 +243,49 @@ class WorkerJobLifecycleTest {
 
         // Recreate worker so tearDown doesn't NPE
         worker = new TestableWorkerAgent(testConfig(server.getPort()));
-        worker.setSpawnBehavior((details, url, onTimeout) -> 0);
+        worker.setSpawnBehavior((details, url) -> 0);
         workerThread = null;
 
         workerHandler.shutdownHeartbeatMonitor();
     }
 
+    // Verifies the durable status store: job + task rows written while the job is
+    // in flight, all rows dropped once the coordinator acks the terminal delivery.
+    @Test
+    void statusStoreWriteThroughAndAck() throws Exception {
+        CountDownLatch midJob = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        worker.setSpawnBehavior((details, url) -> {
+            postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
+            midJob.countDown();
+            release.await();
+            postTaskState(url, details.jobId(), 0, "extract", "COMPLETED", null);
+            return 0;
+        });
+
+        String jobId = submitJob("store-write-through");
+        startWorker();
+
+        assertTrue(midJob.await(10, TimeUnit.SECONDS), "job should reach mid-flight");
+        awaitTrue(() -> worker.statusStore.loadAllJobs().size() == 2, 5, TimeUnit.SECONDS,
+                "job entry + task entry should be persisted mid-flight");
+        List<StatusUpdate> rows = worker.statusStore.loadAllJobs();
+        // Task entry first (RUNNING, job stamped RUNNING), then the job entry (STARTING at claim).
+        assertEquals(TaskState.TASK_STATE_RUNNING, rows.get(0).getTaskState());
+        assertEquals(JobState.JOB_STATE_RUNNING, rows.get(0).getJobState());
+        assertEquals(JobState.JOB_STATE_STARTING, rows.get(1).getJobState());
+
+        release.countDown();
+        Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
+        assertEquals(JobState.JOB_STATE_COMPLETED, job.getState());
+        awaitTrue(() -> worker.statusStore.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "coordinator's close ack should drop the job's rows");
+    }
+
     @Test
     void workerContinuesAfterFailure() throws Exception {
         AtomicBoolean first = new AtomicBoolean(true);
-        worker.setSpawnBehavior((details, url, onTimeout) -> {
+        worker.setSpawnBehavior((details, url) -> {
             if (first.compareAndSet(true, false)) {
                 return 1;
             }
@@ -294,11 +308,13 @@ class WorkerJobLifecycleTest {
     // (so a push is deliverable), and a drain command actually reaches and changes it.
     @Test
     void commandStreamSubscribeAndDrain() throws Exception {
-        worker.setSpawnBehavior((details, url, onTimeout) -> 0);  // no job submitted; worker stays idle
+        worker.setSpawnBehavior((details, url) -> 0);  // no job submitted; worker stays idle
         startWorker();
 
         String workerId = awaitWorkerId();
-        awaitTrue(() -> workerHandler.requestResync(workerId), 5, TimeUnit.SECONDS,
+        // Probe with a no-op drain(false) until it reports deliverable — that's the
+        // signal the worker has opened the system command stream.
+        awaitTrue(() -> workerHandler.drain(workerId, false), 5, TimeUnit.SECONDS,
                 "worker should subscribe to the system command stream");
 
         assertTrue(workerHandler.drain(workerId, true), "drain push should be deliverable");
@@ -415,7 +431,7 @@ class WorkerJobLifecycleTest {
 
             byte[] proto = builder.build().toByteArray();
             byte[] framed = new byte[proto.length + 1];
-            framed[0] = JobCallbackServer.TYPE_TAG_STATUS;
+            framed[0] = JobCallbackHandler.TYPE_TAG_STATUS;
             System.arraycopy(proto, 0, framed, 1, proto.length);
 
             WebSocket ws = HttpClient.newHttpClient().newWebSocketBuilder()

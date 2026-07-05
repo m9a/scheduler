@@ -14,7 +14,6 @@ public final class FailureMessages {
     public static String text(FailureReason reason) {
         return switch (reason) {
             case FAILURE_REASON_HEARTBEAT_LOST -> "Worker heartbeat lost";
-            case FAILURE_REASON_PROCESS_TIMEOUT -> "Job process timed out";
             case FAILURE_REASON_PROCESS_EXITED -> "Job process exited with non-zero code";
             case FAILURE_REASON_PROCESS_START_FAILED -> "Failed to start job process";
             case FAILURE_REASON_UNRESPONSIVE -> "Job container became unresponsive";

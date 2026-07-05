@@ -680,7 +680,7 @@ class IntegrationTest {
         workerConfig.setHostname("host.docker.internal");
         workerConfig.getDocker().setNetwork("scheduler-net");
         workerConfig.getMlflow().setTrackingUri("http://mlflow:5000");
-        workerAgent = new WorkerAgent(workerConfig, objectStore, Duration.ofSeconds(120));
+        workerAgent = new WorkerAgent(workerConfig, objectStore);
         workerThread = new Thread(workerAgent::run);
         workerThread.start();
     }

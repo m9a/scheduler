@@ -31,12 +31,10 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
- * <b>Worker → Coordinator leg.</b> The single owner of the gRPC channel to the
- * coordinator — every RPC the worker sends goes through this class, nothing else
- * talks to the coordinator. Called by {@link WorkerAgent} (register/pull/heartbeat,
- * telemetry forwarding) and, for per-job status, via the
- * {@link CoordinatorStatusStream} this class opens. The other end is the
- * coordinator's {@code WorkerHandler}.
+ * <b>Worker → Coordinator leg.</b> Owns the single gRPC channel to the
+ * coordinator. Every RPC the worker sends goes through this class.
+ * {@link WorkerAgent} calls it; the other end is the coordinator's
+ * {@code WorkerHandler}.
  *
  * <pre>
  * WorkerAgent ──► CoordinatorClient ──gRPC──► Coordinator (WorkerHandler)
@@ -62,8 +60,8 @@ class CoordinatorClient implements AutoCloseable {
     private ScheduledExecutorService heartbeatExecutor;
     // Reschedules dropped command-stream subscriptions; created on first subscribe.
     private ScheduledExecutorService commandExecutor;
-    // Set by close() when the worker is shutting down — distinct from a stream
-    // closing (which triggers a resubscribe). Stops pending resubscribes from firing.
+    // Set by close() on worker shutdown. Stops pending resubscribes from firing —
+    // unlike a stream close, which triggers one.
     private volatile boolean shuttingDown;
 
     CoordinatorClient(String host, int port) {
@@ -126,9 +124,9 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     /**
-     * Subscribes to the coordinator's system-command push stream (resync, drain).
-     * The call returns immediately; {@code handler} runs on a gRPC thread per pushed
-     * command. A dropped stream is re-subscribed after a fixed delay.
+     * Subscribes to the coordinator's system-command push stream (drain).
+     * The call returns immediately; {@code handler} runs on a gRPC thread per
+     * pushed command. A dropped stream re-subscribes after a fixed delay.
      */
     void subscribeSystemCommands(String workerId, Consumer<SystemCommand> handler) {
         ensureCommandExecutor();
@@ -191,9 +189,9 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     /**
-     * Opens the per-job client-streaming pipe for telemetry. The coordinator sends a
-     * single response when the stream closes; onError/onCompleted release the latch so
-     * {@link CoordinatorTelemetryStream#awaitCompletion} can block on the ack.
+     * Opens the per-job client-streaming pipe for telemetry. The coordinator sends
+     * one response when the stream closes. onError/onCompleted release the latch,
+     * so {@link CoordinatorTelemetryStream#awaitCompletion} can block on the ack.
      */
     CoordinatorTelemetryStream openTelemetryStream(String jobId) {
         CountDownLatch done = new CountDownLatch(1);
@@ -221,23 +219,21 @@ class CoordinatorClient implements AutoCloseable {
     /**
      * Opens the per-job client-streaming pipe for status updates.
      *
-     * <p>Two observers are involved:
+     * <p>Two observers:
      * <ul>
-     *   <li>{@code responseObserver} — handles what comes back from the coordinator.
-     *       Since ReportStatus returns a single response only after the stream closes,
-     *       onNext is empty; onCompleted/onError count down the latch so the caller
-     *       (via {@link CoordinatorStatusStream#awaitCompletion}) can wait for
-     *       acknowledgment.</li>
-     *   <li>{@code requestObserver} — the send side. Each {@code onNext()} pushes a status
-     *       update to the coordinator. Wrapped inside {@link CoordinatorStatusStream}
-     *       for conversion to proto.</li>
+     *   <li>{@code responseObserver} — the receive side. ReportStatus sends one
+     *       response only when the stream closes, so onNext is empty.
+     *       onCompleted/onError count down the latch; the caller waits on it via
+     *       {@link CoordinatorStatusStream#awaitCompletion}.</li>
+     *   <li>{@code requestObserver} — the send side. Each {@code onNext()} pushes
+     *       one status update. {@link CoordinatorStatusStream} wraps it.</li>
      * </ul>
      */
     CoordinatorStatusStream openStatusStream(String jobId) {
         CountDownLatch done = new CountDownLatch(1);
 
-        // Receive side: coordinator sends a single response when the stream closes.
-        // The latch lets callers block until the coordinator has acknowledged.
+        // Receive side: the coordinator sends one response when the stream closes.
+        // The latch lets callers block until that ack.
         StreamObserver<StatusUpdateResponse> responseObserver = new StreamObserver<>() {
             @Override
             public void onNext(StatusUpdateResponse response) {}

@@ -161,12 +161,12 @@ class JobManagerTest {
 
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_KILLED,
-                FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, "PT10M"));
+                FailureReason.FAILURE_REASON_UNRESPONSIVE, "no liveness from the container"));
 
         JobStatus updated = jobManager.getJob(claimed.id());
         assertEquals(JobState.JOB_STATE_KILLED, updated.state());
-        assertEquals(FailureReason.FAILURE_REASON_PROCESS_TIMEOUT, updated.failureReason());
-        assertEquals("PT10M", updated.failureDetail());
+        assertEquals(FailureReason.FAILURE_REASON_UNRESPONSIVE, updated.failureReason());
+        assertEquals("no liveness from the container", updated.failureDetail());
         assertNotNull(updated.completedAt());
     }
 

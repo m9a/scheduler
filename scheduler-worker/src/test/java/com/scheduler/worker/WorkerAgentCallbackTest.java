@@ -2,6 +2,7 @@ package com.scheduler.worker;
 
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.TaskState;
+import com.scheduler.worker.persistence.InMemoryWorkerStatusStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,7 +32,7 @@ class WorkerAgentCallbackTest {
         receivedUpdates = Collections.synchronizedList(new ArrayList<>());
         Path configPath = Path.of(getClass().getClassLoader().getResource("config.yaml").getPath());
         WorkerConfig config = WorkerConfig.load(configPath);
-        agent = new WorkerAgent(config, null, java.time.Duration.ofSeconds(10));
+        agent = new WorkerAgent(config, null, new InMemoryWorkerStatusStore());
         agent.onStatusUpdate(receivedUpdates::add);
     }
 
@@ -50,7 +51,7 @@ class WorkerAgentCallbackTest {
                 .build()
                 .toByteArray();
 
-        sendWebSocketBinary(agent.workerAgentUrl(), prefixed(JobCallbackServer.TYPE_TAG_STATUS, proto));
+        sendWebSocketBinary(agent.workerAgentUrl(), prefixed(JobCallbackHandler.TYPE_TAG_STATUS, proto));
 
         assertEquals(1, receivedUpdates.size());
         assertEquals("job-1", receivedUpdates.get(0).getJobId());
