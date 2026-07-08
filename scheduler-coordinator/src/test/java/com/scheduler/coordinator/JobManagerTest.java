@@ -104,8 +104,10 @@ class JobManagerTest {
         assertTrue(claimed.isEmpty());
     }
 
+    // A task update alone advances only the task. The job stays STARTING —
+    // the coordinator never infers job RUNNING; the worker sends it.
     @Test
-    void taskRunningTransitionsTaskOnly() {
+    void taskOnlyUpdate() {
         JobStatus claimed = submitAndClaim("job");
 
         jobManager.handleStatusUpdate(taskUpdate(claimed.id(), 0, "extract", TaskState.TASK_STATE_RUNNING, null));
@@ -183,8 +185,9 @@ class JobManagerTest {
         assertEquals("out of memory", updated.taskStatuses().get(0).errorMessage());
     }
 
+    // A task update that arrives after the job went terminal is dropped.
     @Test
-    void lateStatusIgnoredForTerminalJob() {
+    void lateStatus() {
         JobStatus claimed = submitAndClaim("job");
 
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_FAILED,
@@ -208,8 +211,9 @@ class JobManagerTest {
         assertEquals("extract", updated.taskStatuses().get(0).taskName());
     }
 
+    // A claimed job with no updates yet stays STARTING with no tasks.
     @Test
-    void claimedJobStaysStartingWithoutUpdates() {
+    void claimedStaysStarting() {
         JobStatus claimed = submitAndClaim("idle");
 
         JobStatus current = jobManager.getJob(claimed.id());
@@ -230,8 +234,9 @@ class JobManagerTest {
         assertNotNull(updated.completedAt());
     }
 
+    // Heartbeat-loss cleanup must not touch a job that already finished.
     @Test
-    void testFailJobsForWorkerSkipsTerminal() {
+    void testFailJobsSkipsTerminal() {
         JobStatus claimed = submitAndClaim("done");
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_COMPLETED, null, null));
@@ -242,8 +247,9 @@ class JobManagerTest {
         assertEquals(JobState.JOB_STATE_COMPLETED, jobManager.getJob(claimed.id()).state());
     }
 
+    // A dead worker's jobs all fail, whatever state each was in.
     @Test
-    void testFailJobsForWorkerMultipleJobs() {
+    void testFailJobsMultiple() {
         Job job1 = new Job("job-a", "img:latest", null, 0, null, null);
         Job job2 = new Job("job-b", "img:latest", null, 0, null, null);
         jobManager.submit("id-a", job1);
@@ -261,8 +267,9 @@ class JobManagerTest {
         assertEquals(JobState.JOB_STATE_FAILED, jobManager.getJob("id-b").state());
     }
 
+    // A GPU job goes to a GPU worker.
     @Test
-    void testClaimGpuJobMatchesGpuWorker() {
+    void testClaimGpu() {
         Job job = new Job("gpu-job", "img:latest", null, 0, null,
                 new ResourceRequirements(0, 0, true, Set.of()));
         jobManager.submit("job-gpu", job);
@@ -274,8 +281,9 @@ class JobManagerTest {
         assertEquals("job-gpu", claimed.get().id());
     }
 
+    // A CPU worker skips the GPU job at the head of the queue and takes the CPU job.
     @Test
-    void testClaimGpuJobSkipsNonGpuWorker() {
+    void testClaimSkipsGpuJob() {
         Job gpuJob = new Job("gpu-job", "img:latest", null, 0, null,
                 new ResourceRequirements(0, 0, true, Set.of()));
         Job cpuJob = new Job("cpu-job", "img:latest", null, 0, null, null);
@@ -289,9 +297,9 @@ class JobManagerTest {
         assertEquals("job-cpu", claimed.get().id());
     }
 
+    // GPU workers are reserved: a CPU-only job must not occupy a GPU worker.
     @Test
-    void testClaimNonGpuJobSkipsGpuWorker() {
-        // GPU workers are reserved: a CPU-only job must not occupy a GPU worker.
+    void testClaimGpuWorkerReserved() {
         Job cpuJob = new Job("cpu-job", "img:latest", null, 0, null, null);
         jobManager.submit("job-cpu", cpuJob);
 
@@ -301,8 +309,9 @@ class JobManagerTest {
         assertTrue(claimed.isEmpty());
     }
 
+    // A job requiring a capability only matches a worker that advertises it.
     @Test
-    void testClaimMatchesCapabilities() {
+    void testClaimCapabilities() {
         Job job = new Job("cap-job", "img:latest", null, 0, null,
                 new ResourceRequirements(0, 0, false, Set.of("avx512")));
         jobManager.submit("job-cap", job);
@@ -314,8 +323,9 @@ class JobManagerTest {
         assertTrue(jobManager.claimNextJob(capableWorker).isPresent());
     }
 
+    // A job with no requirements matches any non-GPU worker.
     @Test
-    void testClaimDefaultRequirementsMatchAdequateWorker() {
+    void testClaimDefaults() {
         Job job = new Job("any-job", "img:latest", null, 0, null, null);
         jobManager.submit("job-any", job);
 
@@ -325,8 +335,9 @@ class JobManagerTest {
         assertTrue(claimed.isPresent());
     }
 
+    // A worker with too little memory cannot claim the job.
     @Test
-    void testClaimMemoryInsufficient() {
+    void testClaimLowMemory() {
         Job job = new Job("big-job", "img:latest", null, 0, null,
                 new ResourceRequirements(4096, 0, false, Set.of()));
         jobManager.submit("job-big", job);
@@ -338,36 +349,38 @@ class JobManagerTest {
     }
 
     @Test
-    void lastActivityTracked() {
+    void livenessTracked() {
         JobStatus claimed = submitAndClaim("live");
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
 
         // Liveness-only report: timestamp, no entries.
         jobManager.handleReport(claimed.id(), 0, 1234L, List.of());
 
-        assertEquals(1234L, jobManager.lastActivity(claimed.id()));
+        assertEquals(1234L, jobManager.lastLivenessAt(claimed.id()));
     }
 
+    // Terminal state clears the job's liveness tracking.
     @Test
-    void lastActivityClearedOnTerminal() {
+    void livenessCleared() {
         JobStatus claimed = submitAndClaim("done");
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_RUNNING, null, null));
         jobManager.handleReport(claimed.id(), 0, 1234L, List.of());
 
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_COMPLETED, null, null));
 
-        assertEquals(0L, jobManager.lastActivity(claimed.id()));
+        assertEquals(0L, jobManager.lastLivenessAt(claimed.id()));
     }
 
+    // A liveness report arriving after the job went terminal is ignored.
     @Test
-    void lastActivityIgnoredForTerminalJob() {
+    void lateReportIgnored() {
         JobStatus claimed = submitAndClaim("term");
         jobManager.handleStatusUpdate(jobUpdate(claimed.id(), JobState.JOB_STATE_FAILED,
                 FailureReason.FAILURE_REASON_PROCESS_EXITED, "exit code 1"));
 
-        jobManager.handleReport(claimed.id(), 0, 1234L, List.of());  // late report — must be ignored
+        jobManager.handleReport(claimed.id(), 0, 1234L, List.of());
 
-        assertEquals(0L, jobManager.lastActivity(claimed.id()));
+        assertEquals(0L, jobManager.lastLivenessAt(claimed.id()));
     }
 
     // -- helpers --

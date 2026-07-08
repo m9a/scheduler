@@ -236,10 +236,11 @@ Job container (SDK)                        WorkerAgent
   │ ────────────────────────────────────────► │
   │                                           │
   │  [0x04] Liveness (ping)                   │  consumed locally for stall detection;
-  │ ────────────────────────────────────────► │  not forwarded — the worker emits its
-  │                                           │  own liveness Report on the telemetry
-  │                                           │  stream so silent jobs still report
+  │ ────────────────────────────────────────► │  never forwarded. The worker's stall
+  │                                           │  detection is entirely local.
 ```
+
+The worker re-stamps each `[0x03]` Report with the job's **last-liveness time** — owned by the `JobLivenessMonitor` (the epoch millis of the last frame it saw) — before forwarding, so the coordinator's last-activity comes from real telemetry, not a synthetic liveness Report. A job that stays silent — only sending `[0x04]` pings — surfaces no last-activity to the coordinator for now; a future cadence-based forwarder will (TODO.md #23).
 
 ### Failure detection — who acts
 
@@ -287,6 +288,30 @@ The job and its container have **separate lifecycles**, on purpose.
 - The SDK's WebSocket is **initiated by the SDK** (the worker's URL travels in
   `EXECUTION_PAYLOAD`), so a container can in principle re-dial a restarted worker —
   that reconnect is part of the re-attach work.
+
+### Worker process model (docker CLI children)
+
+Each docker step (`run -d`, `wait`, `logs -f`, `inspect`, `rm`) runs the docker CLI
+as a **child OS process of the worker's JVM** (`ProcessBuilder` = fork/exec). The CLI
+is a thin client: it sends one request to the Docker daemon over its socket and
+streams back the answer.
+
+- The **container is not one of these children**. The daemon runs it. Killing the
+  worker and its CLI children does not touch the container.
+- If the JVM dies, its child CLI processes are not automatically killed — the OS
+  orphans them and they exit on their own. Either way it doesn't matter: they only
+  watch, they own nothing.
+- So `docker wait` is just a watcher. A worker crash means nobody is watching; the
+  container keeps running. A restarted worker starts a fresh `docker wait` by name.
+- The log follower is a worker **thread** that runs one `docker logs -f` child and
+  copies each line into `stdout.log`.
+
+### Container removal and logs
+
+`docker rm` deletes the container **and its daemon-side log storage** — lines not yet
+copied out are gone. So the order at job end is fixed: the log follower flushes the
+remaining lines into `stdout.log` first, then the container is removed. `stdout.log`
+(uploaded to MinIO) is the durable copy; the daemon's copy is disposable.
 
 ## Failure Handling
 
@@ -383,10 +408,10 @@ that re-attaches a restarted worker to its still-running containers is in progre
 
 The **worker** owns job liveness (it sees the job's frames), via `JobLivenessMonitor`, one per running job:
 
-- **Liveness signal** — every frame the SDK sends over the WebSocket (status, telemetry, or a periodic liveness ping) counts as activity and refreshes the job's last-activity time.
+- **Liveness signal** — every frame the SDK sends over the WebSocket (status, telemetry, or a periodic liveness ping) counts as activity and refreshes the monitor's `lastLivenessAt` (epoch millis of the last frame). This is worker-local for stall detection; the same value is stamped onto forwarded telemetry so the coordinator can surface it.
 - **Cadence** — the monitor ticks every `liveness.pingIntervalSeconds` (default 15s).
 - **The check** — a job is *unresponsive* when either: it shows **no activity within `startupTimeoutSeconds`** of launch (default 30s, never started), **or** it goes **silent for `maxMissedPings × pingIntervalSeconds`** after starting (default 3 × 15s = 45s).
-- **Action & owner** — on a stall, **the worker** (not the coordinator) gracefully stops the container (`shutdownGraceSeconds` grace) when `autoKill` is set, then reports the job `KILLED` / `UNRESPONSIVE`. Disabling `autoKill` keeps detection (surfaced as last-activity) but takes no action. (Covered by `IntegrationTest#testJobStallUnresponsive`.)
+- **Action & owner** — on a stall, **the worker** (not the coordinator) gracefully stops the container (`shutdownGraceSeconds` grace) when `autoKill` is set, then reports the job `KILLED` / `UNRESPONSIVE`. Disabling `autoKill` keeps detection but takes no action. (Covered by `IntegrationTest#testJobStallUnresponsive`.)
 
 ### When the service kills a container
 
@@ -484,6 +509,82 @@ Terminal jobs are kept for `retentionDays` (default 7). A periodic sweep **delet
 ### Storage abstraction
 
 There's nothing to "bring up" for SQLite — it's an embedded library, not a server: no process, port, or credentials. The coordinator opens the file at `coordinator.dbPath` on startup and creates the schema on first open. The store sits behind a `JobStore` interface that speaks only domain types (`JobStatus`); `SqliteJobStore` is the only place that knows SQL or schema, and `JobManager` depends on the interface. Swapping to Postgres (or another backend) is one new `JobStore` implementation, injected at startup — no changes to `JobManager` or the core.
+
+## Worker Failover & Recovery
+
+When the worker **process** dies (crash, OOM, upgrade, host reboot), its job containers
+keep running — the Docker daemon owns them, not the worker (see "Job vs container
+lifecycle"). Recovery is how a restarted worker takes those jobs back instead of
+leaking or re-running them. Being built slice by slice; full plan in worker-recovery.md.
+
+### Design choices and trade-offs
+
+- **Re-attach, not relaunch.** Training jobs are not idempotent: they write model and
+  checkpoint files as they go. Re-running one on the same output dir corrupts or
+  overwrites partial results. So a restarted worker resumes watching the running
+  container. A container that is genuinely gone fails the job — the user decides what
+  to do with partial output. Nothing is ever silently re-run.
+- **Detached containers are the enabler.** A foreground `docker run --rm` child dies
+  with the worker and deletes its own exit code. Detached (`docker run -d`, no `--rm`),
+  the container survives the worker, and normal watching and re-attach use the *same*
+  calls (`docker wait` / `docker logs` by name). One mechanism, not two.
+- **The status store is the memory.** The worker's SQLite status store (one row per
+  job/task, written through before every send) is what a restarted worker reads to
+  know which jobs it owned. No store row → the worker never claimed it.
+- **The container is the truth.** Recovery trusts `docker inspect`, not the stored
+  state: the store says what the job *was* doing, the daemon says what the container
+  *is* doing. Decisions come from the live answer.
+
+### Boot recovery
+
+On boot, before registering, the worker runs `recover()`: read the status store, and
+for each non-terminal job inspect its container (`ContainerState`):
+
+| Container | Decision |
+|-----------|----------|
+| RUNNING | Re-attach: resume `docker wait`, restart liveness, re-open streams |
+| EXITED | Fail best-effort: salvage logs + outputs, report FAILED / `NOT_FOUND_ON_RECOVERY`, remove the container after the ack |
+| ABSENT | Fail best-effort: salvage leftover outputs, report FAILED / `NOT_FOUND_ON_RECOVERY`, never relaunch |
+
+Terminal rows in the store are skipped — they only wait for the register flush to
+deliver them. Boot order: resolve worker id → `recover()` → register → heartbeat →
+subscribe → re-attach running jobs → pull loop.
+
+### Re-attach
+
+A RUNNING decision re-runs the same per-job wiring a fresh job gets, minus staging
+and `docker run`: re-open the status and telemetry streams, start a fresh liveness
+monitor (its startup window gives the briefly-unwatched container time to ping
+again), rebind the WebSocket handlers, and block on `docker wait job-{id}`. The
+worker first re-asserts job RUNNING — the crash may have happened before any task
+update, leaving the coordinator at STARTING. From there the job finishes exactly
+like a normal one: terminal report, output upload, container removal, store ack.
+
+The job's SDK still holds a dead WebSocket to the old worker process; SDK-side
+reconnect is the next slice. Until then a re-attached container reports no liveness.
+
+### Lost containers (`NOT_FOUND_ON_RECOVERY`)
+
+A recovered job whose container is not running is failed **best-effort** with one
+coarse reason, `FAILURE_REASON_NOT_FOUND_ON_RECOVERY`. The worker does not try to
+reconstruct what happened — **the user reads the job's checkpoint to determine
+where it stopped** and whether to re-run. Work done so far is salvaged (outputs
+and, for an exited container, logs), never silently re-run.
+
+All the scenarios that land here:
+
+- The container **finished while the worker was down** — success, failure, or a
+  liveness kill the worker never observed (found `EXITED`).
+- The container **never launched** — the worker crashed between claiming the job
+  and a successful `docker run` (found `ABSENT`).
+- The container was **removed externally** — `docker rm` / `docker system prune`,
+  a daemon reset, or a host rebuild (found `ABSENT`).
+- The container **finished and was removed by the worker**, which then crashed
+  before reporting the result (found `ABSENT`; the real outcome is lost).
+
+TODO (TODO.md #24): differentiate these scenarios and recover the real outcome
+(read the exit code for `EXITED`; persist the terminal state before container
+removal) instead of the coarse FAILED.
 
 ## Input/Output Files
 
@@ -635,8 +736,9 @@ Full metric tables: [docs/metrics.md](docs/metrics.md).
 ### Planned
 
 - `scheduler_job_stalled{job_id}` on the coordinator — a RUNNING job with no
-  telemetry past a threshold. Now feasible: the worker forwards last-activity on
-  the telemetry stream (see Protocol Exchanges).
+  telemetry past a threshold. Feasible once the worker forwards last-activity on a
+  steady cadence for silent jobs (TODO.md #23); today only re-stamped real
+  telemetry reaches the coordinator.
 
 ## External Dependencies
 

@@ -235,6 +235,8 @@ class CoordinatorClient implements AutoCloseable {
         // Receive side: the coordinator sends one response when the stream closes.
         // The latch lets callers block until that ack.
         StreamObserver<StatusUpdateResponse> responseObserver = new StreamObserver<>() {
+
+            // TODO: log here that we got an ack
             @Override
             public void onNext(StatusUpdateResponse response) {}
 

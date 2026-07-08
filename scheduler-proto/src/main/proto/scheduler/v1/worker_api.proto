@@ -13,11 +13,13 @@ message RegisterWorkerRequest {
   string hostname = 1;
   scheduler.v1.ResourceRequirements resources = 2;
   string worker_id = 3;
+  repeated scheduler.job.v1.StatusUpdate known_jobs = 4;
 }
 
 // Coordinator -> Worker
 message RegisterWorkerResponse {
   string worker_id = 1;
+  repeated string acked_job_ids = 2;
 }
 
 // Worker -> Coordinator
@@ -54,8 +56,8 @@ message SubscribeRequest {
 
 // Coordinator -> Worker
 message SystemCommand {
+  reserved 1;
   oneof kind {
-    Resync resync = 1;
     Drain drain = 2;
   }
 }
@@ -66,9 +68,6 @@ message JobCommand {
     Cancel cancel = 1;
     Preempt preempt = 2;
   }
-}
-
-message Resync {
 }
 
 message Drain {

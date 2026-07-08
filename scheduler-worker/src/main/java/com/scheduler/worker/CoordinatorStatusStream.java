@@ -39,6 +39,8 @@ public class CoordinatorStatusStream {
     }
 
     public synchronized void report(StatusUpdate update) {
+
+        // TODO: why do we still have JOB_STATE_UNSPECIFIED here ?
         if (update.getJobState() != JobState.JOB_STATE_UNSPECIFIED) {
             log.info("Reporting job status to coordinator: jobId={}, jobState={}{}",
                     update.getJobId(), update.getJobState(),
@@ -46,6 +48,8 @@ public class CoordinatorStatusStream {
                             ? ", reason=" + FailureMessages.format(update.getFailureReason(), update.getFailureDetail())
                             : "");
         }
+
+        // TODO: why do we still have TASK_STATE_UNSPECIFIED here ?
         if (update.getTaskState() != TaskState.TASK_STATE_UNSPECIFIED) {
             log.info("Forwarding task status to coordinator: jobId={}, taskIndex={}, taskName={}, taskState={}",
                     update.getJobId(), update.getTaskIndex(), update.getTaskName(), update.getTaskState());

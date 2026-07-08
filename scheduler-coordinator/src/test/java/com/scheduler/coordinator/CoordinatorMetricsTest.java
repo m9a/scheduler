@@ -54,8 +54,9 @@ class CoordinatorMetricsTest {
         return StatusUpdate.newBuilder().setJobId(jobId).setJobState(state).build();
     }
 
+    // A job failed by heartbeat loss counts in the "failed" finished counter.
     @Test
-    void testHeartbeatFailureCountsAsFailed() {
+    void testHeartbeatFailed() {
         JobManager jobManager = new JobManager(new com.scheduler.coordinator.persistence.InMemoryJobStore());
         double failedBefore = counterValue("scheduler_jobs_finished_total", "failed");
 

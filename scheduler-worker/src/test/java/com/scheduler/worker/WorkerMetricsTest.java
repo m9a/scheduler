@@ -30,8 +30,10 @@ class WorkerMetricsTest {
         assertEquals(2L * 1024 * 1024 * 1024, WorkerMetrics.parseSize(" 2GiB "), 1);
     }
 
+    // One job through start → finish: running gauge up then down, duration
+    // observed, and the per-job container series removed at the end.
     @Test
-    void testJobLifecycleGaugesAndDuration() {
+    void testJobLifecycle() {
         WorkerMetrics metrics = new WorkerMetrics(false);
         double completedBefore = sample("scheduler_worker_job_duration_seconds_count",
                 new String[]{"outcome"}, new String[]{"completed"});

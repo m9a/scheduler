@@ -34,7 +34,7 @@ public final class ProtoMapper {
         );
     }
 
-    public static com.scheduler.proto.v1.Job toProto(JobStatus execution, long lastActivityAtMillis) {
+    public static com.scheduler.proto.v1.Job toProto(JobStatus execution, long lastLivenessAtMillis) {
         com.scheduler.proto.v1.Job.Builder builder = com.scheduler.proto.v1.Job.newBuilder()
                 .setId(execution.id())
                 .setName(execution.job().name())
@@ -58,8 +58,10 @@ public final class ProtoMapper {
         if (execution.completedAt() != null) {
             builder.setCompletedAtMillis(execution.completedAt().toEpochMilli());
         }
-        if (lastActivityAtMillis > 0) {
-            builder.setLastActivityAtMillis(lastActivityAtMillis);
+        // Public proto field stays last_activity_at_millis; the source is the
+        // worker-owned last-liveness time.
+        if (lastLivenessAtMillis > 0) {
+            builder.setLastActivityAtMillis(lastLivenessAtMillis);
         }
         if (execution.failureReason() != null) {
             builder.setFailureReason(execution.failureReason());

@@ -10,10 +10,12 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * <b>Worker → Coordinator leg.</b> The open ReportTelemetry gRPC stream for one
- * job: forwards each {@link Report} the SDK emitted, unchanged. Opened per job by
- * {@link CoordinatorClient#openTelemetryStream}; written to by the job's report
- * handler (WebSocket thread) and the {@link JobLivenessMonitor} tick (scheduler
- * thread).
+ * job: forwards each SDK {@link Report}, re-stamped by the worker with its receive
+ * time as the job's last-activity marker (see {@link WorkerAgent#relayTelemetry}).
+ * Opened per job by {@link CoordinatorClient#openTelemetryStream}; written by the
+ * job's report handler (WebSocket thread) and completed by the worker thread —
+ * those two threads are why {@link #report} and {@link #complete} are synchronized.
+ * The {@link JobLivenessMonitor} does not write here; liveness is worker-local.
  *
  * <pre>
  * WorkerAgent ──► CoordinatorTelemetryStream ──gRPC stream──► Coordinator

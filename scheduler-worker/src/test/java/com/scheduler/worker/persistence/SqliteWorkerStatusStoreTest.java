@@ -64,8 +64,9 @@ class SqliteWorkerStatusStoreTest {
         }
     }
 
+    // A terminal update's failure reason and detail survive the round trip to disk.
     @Test
-    void terminalRoundTripsFailureFields(@TempDir Path dir) {
+    void terminalRoundTrip(@TempDir Path dir) {
         try (SqliteWorkerStatusStore store = open(dir)) {
             store.update(jobFailed("j1", "exit code 7"));
 
@@ -76,8 +77,9 @@ class SqliteWorkerStatusStoreTest {
         }
     }
 
+    // Ack drops every row of the acked job and leaves other jobs alone.
     @Test
-    void ackDropsAllRowsForJob(@TempDir Path dir) {
+    void ackDropsJob(@TempDir Path dir) {
         try (SqliteWorkerStatusStore store = open(dir)) {
             store.update(taskUpdate("j1", 0, TaskState.TASK_STATE_COMPLETED));
             store.update(jobFailed("j1", "boom"));
@@ -91,8 +93,9 @@ class SqliteWorkerStatusStoreTest {
         }
     }
 
+    // Prune removes stale terminal jobs only; in-flight jobs are never pruned.
     @Test
-    void pruneRemovesOnlyOldTerminalJobs(@TempDir Path dir) {
+    void prune(@TempDir Path dir) {
         try (SqliteWorkerStatusStore store = open(dir)) {
             store.update(jobFailed("old", "boom"));   // terminal, completed_at ~ now
             store.update(jobRunning("live"));         // non-terminal, no completed_at

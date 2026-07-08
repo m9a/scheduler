@@ -114,7 +114,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
         PullJobResponse.Builder builder = PullJobResponse.newBuilder();
         if (claimed.isPresent()) {
             log.info("Assigned jobId={} to workerId={}", claimed.get().id(), request.getWorkerId());
-            builder.setJob(ProtoMapper.toProto(claimed.get(), jobManager.lastActivity(claimed.get().id())));
+            builder.setJob(ProtoMapper.toProto(claimed.get(), jobManager.lastLivenessAt(claimed.get().id())));
         } else {
             log.debug("No jobs available for workerId={}", request.getWorkerId());
         }
