@@ -1,14 +1,18 @@
 package com.scheduler.worker;
 
 import com.scheduler.core.ObjectStore;
+import com.scheduler.proto.job.Report;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.worker.persistence.SqliteWorkerStatusStore;
 import com.scheduler.worker.persistence.WorkerStatusStore;
 import com.scheduler.proto.v1.FailureReason;
 import com.scheduler.proto.v1.Job;
 import com.scheduler.proto.v1.JobState;
+import com.scheduler.proto.v1.TaskState;
 import com.scheduler.proto.worker.JobCommand;
 import com.scheduler.proto.worker.SystemCommand;
+import com.scheduler.worker.JobLauncher.ContainerState;
+import com.scheduler.worker.WorkerRecovery.RecoveryDecision;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -22,6 +26,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -50,7 +55,7 @@ import java.util.concurrent.TimeUnit;
  * Per job ({@link #executeJob}): stage inputs → open status stream → wire handler
  * → spawn container → wait → report COMPLETED/FAILED/KILLED → upload outputs.
  */
-public class WorkerAgent implements AutoCloseable {
+public class WorkerAgent implements AutoCloseable, ContainerInspector {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerAgent.class);
 
@@ -69,6 +74,9 @@ public class WorkerAgent implements AutoCloseable {
     // Durable mirror of every status update this agent sends. Survives a worker
     // crash: recover() reads it on boot, register flushes it to the coordinator.
     private final WorkerStatusStore statusStore;
+
+    // Boot recovery: reconciles in-flight jobs against their containers before register.
+    private final WorkerRecovery recovery;
 
     // Path to the worker's checkpoint file (worker_checkpoint.yaml) — source of the stable workerId.
     private final String checkpointPath;
@@ -90,6 +98,10 @@ public class WorkerAgent implements AutoCloseable {
     private volatile boolean draining;
     // Id of the job currently executing (null when idle) — lets a job command target it.
     private volatile String currentJobId;
+    // Set on the WebSocket thread when a task reports FAILED; read at container
+    // exit to fail the job even if the container exited 0. Reset per job in
+    // openReportingChannel.
+    private volatile boolean currentJobTaskFailed;
     private String workerId;
 
     public WorkerAgent(WorkerConfig config, ObjectStore objectStore) throws IOException {
@@ -123,6 +135,9 @@ public class WorkerAgent implements AutoCloseable {
                 config.getDocker().getNetwork(), config.getMlflow().getTrackingUri(),
                 liveness.getShutdownGraceSeconds(),
                 Duration.ofMinutes(config.getDocker().getImagePullTimeoutMinutes()));
+        // The agent is the inspector so tests can stub container state; the real
+        // probe still lives in JobLauncher (see containerState below).
+        this.recovery = new WorkerRecovery(statusStore, this);
 
         // Bind to all NICs. Containers on the bridge network reach this server via
         // the host's real hostname (passed in workerAgentUrl).
@@ -161,6 +176,8 @@ public class WorkerAgent implements AutoCloseable {
         // The checkpoint file holds the stable id (generated on first boot). The
         // same id survives restarts, so the coordinator can reconcile our jobs.
         workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
+        // Reconcile in-flight jobs against their containers before we register.
+        List<RecoveryDecision> decisions = recovery.recover();
         coordinator.register(workerId, hostname, memory, cpu, gpu, capabilities);
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
@@ -169,6 +186,9 @@ public class WorkerAgent implements AutoCloseable {
         coordinator.subscribeSystemCommands(workerId, this::onSystemCommand);
         coordinator.subscribeJobCommands(workerId, this::onJobCommand);
         running = true;
+        // Act on recovery before pulling new work: a container that survived the
+        // restart is still this worker's job — resume watching it first.
+        recoverJobs(decisions);
         while (running) {
             Optional<Job> job = draining ? Optional.empty() : coordinator.pullJob(workerId);
             if (job.isPresent()) {
@@ -237,6 +257,118 @@ public class WorkerAgent implements AutoCloseable {
         }
     }
 
+    // ── boot re-attach (recovery decisions) ─────────────────────────────────
+
+    /**
+     * Acts on the boot-recovery decisions. A still-running container is re-attached
+     * and watched to the end; anything else is failed best-effort — the work done
+     * so far is salvaged, never silently re-run.
+     */
+    private void recoverJobs(List<RecoveryDecision> decisions) {
+        for (RecoveryDecision decision : decisions) {
+            switch (decision.containerState()) {
+                case RUNNING -> recoverJob(decision.jobId());
+                case EXITED, ABSENT -> failLostJob(decision.jobId(), decision.containerState());
+            }
+        }
+    }
+
+    /**
+     * Best-effort recovery for a job whose container is no longer running: salvage
+     * outputs and logs, report the job FAILED / NOT_FOUND_ON_RECOVERY, and clean
+     * up. Deliberately imprecise — the worker does not try to reconstruct the
+     * outcome; the user reads the job's checkpoint to decide progress, completion,
+     * or the need to re-run. Both container states land here:
+     * <ul>
+     *   <li><b>EXITED</b> — the container finished while the worker was down (any
+     *       exit code, or a liveness kill the worker never observed). Its logs are
+     *       still salvageable; it is removed only after the coordinator acks.</li>
+     *   <li><b>ABSENT</b> — the container is gone: it never launched (crash between
+     *       claim and docker run), it was removed externally (docker rm / prune /
+     *       daemon reset / host rebuild), or it finished and the worker crashed
+     *       after removing it but before reporting the result.</li>
+     * </ul>
+     * TODO (TODO.md #24): differentiate these scenarios and recover the real
+     * outcome (read the exit code for EXITED; persist the terminal state before
+     * container removal) instead of the coarse FAILED.
+     *
+     * <p>Idempotent: rows leave the store only on the coordinator's ack, and the
+     * exited container is removed only after that ack — so a crash mid-recovery
+     * re-runs this path to the same result (re-reporting a terminal job is a
+     * coordinator no-op).
+     */
+    private void failLostJob(String jobId, ContainerState state) {
+        log.warn("Recovering lost job: jobId={}, containerState={} → FAILED / NOT_FOUND_ON_RECOVERY", jobId, state);
+        Path outputDir = Path.of("/tmp/jobs", jobId, "output");
+        Path logFile = Path.of("/tmp/jobs", jobId, "stdout.log");
+        try {
+            if (state == ContainerState.EXITED) {
+                launcher.salvageLogs(jobId, logFile);
+            }
+            launcher.uploadOutputs(jobId, outputDir, logFile);
+
+            // Status-only reporting: no telemetry stream or liveness monitor — the
+            // container is not running and its SDK is gone.
+            CoordinatorStatusStream statusStream = coordinator.openStatusStream(jobId);
+            StatusUpdate terminal = failedUpdate(jobId, FailureReason.FAILURE_REASON_NOT_FOUND_ON_RECOVERY,
+                    "container " + (state == ContainerState.EXITED ? "exited" : "absent") + " on worker restart");
+            statusStore.update(terminal);
+            statusStream.report(terminal);
+            statusStream.complete();
+            if (awaitStatusClose(statusStream)) {
+                statusStore.ack(jobId);
+                // Remove only after the ack: a crash before this leaves the exited
+                // container in place for the next recovery pass to re-report.
+                if (state == ContainerState.EXITED) {
+                    JobLauncher.removeContainer(jobId);
+                }
+            } else {
+                log.warn("No close ack from coordinator for lost jobId={}; keeping status rows and container", jobId);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted recovering lost jobId={}; the next boot re-runs recovery", jobId);
+        } finally {
+            launcher.cleanupTempDirs(jobId);
+            log.info("Finished lost-job recovery: jobId={}", jobId);
+        }
+    }
+
+    /**
+     * Recovers a job whose container kept running across a worker restart. Same
+     * reporting pipes and teardown as a fresh job, minus staging and docker run —
+     * the container already exists, the agent re-attaches and waits for it to
+     * finish. The liveness monitor starts fresh, so its startup window gives the
+     * briefly-unwatched container time to ping again before it can be judged stalled.
+     */
+    private void recoverJob(String jobId) {
+        log.info("Recovering job: jobId={}", jobId);
+        Path outputDir = Path.of("/tmp/jobs", jobId, "output");
+        Path logFile = Path.of("/tmp/jobs", jobId, "stdout.log");
+
+        // Published so a cancel/preempt command can target the recovered job.
+        currentJobId = jobId;
+        try {
+            JobReporting reporting = openReportingChannel(jobId);
+            // The job's name is not persisted; the id stands in for the metrics label.
+            metrics.jobStarted(jobId, jobId);
+            // The container is running, so the job is RUNNING. Re-assert it: the
+            // worker may have died before any task update, leaving the coordinator
+            // at STARTING — which cannot go terminal directly. A coordinator that
+            // already saw RUNNING de-dupes this to a no-op.
+            StatusUpdate runningUpdate = jobUpdate(jobId, JobState.JOB_STATE_RUNNING, null, null);
+            statusStore.update(runningUpdate);
+            reporting.statusStream().report(runningUpdate);
+            StatusUpdate terminal = reattachJob(jobId, logFile, reporting.liveness());
+            reportTerminalUpdate(jobId, jobId, terminal, reporting);
+            launcher.uploadOutputs(jobId, outputDir, logFile);
+        } finally {
+            currentJobId = null;
+            launcher.cleanupTempDirs(jobId);
+            log.info("Finished recovered job: jobId={}", jobId);
+        }
+    }
+
     /** True once a drain command has told this worker to stop pulling new jobs. */
     boolean isDraining() {
         return draining;
@@ -284,15 +416,21 @@ public class WorkerAgent implements AutoCloseable {
 
     /** Opens the reporting pipes, runs the container, sends the terminal update, closes the pipes. */
     private void runJobContainer(Job job, Path inputDir, Path outputDir, Path logFile) {
-        JobReporting reporting = openReporting(job);
+        JobReporting reporting = openReportingChannel(job.getId());
         metrics.jobStarted(job.getId(), job.getName());
-        StatusUpdate terminal = awaitContainerOutcome(job, inputDir, outputDir, logFile,
+        StatusUpdate terminal = spawnJob(job, inputDir, outputDir, logFile,
                 reporting.liveness());
+        reportTerminalUpdate(job.getId(), job.getName(), terminal, reporting);
+    }
+
+    /** Persists and sends the terminal update, then tears down the reporting pipes. */
+    private void reportTerminalUpdate(String jobId, String jobName, StatusUpdate terminal,
+                                      JobReporting reporting) {
         try {
             statusStore.update(terminal);
             reporting.statusStream().report(terminal);
         } finally {
-            closeReporting(job, terminal.getJobState(), reporting);
+            closeReportingChannel(jobId, jobName, terminal.getJobState(), reporting);
         }
     }
 
@@ -302,26 +440,36 @@ public class WorkerAgent implements AutoCloseable {
      * onto each task update — the SDK only knows task state. The coordinator moves
      * STARTING → RUNNING on the first and de-dupes the rest.
      */
-    private JobReporting openReporting(Job job) {
-        CoordinatorStatusStream statusStream = coordinator.openStatusStream(job.getId());
+    private JobReporting openReportingChannel(String jobId) {
+        // Fresh per-job state before the container runs.
+        currentJobTaskFailed = false;
+
+        CoordinatorStatusStream statusStream = coordinator.openStatusStream(jobId);
         onStatusUpdate(update -> relayTaskStatus(statusStream, update));
 
-        // The SDK's reports and the liveness ticks both ride the telemetry stream.
-        CoordinatorTelemetryStream telemetryStream = coordinator.openTelemetryStream(job.getId());
-        jobCallbacks.setReportHandler(telemetryStream::report);
+        CoordinatorTelemetryStream telemetryStream = coordinator.openTelemetryStream(jobId);
 
-        // KILL PATH 1 — liveness. Every inbound SDK frame bumps the monitor; a
-        // container silent past the thresholds is gracefully stopped.
-        JobLivenessMonitor liveness = new JobLivenessMonitor(job.getId(), telemetryStream::report,
-                livenessConfig, () -> launcher.stopContainer(job.getId()));
+        // KILL PATH 1 — liveness, purely worker-local. Every inbound SDK frame
+        // bumps the monitor (via the activity listener); a container silent past
+        // the thresholds is gracefully stopped. The monitor also owns the one
+        // liveness clock the worker stamps onto telemetry — so it is created
+        // before the report handler that reads it.
+        JobLivenessMonitor liveness = new JobLivenessMonitor(jobId,
+                livenessConfig, () -> launcher.stopContainer(jobId));
         jobCallbacks.setActivityListener(liveness::recordActivity);
+
+        // Telemetry: forward each SDK Report, re-stamped with the monitor's last
+        // liveness time (see relayTelemetry). The activity listener above runs
+        // before this handler on each frame, so that time is this report's arrival.
+        jobCallbacks.setReportHandler(report -> relayTelemetry(telemetryStream, liveness, report));
+
         liveness.start();
 
         return new JobReporting(statusStream, telemetryStream, liveness);
     }
 
     /** Unbinds the WebSocket handlers, then closes the monitor and both streams. */
-    private void closeReporting(Job job, JobState terminalState, JobReporting reporting) {
+    private void closeReportingChannel(String jobId, String jobName, JobState terminalState, JobReporting reporting) {
         reporting.liveness().close();
         jobCallbacks.setActivityListener(null);
         // Stop routing telemetry before closing the stream. A late frame after
@@ -329,15 +477,15 @@ public class WorkerAgent implements AutoCloseable {
         jobCallbacks.setReportHandler(null);
         reporting.telemetryStream().complete();
         awaitTelemetryClose(reporting.telemetryStream());
-        metrics.jobFinished(job.getId(), job.getName(), metricsOutcomeLabel(terminalState));
+        metrics.jobFinished(jobId, jobName, metricsOutcomeLabel(terminalState));
         reporting.statusStream().complete();
         // The coordinator's close ack confirms it saw the terminal update — the
         // one coarse ack per job. Only then do the job's rows leave the store.
         if (awaitStatusClose(reporting.statusStream())) {
-            statusStore.ack(job.getId());
+            statusStore.ack(jobId);
         } else {
             log.warn("No close ack from coordinator for jobId={}; keeping status rows for the register flush",
-                    job.getId());
+                    jobId);
         }
     }
 
@@ -361,13 +509,13 @@ public class WorkerAgent implements AutoCloseable {
     }
 
     /**
-     * Runs the container to exit and builds the terminal job update. The one
-     * early-kill path is the liveness check (see {@link #openReporting}); there
-     * is no run deadline. A task still mid-execution keeps its last reported
-     * state — the worker does not fail it.
+     * Launches the container, blocks until it exits, and builds the terminal job
+     * update. The one early-kill path is the liveness check (see
+     * {@link #openReportingChannel}); there is no run deadline. A task still
+     * mid-execution keeps its last reported state — the worker does not fail it.
      */
-    private StatusUpdate awaitContainerOutcome(Job job, Path inputDir, Path outputDir, Path logFile,
-                                               JobLivenessMonitor liveness) {
+    private StatusUpdate spawnJob(Job job, Path inputDir, Path outputDir, Path logFile,
+                                  JobLivenessMonitor liveness) {
         String jobId = job.getId();
         int exitCode;
         try {
@@ -379,13 +527,44 @@ public class WorkerAgent implements AutoCloseable {
             }
             return failedUpdate(jobId, FailureReason.FAILURE_REASON_PROCESS_START_FAILED, e.getMessage());
         }
+        return getTerminalUpdateFromExit(jobId, exitCode, liveness);
+    }
 
+    /**
+     * Re-attach counterpart of {@link #spawnJob}: re-attaches to a
+     * container recovery found still running, blocks until the job finishes, and
+     * maps its exit the same way.
+     */
+    private StatusUpdate reattachJob(String jobId, Path logFile, JobLivenessMonitor liveness) {
+        int exitCode;
+        try {
+            exitCode = attachJobProcess(jobId, logFile);
+        } catch (IOException | InterruptedException e) {
+            log.error("Failed to re-attach to job: jobId={}, error={}", jobId, e.getMessage(), e);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return failedUpdate(jobId, FailureReason.FAILURE_REASON_PROCESS_START_FAILED,
+                    "re-attach failed: " + e.getMessage());
+        }
+        return getTerminalUpdateFromExit(jobId, exitCode, liveness);
+    }
+
+    /** Maps the container's exit to the terminal job update. */
+    private StatusUpdate getTerminalUpdateFromExit(String jobId, int exitCode, JobLivenessMonitor liveness) {
         // KILL PATH — liveness. The monitor stopped a silent container; its
         // verdict beats the kill-induced exit code.
         if (liveness.isUnresponsive()) {
             WorkerMetrics.JOBS_KILLED_UNRESPONSIVE.inc();
             return killedUpdate(jobId, FailureReason.FAILURE_REASON_UNRESPONSIVE,
                     "no liveness from the container");
+        }
+        // A task that reported FAILED fails the whole job, even if the container
+        // then exited 0 (e.g. the SDK caught the error during shutdown). Any task
+        // failure stops the job — see CLAUDE.md "State model".
+        if (currentJobTaskFailed && exitCode == JobLauncher.EXIT_SUCCESS) {
+            log.warn("Job container exited 0 but a task reported FAILED: jobId={}", jobId);
+            return failedUpdate(jobId, FailureReason.FAILURE_REASON_PROCESS_EXITED, "a task reported FAILED");
         }
         if (exitCode == JobLauncher.EXIT_SUCCESS) {
             return completedUpdate(jobId);
@@ -413,13 +592,36 @@ public class WorkerAgent implements AutoCloseable {
     /**
      * Stamps job RUNNING onto a task update from the SDK and forwards it to the
      * coordinator. Registered as the per-job status handler in
-     * {@link #openReporting}. Persists before sending: a crash between the two
+     * {@link #openReportingChannel}. Persists before sending: a crash between the two
      * re-asserts the update on the next register instead of losing it.
+     *
+     * <p>Job stays RUNNING even on a task FAILED — the job is still alive at that
+     * instant; it goes terminal only at container exit. The failure is remembered
+     * ({@code currentJobTaskFailed}) so {@link #getTerminalUpdateFromExit} fails
+     * the job even if the container then exits 0.
      */
     private void relayTaskStatus(CoordinatorStatusStream statusStream, StatusUpdate update) {
+        if (update.getTaskState() == TaskState.TASK_STATE_FAILED) {
+            currentJobTaskFailed = true;
+        }
         StatusUpdate stamped = update.toBuilder().setJobState(JobState.JOB_STATE_RUNNING).build();
         statusStore.update(stamped);
         statusStream.report(stamped);
+    }
+
+    /**
+     * Re-stamps a telemetry {@link Report} with the job's last liveness time — the
+     * marker the coordinator surfaces on {@code GetJobStatus} — then forwards it.
+     * Registered as the per-job report handler in {@link #openReportingChannel}.
+     * The value is the {@link JobLivenessMonitor}'s {@code lastLivenessAt}, the one
+     * liveness clock the worker owns; the SDK's own timestamp is not trusted here.
+     *
+     * <p>TODO (TODO.md #23): forward on a fixed cadence instead of on arrival,
+     * aggregating buffered reports and stamping one liveness time per flush.
+     */
+    private void relayTelemetry(CoordinatorTelemetryStream telemetryStream, JobLivenessMonitor liveness,
+                                Report report) {
+        telemetryStream.report(report.toBuilder().setTimestampMs(liveness.lastLivenessAt()).build());
     }
 
     // ── job-level status updates ─────────────────────────────────────────────
@@ -455,6 +657,23 @@ public class WorkerAgent implements AutoCloseable {
     int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
                         Map<String, String> params) throws IOException, InterruptedException {
         return launcher.spawn(details, inputDir, outputDir, logFile, params);
+    }
+
+    /**
+     * Re-attaches to a recovered container via {@link JobLauncher} and blocks until
+     * exit. Package-private so tests can override it and simulate the resumed wait.
+     */
+    int attachJobProcess(String jobId, Path logFile) throws IOException, InterruptedException {
+        return launcher.attachAndWait(jobId, logFile);
+    }
+
+    /**
+     * Boot recovery's container probe — the real read is {@link JobLauncher}'s
+     * docker inspect. On the agent so tests can stub container state.
+     */
+    @Override
+    public ContainerState containerState(String jobId) {
+        return launcher.containerState(jobId);
     }
 
     // ── lifecycle ────────────────────────────────────────────────────────────

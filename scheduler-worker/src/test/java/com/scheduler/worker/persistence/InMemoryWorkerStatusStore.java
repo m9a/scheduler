@@ -72,6 +72,7 @@ public class InMemoryWorkerStatusStore implements WorkerStatusStore {
 
     @Override
     public synchronized void close() {
-        rows.clear();
+        // Keep the rows: the sqlite store's data survives close too, and restart
+        // tests hand the same store to the next agent as the "disk".
     }
 }

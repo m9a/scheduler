@@ -25,6 +25,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
@@ -231,16 +232,33 @@ class CoordinatorClient implements AutoCloseable {
      */
     CoordinatorStatusStream openStatusStream(String jobId) {
         CountDownLatch done = new CountDownLatch(1);
+        // True once the coordinator's close-ack response arrives — proof it applied
+        // every update. A stream error before that must NOT count as acked: the
+        // caller keeps the job's store rows in that case.
+        AtomicBoolean acked = new AtomicBoolean(false);
 
-        // Receive side: the coordinator sends one response when the stream closes.
-        // The latch lets callers block until that ack.
+        // Receive side: the coordinator sends one response + onCompleted when the
+        // worker closes the stream. The latch lets callers block until then.
         StreamObserver<StatusUpdateResponse> responseObserver = new StreamObserver<>() {
+
             @Override
-            public void onNext(StatusUpdateResponse response) {}
+            public void onNext(StatusUpdateResponse response) {
+                // This response IS the ack — the coordinator sends it only after
+                // applying every update on the stream.
+                acked.set(true);
+                log.info("Received status close ack from coordinator: jobId={}", jobId);
+            }
 
             @Override
             public void onError(Throwable t) {
-                log.error("ReportStatus stream error: {}", t.getMessage());
+                if (acked.get()) {
+                    // The ack got through before the stream broke — updates are
+                    // safe on the coordinator, only the close was untidy.
+                    log.warn("ReportStatus stream error after ack: jobId={}, error={}", jobId, t.getMessage());
+                } else {
+                    log.error("ReportStatus stream error before ack — status rows will be kept: jobId={}, error={}",
+                            jobId, t.getMessage());
+                }
                 done.countDown();
             }
 
@@ -254,7 +272,7 @@ class CoordinatorClient implements AutoCloseable {
         StreamObserver<StatusUpdate> requestObserver =
                 asyncStub.reportStatus(responseObserver);
 
-        return new CoordinatorStatusStream(requestObserver, done);
+        return new CoordinatorStatusStream(requestObserver, done, acked);
     }
 
     @Override

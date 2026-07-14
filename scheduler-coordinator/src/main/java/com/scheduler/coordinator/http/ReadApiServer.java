@@ -212,8 +212,9 @@ public class ReadApiServer {
         Map<String, Object> m = jobSummary(job);
         m.put("failureReason", job.failureReason() == null ? null : job.failureReason().name());
         m.put("failureDetail", job.failureDetail());
-        long lastActivity = jobManager.lastActivity(job.id());
-        m.put("lastActivityMs", lastActivity == 0 ? null : lastActivity);
+        // JSON key stays lastActivityMs (UI contract); value is last-liveness time.
+        long lastLiveness = jobManager.lastLivenessAt(job.id());
+        m.put("lastActivityMs", lastLiveness == 0 ? null : lastLiveness);
         m.put("tasks", taskList(job));
         return m;
     }

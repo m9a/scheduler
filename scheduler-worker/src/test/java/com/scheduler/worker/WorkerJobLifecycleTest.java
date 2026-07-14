@@ -45,15 +45,23 @@ class WorkerJobLifecycleTest {
                 throws IOException, InterruptedException;
     }
 
+    @FunctionalInterface
+    interface AttachBehavior {
+        int execute(String jobId) throws IOException, InterruptedException;
+    }
+
     static class TestableWorkerAgent extends WorkerAgent {
         final InMemoryWorkerStatusStore statusStore;
         private volatile SpawnBehavior spawnBehavior;
+        private volatile AttachBehavior attachBehavior;
+        // When set, boot recovery sees this instead of asking docker.
+        volatile JobLauncher.ContainerState containerStateStub;
 
         TestableWorkerAgent(WorkerConfig config) throws IOException {
             this(config, new InMemoryWorkerStatusStore());
         }
 
-        private TestableWorkerAgent(WorkerConfig config, InMemoryWorkerStatusStore store) throws IOException {
+        TestableWorkerAgent(WorkerConfig config, InMemoryWorkerStatusStore store) throws IOException {
             super(config, null, store);
             this.statusStore = store;
         }
@@ -62,10 +70,24 @@ class WorkerJobLifecycleTest {
             this.spawnBehavior = behavior;
         }
 
+        void setAttachBehavior(AttachBehavior behavior) {
+            this.attachBehavior = behavior;
+        }
+
         @Override
         int spawnJobProcess(JobDetails details, Path inputDir, Path outputDir, Path logFile,
                             Map<String, String> params) throws IOException, InterruptedException {
             return spawnBehavior.execute(details, workerAgentUrl());
+        }
+
+        @Override
+        int attachJobProcess(String jobId, Path logFile) throws IOException, InterruptedException {
+            return attachBehavior.execute(jobId);
+        }
+
+        @Override
+        public JobLauncher.ContainerState containerState(String jobId) {
+            return containerStateStub != null ? containerStateStub : super.containerState(jobId);
         }
     }
 
@@ -174,8 +196,29 @@ class WorkerJobLifecycleTest {
         assertEquals(TaskState.TASK_STATE_FAILED, job.getTasks(0).getState());
     }
 
+    // A task reports FAILED but the container still exits 0 — the job must be
+    // FAILED, not COMPLETED. Any task failure fails the whole job.
     @Test
-    void testWorkerHeartbeatLost() throws Exception {
+    void taskFailedExitZero() throws Exception {
+        worker.setSpawnBehavior((details, url) -> {
+            postTaskState(url, details.jobId(), 0, "extract", "RUNNING", null);
+            postTaskState(url, details.jobId(), 0, "extract", "FAILED", "boom");
+            return 0;  // container exits clean despite the failed task
+        });
+
+        String jobId = submitJob("task-fail-exit-zero");
+        startWorker();
+
+        Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
+        assertEquals(FailureReason.FAILURE_REASON_PROCESS_EXITED, job.getFailureReason());
+        assertEquals(TaskState.TASK_STATE_FAILED, job.getTasks(0).getState());
+    }
+
+    // A worker goes silent mid-job; the coordinator's heartbeat monitor must
+    // detect it and fail the job as HEARTBEAT_LOST.
+    @Test
+    void heartbeatLost() throws Exception {
         // Tear down the default setup — we need a coordinator with the heartbeat monitor enabled
         worker.stop();
         if (workerThread != null) {
@@ -249,10 +292,10 @@ class WorkerJobLifecycleTest {
         workerHandler.shutdownHeartbeatMonitor();
     }
 
-    // Verifies the durable status store: job + task rows written while the job is
-    // in flight, all rows dropped once the coordinator acks the terminal delivery.
+    // Durable status store: job + task rows written while the job is in flight,
+    // all rows dropped once the coordinator acks the terminal delivery.
     @Test
-    void statusStoreWriteThroughAndAck() throws Exception {
+    void statusStoreAck() throws Exception {
         CountDownLatch midJob = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         worker.setSpawnBehavior((details, url) -> {
@@ -282,8 +325,9 @@ class WorkerJobLifecycleTest {
                 "coordinator's close ack should drop the job's rows");
     }
 
+    // A failed job must not wedge the worker: the next job still runs.
     @Test
-    void workerContinuesAfterFailure() throws Exception {
+    void nextJobAfterFailure() throws Exception {
         AtomicBoolean first = new AtomicBoolean(true);
         worker.setSpawnBehavior((details, url) -> {
             if (first.compareAndSet(true, false)) {
@@ -304,10 +348,10 @@ class WorkerJobLifecycleTest {
         assertEquals(JobState.JOB_STATE_COMPLETED, job2.getState());
     }
 
-    // Verifies the coordinator → worker push path end-to-end: the worker subscribes
-    // (so a push is deliverable), and a drain command actually reaches and changes it.
+    // Coordinator → worker push path end-to-end: the worker subscribes (so a push
+    // is deliverable), and a drain command actually reaches and changes it.
     @Test
-    void commandStreamSubscribeAndDrain() throws Exception {
+    void drainCommand() throws Exception {
         worker.setSpawnBehavior((details, url) -> 0);  // no job submitted; worker stays idle
         startWorker();
 
@@ -319,6 +363,102 @@ class WorkerJobLifecycleTest {
 
         assertTrue(workerHandler.drain(workerId, true), "drain push should be deliverable");
         awaitTrue(worker::isDraining, 5, TimeUnit.SECONDS, "drain command should reach the worker");
+    }
+
+    // A worker dies mid-job; the job's rows stay in the store and the container keeps
+    // running. The restarted worker must re-attach, resume the wait, and report the
+    // terminal state; the coordinator's ack then drops the rows.
+    @Test
+    void reattach() throws Exception {
+        CountDownLatch claimed = new CountDownLatch(1);
+        CountDownLatch blockForever = new CountDownLatch(1);
+        worker.setSpawnBehavior((details, url) -> {
+            claimed.countDown();
+            blockForever.await();
+            return 0;
+        });
+
+        String jobId = submitJob("reattach");
+        startWorker();
+        assertTrue(claimed.await(10, TimeUnit.SECONDS), "job should be claimed");
+        awaitTrue(() -> !worker.statusStore.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "job entry should be persisted before the crash");
+
+        // "Crash": close the worker. Its spawn thread stays blocked (daemon); the
+        // store — standing in for the sqlite file — keeps the job's rows.
+        InMemoryWorkerStatusStore store = worker.statusStore;
+        worker.close();
+
+        worker = new TestableWorkerAgent(testConfig(server.getPort()), store);
+        worker.containerStateStub = JobLauncher.ContainerState.RUNNING;
+        worker.setSpawnBehavior((details, url) -> 0);
+        CountDownLatch reattached = new CountDownLatch(1);
+        worker.setAttachBehavior(jid -> {
+            reattached.countDown();
+            return 0;
+        });
+        startWorker();
+
+        assertTrue(reattached.await(10, TimeUnit.SECONDS), "restarted worker should re-attach");
+        Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
+        assertEquals(JobState.JOB_STATE_COMPLETED, job.getState());
+        awaitTrue(() -> store.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "ack of the re-attached terminal should drop the job's rows");
+    }
+
+    // A worker dies mid-job and the container is gone on restart. Best-effort
+    // recovery: the job is FAILED / NOT_FOUND_ON_RECOVERY and the rows are acked.
+    @Test
+    void absentOnRecovery() throws Exception {
+        Job job = restartWithContainerState(JobLauncher.ContainerState.ABSENT);
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
+        assertEquals(FailureReason.FAILURE_REASON_NOT_FOUND_ON_RECOVERY, job.getFailureReason());
+        assertEquals("container absent on worker restart", job.getFailureDetail());
+    }
+
+    // Same crash, but the container finished while the worker was down. Still the
+    // coarse best-effort FAILED — the user reads the checkpoint to judge progress.
+    @Test
+    void exitedOnRecovery() throws Exception {
+        Job job = restartWithContainerState(JobLauncher.ContainerState.EXITED);
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
+        assertEquals(FailureReason.FAILURE_REASON_NOT_FOUND_ON_RECOVERY, job.getFailureReason());
+        assertEquals("container exited on worker restart", job.getFailureDetail());
+    }
+
+    /**
+     * Shared crash-and-restart scaffold: worker 1 claims a job and dies mid-run;
+     * worker 2 boots on the same store with the stubbed container state. Returns
+     * the job's terminal view from the coordinator after recovery, asserting the
+     * store was acked empty.
+     */
+    private Job restartWithContainerState(JobLauncher.ContainerState state) throws Exception {
+        CountDownLatch claimed = new CountDownLatch(1);
+        CountDownLatch blockForever = new CountDownLatch(1);
+        worker.setSpawnBehavior((details, url) -> {
+            claimed.countDown();
+            blockForever.await();
+            return 0;
+        });
+
+        String jobId = submitJob("recovery-" + state);
+        startWorker();
+        assertTrue(claimed.await(10, TimeUnit.SECONDS), "job should be claimed");
+        awaitTrue(() -> !worker.statusStore.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "job entry should be persisted before the crash");
+
+        InMemoryWorkerStatusStore store = worker.statusStore;
+        worker.close();
+
+        worker = new TestableWorkerAgent(testConfig(server.getPort()), store);
+        worker.containerStateStub = state;
+        worker.setSpawnBehavior((details, url) -> 0);
+        startWorker();
+
+        Job job = pollUntilTerminal(jobId, 10, TimeUnit.SECONDS);
+        awaitTrue(() -> store.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "ack of the recovery terminal should drop the job's rows");
+        return job;
     }
 
     // -- helpers --

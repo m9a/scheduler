@@ -88,8 +88,9 @@ class SqliteJobStoreTest {
         }
     }
 
+    // Boot recovery loads only in-flight jobs; terminal ones stay behind.
     @Test
-    void loadNonTerminalExcludesTerminal(@TempDir Path dir) {
+    void loadNonTerminal(@TempDir Path dir) {
         SqliteJobStore store = new SqliteJobStore(dir.resolve("jobs.db"));
         try {
             store.save(running("active", new LinkedHashMap<>()), "w1");
@@ -119,8 +120,10 @@ class SqliteJobStoreTest {
         }
     }
 
+    // The retention sweep deletes terminal jobs past the cutoff; in-flight and
+    // recent ones survive.
     @Test
-    void retentionDeletesOldTerminal(@TempDir Path dir) {
+    void retention(@TempDir Path dir) {
         SqliteJobStore store = new SqliteJobStore(dir.resolve("jobs.db"));
         try {
             store.save(terminal("old", JobState.JOB_STATE_COMPLETED, 1_000), "w1");

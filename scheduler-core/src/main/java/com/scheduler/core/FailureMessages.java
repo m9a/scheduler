@@ -17,6 +17,8 @@ public final class FailureMessages {
             case FAILURE_REASON_PROCESS_EXITED -> "Job process exited with non-zero code";
             case FAILURE_REASON_PROCESS_START_FAILED -> "Failed to start job process";
             case FAILURE_REASON_UNRESPONSIVE -> "Job container became unresponsive";
+            case FAILURE_REASON_NOT_FOUND_ON_RECOVERY ->
+                    "Job container not found running on worker restart; read the job checkpoint to determine progress";
             default -> "Job failed";
         };
     }

@@ -139,8 +139,9 @@ class ReadApiServerTest {
 
     // ── static UI serving (Option B: coordinator serves the UI) ─────────────
 
+    // Serves index.html at / and static assets with their content types.
     @Test
-    void servesUiIndexAndAssets(@TempDir Path uiDir) throws Exception {
+    void serveUi(@TempDir Path uiDir) throws Exception {
         Files.writeString(uiDir.resolve("index.html"), "<!doctype html><title>Scheduler</title>");
         Files.createDirectories(uiDir.resolve("assets"));
         Files.writeString(uiDir.resolve("assets/app.js"), "console.log('hi')");
@@ -165,8 +166,9 @@ class ReadApiServerTest {
         }
     }
 
+    // A client-side route with no file behind it falls back to index.html (SPA).
     @Test
-    void unknownRouteFallsBackToIndex(@TempDir Path uiDir) throws Exception {
+    void unknownRoute(@TempDir Path uiDir) throws Exception {
         Files.writeString(uiDir.resolve("index.html"), "<!doctype html><title>SPA</title>");
 
         ReadApiServer uiServer = new ReadApiServer(jobManager, workerHandler, uiDir);

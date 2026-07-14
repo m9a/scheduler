@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * <b>Worker → Coordinator leg.</b> The open ReportStatus gRPC stream for one job.
@@ -32,13 +33,20 @@ public class CoordinatorStatusStream {
 
     private final StreamObserver<StatusUpdate> requestObserver;
     private final CountDownLatch done;
+    // Set by the receive side when the coordinator's close-ack response arrives.
+    // A stream error before the ack opens the latch without setting it.
+    private final AtomicBoolean acked;
 
-    CoordinatorStatusStream(StreamObserver<StatusUpdate> requestObserver, CountDownLatch done) {
+    CoordinatorStatusStream(StreamObserver<StatusUpdate> requestObserver, CountDownLatch done,
+                            AtomicBoolean acked) {
         this.requestObserver = requestObserver;
         this.done = done;
+        this.acked = acked;
     }
 
     public synchronized void report(StatusUpdate update) {
+
+        // TODO: why do we still have JOB_STATE_UNSPECIFIED here ?
         if (update.getJobState() != JobState.JOB_STATE_UNSPECIFIED) {
             log.info("Reporting job status to coordinator: jobId={}, jobState={}{}",
                     update.getJobId(), update.getJobState(),
@@ -46,6 +54,8 @@ public class CoordinatorStatusStream {
                             ? ", reason=" + FailureMessages.format(update.getFailureReason(), update.getFailureDetail())
                             : "");
         }
+
+        // TODO: why do we still have TASK_STATE_UNSPECIFIED here ?
         if (update.getTaskState() != TaskState.TASK_STATE_UNSPECIFIED) {
             log.info("Forwarding task status to coordinator: jobId={}, taskIndex={}, taskName={}, taskState={}",
                     update.getJobId(), update.getTaskIndex(), update.getTaskName(), update.getTaskState());
@@ -57,7 +67,13 @@ public class CoordinatorStatusStream {
         requestObserver.onCompleted();
     }
 
+    /**
+     * True only when the coordinator's close ack arrived — the caller's signal
+     * that every update (incl. the terminal one) was applied and the job's store
+     * rows may be dropped. False on timeout <b>or</b> a stream error before the
+     * ack: the rows stay for the register flush to re-deliver.
+     */
     public boolean awaitCompletion(long timeout, TimeUnit unit) throws InterruptedException {
-        return done.await(timeout, unit);
+        return done.await(timeout, unit) && acked.get();
     }
 }

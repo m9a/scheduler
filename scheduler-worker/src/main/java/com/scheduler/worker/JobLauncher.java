@@ -22,7 +22,8 @@ import java.util.stream.Stream;
 /**
  * Runs the job container and handles its files. It does not talk to the job
  * process or the coordinator — {@link JobCallbackHandler} and
- * {@link CoordinatorClient} do that. Only {@link WorkerAgent#executeJob} calls it.
+ * {@link CoordinatorClient} do that. Only {@link WorkerAgent} calls it:
+ * {@code executeJob} for a fresh job, boot re-attach for a recovered one.
  *
  * <p>The container runs <b>detached</b> ({@code docker run -d}, no {@code --rm}).
  * The Docker daemon owns it, not the worker process. A worker crash does not kill
@@ -41,12 +42,20 @@ import java.util.stream.Stream;
  *   cleanupTempDirs()    rm /tmp/jobs/{id}
  * </pre>
  */
-class JobLauncher {
+class JobLauncher implements ContainerInspector {
 
     private static final Logger log = LoggerFactory.getLogger(JobLauncher.class);
 
     // spawn() return code for a successful job (docker exit codes are >= 0).
     static final int EXIT_SUCCESS = 0;
+
+    /**
+     * A container's state as the daemon sees it, read by boot recovery.
+     * RUNNING → re-attach. EXITED → finalize. ABSENT → fail the job.
+     * No exit code here — finalize reads it with `docker wait`, which returns
+     * at once for an exited container.
+     */
+    enum ContainerState { RUNNING, EXITED, ABSENT }
 
     private final ObjectStore objectStore;
     private final String dockerNetwork;
@@ -69,6 +78,11 @@ class JobLauncher {
      * Launches the container detached, follows its logs, and blocks on
      * {@code docker wait} until the container exits. Returns its exit code.
      *
+     * <p>Every docker step here runs the docker CLI as a child OS process of the
+     * worker's JVM. The CLI is only a thin client — it sends one request to the
+     * Docker daemon and streams the answer. The container itself belongs to the
+     * daemon, so a dying worker (and its child CLI processes) never kills the job.
+     *
      * <p>There is no run deadline — a training job may legitimately run for days.
      * A container that goes silent is killed by the {@link JobLivenessMonitor},
      * and cancel/preempt commands stop it via {@link #stopContainer}; both make
@@ -80,17 +94,64 @@ class JobLauncher {
         log.info("Starting job container: {}", String.join(" ", command));
 
         String containerName = "job-" + details.jobId();
+        launchDetached(command, containerName, details.jobId());
 
-        // Step 1: create the container. `docker run -d` pulls the image if absent,
-        // creates the container, and returns — the job has not produced anything
-        // yet at this point. If the pull/create exceeds imagePullTimeout, we give
-        // up and throw; the agent reports the job FAILED / PROCESS_START_FAILED.
-        // No TIMEOUT state is involved — the job never started.
+        Thread logFollower = followLogs(details.jobId(), containerName, logFile);
+        try {
+            return awaitJobTermination(containerName);
+        } finally {
+            // One cleanup for every way out of the wait: flush the last log lines,
+            // then remove the container.
+            finalizeContainer(details.jobId(), logFollower);
+        }
+    }
+
+    /**
+     * Re-attaches to an existing {@code job-{id}} container after a worker
+     * restart and <b>blocks until the job finishes</b> — not just a handle
+     * re-bind. Skips {@code docker run} (the container is already there) and
+     * runs the same watch spawn() uses: log follower + {@code docker wait} +
+     * finalize. Returns the container's exit code. The follower re-reads the
+     * log from the container's start, so stdout.log is complete even though
+     * the old follower died with the worker.
+     */
+    int attachAndWait(String jobId, Path logFile) throws IOException, InterruptedException {
+        String containerName = "job-" + jobId;
+        log.info("Re-attaching to container: {}", containerName);
+        Thread logFollower = followLogs(jobId, containerName, logFile);
+        try {
+            return awaitJobTermination(containerName);
+        } finally {
+            finalizeContainer(jobId, logFollower);
+        }
+    }
+
+    /**
+     * One-shot log salvage for a container recovery found already exited: streams
+     * whatever the daemon still holds into the job's log file (bounded wait — the
+     * follower ends on its own once the exited container's log is drained). Does
+     * <b>not</b> remove the container; the caller removes it after the coordinator
+     * acks the terminal report.
+     */
+    void salvageLogs(String jobId, Path logFile) throws InterruptedException {
+        Thread logFollower = followLogs(jobId, "job-" + jobId, logFile);
+        awaitLogFollower(logFollower, jobId);
+    }
+
+    /**
+     * Step 1: create the container. `docker run -d` pulls the image if absent,
+     * creates the container, and returns — the job has produced nothing yet.
+     * A pull/create past imagePullTimeout throws; the agent reports the job
+     * FAILED / PROCESS_START_FAILED.
+     */
+    private void launchDetached(List<String> command, String containerName, String jobId)
+            throws IOException, InterruptedException {
         Process run = new ProcessBuilder(command).redirectErrorStream(true).start();
+        // waitFor returns false when the timeout ran out and `docker run` still hadn't returned.
         if (!run.waitFor(imagePullTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
             run.destroyForcibly();
             // The daemon may have created the container despite the client dying.
-            removeContainer(details.jobId());
+            removeContainer(jobId);
             throw new IOException("docker run -d did not return within " + imagePullTimeout
                     + " for " + containerName);
         }
@@ -99,37 +160,38 @@ class JobLauncher {
         if (run.exitValue() != 0) {
             throw new IOException("docker run -d failed for " + containerName + ": " + runOutput);
         }
+    }
 
-        Thread logFollower = followLogs(details.jobId(), containerName, logFile);
-
-        // Step 2: block until the container exits. `docker wait` prints the exit
-        // code when the container stops, and returns at once if it already exited.
-        // This wait has no time bound on purpose — a training job may run for days.
-        // It cannot hang forever, because something always makes the container
-        // exit: the job finishing, the liveness monitor killing a silent container,
-        // or a cancel/preempt stopping it. Each of those ends this wait.
+    /**
+     * Step 2: block until the container exits. `docker wait` prints the exit
+     * code when the container stops, and returns at once if it already exited.
+     * This wait has no time bound on purpose — a training job may run for days.
+     * It cannot hang forever, because something always makes the container
+     * exit: the job finishing, the liveness monitor killing a silent container,
+     * or a cancel/preempt stopping it. Each of those ends this wait.
+     */
+    private int awaitJobTermination(String containerName) throws IOException, InterruptedException {
         Process wait = new ProcessBuilder("docker", "wait", containerName)
                 .redirectErrorStream(true)
                 .start();
         wait.waitFor();
 
         String waitOutput = new String(wait.getInputStream().readAllBytes()).trim();
-        int exitCode;
         try {
-            exitCode = Integer.parseInt(waitOutput);
+            int exitCode = Integer.parseInt(waitOutput);
+            log.info("Job container finished: {}, exitCode={}", containerName, exitCode);
+            return exitCode;
         } catch (NumberFormatException e) {
-            finalizeContainer(details.jobId(), logFollower);
             throw new IOException("docker wait returned no exit code for " + containerName + ": " + waitOutput);
         }
-        finalizeContainer(details.jobId(), logFollower);
-        log.info("Job container finished: jobId={}, exitCode={}", details.jobId(), exitCode);
-        return exitCode;
     }
 
     /**
-     * Cleanup shared by every spawn() exit: flush the last log lines (before the
-     * agent uploads stdout.log), then remove the container. Outputs live on the
-     * mounted volume, not inside the container, so removal loses nothing.
+     * Cleanup shared by every spawn() exit. Finalize = flush the last log lines,
+     * then remove. Remove ({@link #removeContainer}) is just `docker rm` — it also
+     * deletes the container's log storage, which is why the flush comes first.
+     * Outputs live on the mounted volume, not inside the container, so removal
+     * loses nothing.
      */
     private void finalizeContainer(String jobId, Thread logFollower) throws InterruptedException {
         awaitLogFollower(logFollower, jobId);
@@ -174,6 +236,56 @@ class JobLauncher {
         if (follower.isAlive()) {
             log.warn("Log follower for jobId={} still running after 10s; abandoning it (daemon thread)", jobId);
         }
+    }
+
+    /**
+     * Inspects {@code job-{id}} and reports its state for boot recovery. Detection
+     * only — it never starts, stops, or re-attaches anything.
+     *
+     * <p>A failed inspect (typically "No such object") means the container is gone
+     * → ABSENT. Transient live states (created, restarting, paused) count as
+     * RUNNING — still daemon-managed, so re-attach can wait on them.
+     */
+    @Override
+    public ContainerState containerState(String jobId) {
+        String containerName = "job-" + jobId;
+        try {
+            Process inspect = new ProcessBuilder("docker", "inspect",
+                    "-f", "{{.State.Status}}", containerName)
+                    .redirectErrorStream(true)
+                    .start();
+            // waitFor returns false when the 10s ran out and inspect still hadn't finished.
+            if (!inspect.waitFor(10, TimeUnit.SECONDS)) {
+                inspect.destroyForcibly();
+                log.warn("docker inspect timed out for {}; treating as absent", containerName);
+                return ContainerState.ABSENT;
+            }
+            String output = new String(inspect.getInputStream().readAllBytes()).trim();
+            if (inspect.exitValue() != 0) {
+                log.info("Container absent on recovery: jobId={}, docker: {}", jobId, output);
+                return ContainerState.ABSENT;
+            }
+            return parseState(jobId, output);
+        } catch (IOException e) {
+            log.warn("docker inspect failed for {}: {}; treating as absent", containerName, e.getMessage());
+            return ContainerState.ABSENT;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted inspecting {}; treating as absent", containerName);
+            return ContainerState.ABSENT;
+        }
+    }
+
+    /** Maps docker's status word (running, exited, ...) to a {@link ContainerState}. */
+    private static ContainerState parseState(String jobId, String status) {
+        return switch (status) {
+            case "running", "created", "restarting", "paused" -> ContainerState.RUNNING;
+            case "exited", "dead" -> ContainerState.EXITED;
+            default -> {
+                log.warn("Unexpected container status for jobId={}: '{}'; treating as running", jobId, status);
+                yield ContainerState.RUNNING;
+            }
+        };
     }
 
     void stageInputFiles(Job job) {
@@ -245,7 +357,12 @@ class JobLauncher {
         }
     }
 
-    private static void removeContainer(String jobId) {
+    /**
+     * `docker rm -f -v`: deletes the container and, with it, the daemon-side log
+     * storage. Anything not yet copied to stdout.log is gone — so callers flush
+     * the log follower first (see {@link #finalizeContainer}).
+     */
+    static void removeContainer(String jobId) {
         String containerName = "job-" + jobId;
         try {
             Process rm = new ProcessBuilder("docker", "rm", "-f", "-v", containerName)

@@ -9,13 +9,13 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class JobLivenessMonitorTest {
 
-    // Null coordinator → the monitor skips the liveness report and only exercises detection.
+    // The monitor is purely local stall detection — it sends nothing to the coordinator.
 
     @Test
     void killsOnStartupTimeout() throws InterruptedException {
         CountDownLatch killed = new CountDownLatch(1);
         JobLivenessMonitor.Config cfg = new JobLivenessMonitor.Config(200, 100, 2, true);
-        JobLivenessMonitor m = new JobLivenessMonitor("j", null, cfg, killed::countDown);
+        JobLivenessMonitor m = new JobLivenessMonitor("j", cfg, killed::countDown);
         m.start();
 
         assertTrue(killed.await(3, TimeUnit.SECONDS), "a container that never pings must be killed");
@@ -27,7 +27,7 @@ class JobLivenessMonitorTest {
     void killsAfterMissedPings() throws InterruptedException {
         CountDownLatch killed = new CountDownLatch(1);
         JobLivenessMonitor.Config cfg = new JobLivenessMonitor.Config(5000, 100, 2, true);
-        JobLivenessMonitor m = new JobLivenessMonitor("j", null, cfg, killed::countDown);
+        JobLivenessMonitor m = new JobLivenessMonitor("j", cfg, killed::countDown);
         m.recordActivity();  // first ping arrived → steady state, then goes silent
         m.start();
 
@@ -39,7 +39,7 @@ class JobLivenessMonitorTest {
     void healthyJobNotKilled() throws InterruptedException {
         CountDownLatch killed = new CountDownLatch(1);
         JobLivenessMonitor.Config cfg = new JobLivenessMonitor.Config(5000, 100, 3, true);
-        JobLivenessMonitor m = new JobLivenessMonitor("j", null, cfg, killed::countDown);
+        JobLivenessMonitor m = new JobLivenessMonitor("j", cfg, killed::countDown);
         m.start();
 
         for (int i = 0; i < 8; i++) {  // keep pinging — stays under maxMissedPings * interval
@@ -55,7 +55,7 @@ class JobLivenessMonitorTest {
     void autoKillDisabled() throws InterruptedException {
         CountDownLatch killed = new CountDownLatch(1);
         JobLivenessMonitor.Config cfg = new JobLivenessMonitor.Config(100, 50, 2, false);
-        JobLivenessMonitor m = new JobLivenessMonitor("j", null, cfg, killed::countDown);
+        JobLivenessMonitor m = new JobLivenessMonitor("j", cfg, killed::countDown);
         m.start();
 
         assertFalse(killed.await(400, TimeUnit.MILLISECONDS), "autoKill=false must never kill");

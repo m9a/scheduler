@@ -62,10 +62,10 @@ public class JobManager {
     // which jobs to fail when a worker dies.
     private final ConcurrentHashMap<String, String> jobWorker = new ConcurrentHashMap<>();
 
-    // jobId -> last-activity epoch millis, reported by the worker (which owns job
+    // jobId -> last-liveness epoch millis, stamped by the worker (which owns job
     // liveness — it sees the SDK's frames and pings). Read by the client API;
     // removed when the job goes terminal.
-    private final ConcurrentHashMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> lastLivenessAt = new ConcurrentHashMap<>();
 
     public JobManager(JobStore store) {
         this.store = store;
@@ -251,7 +251,7 @@ public class JobManager {
         };
         if (JobStates.isTerminal(jobState)) {
             jobWorker.remove(jobId);
-            lastActivityMillis.remove(jobId);
+            lastLivenessAt.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(CoordinatorMetrics.jobStateLabel(jobState)).inc();
         }
         jobs.put(jobId, updated);
@@ -276,7 +276,7 @@ public class JobManager {
      * snapshot. Creates the TaskStatus if telemetry arrives before the first
      * status update — the two travel on separate RPCs, so order isn't guaranteed.
      */
-    public synchronized void handleReport(String jobId, int taskIndex, long timestampMs, List<ReportEntry> entries) {
+    public synchronized void handleReport(String jobId, int taskIndex, long livenessAtMs, List<ReportEntry> entries) {
         CoordinatorMetrics.TELEMETRY_REPORTS.inc();
         JobStatus job = getJob(jobId);
         if (JobStates.isTerminal(job.state())) {
@@ -285,9 +285,9 @@ public class JobManager {
             log.debug("Applying late report to terminal job: jobId={}, taskIndex={}", jobId, taskIndex);
         } else {
             // Every report doubles as a liveness signal. The worker owns liveness
-            // and stamps each Report with last-activity time. Max-wins, because
+            // and stamps each Report with its last-liveness time. Max-wins, because
             // reports can arrive out of order.
-            lastActivityMillis.merge(jobId, timestampMs, Math::max);
+            lastLivenessAt.merge(jobId, livenessAtMs, Math::max);
         }
         // A liveness-only report carries no entries — don't materialize a phantom task.
         if (entries.isEmpty()) {
@@ -298,9 +298,9 @@ public class JobManager {
         task.applyReports(entries);
     }
 
-    /** Last-activity epoch millis for a job, or 0 if none reported. Read by the client API. */
-    public long lastActivity(String jobId) {
-        return lastActivityMillis.getOrDefault(jobId, 0L);
+    /** Last-liveness epoch millis for a job, or 0 if none reported. Read by the client API. */
+    public long lastLivenessAt(String jobId) {
+        return lastLivenessAt.getOrDefault(jobId, 0L);
     }
 
 
@@ -321,7 +321,7 @@ public class JobManager {
             JobStatus job = jobs.get(jobId);
             if (job == null || JobStates.isTerminal(job.state())) {
                 jobWorker.remove(jobId);
-                lastActivityMillis.remove(jobId);
+                lastLivenessAt.remove(jobId);
                 continue;
             }
             // Only the job state changes. An in-progress task keeps its last
@@ -330,7 +330,7 @@ public class JobManager {
             jobs.put(jobId, failed);
             store.save(failed, workerId);  // persist the dead-worker fail
             jobWorker.remove(jobId);
-            lastActivityMillis.remove(jobId);
+            lastLivenessAt.remove(jobId);
             CoordinatorMetrics.JOBS_FINISHED.labels(
                     CoordinatorMetrics.jobStateLabel(JobState.JOB_STATE_FAILED)).inc();
             log.info("Failed job due to dead worker: jobId={}, workerId={}, reason={}",
