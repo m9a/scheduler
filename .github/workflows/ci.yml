@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # IntegrationTest needs a sibling scheduler-sdk checkout + docker-compose
+      # infra (MinIO, Postgres, MLflow, local registry) — excluded here, run locally.
+      # Real-docker tests (JobLauncherTest etc.) run: the runner has Docker.
+      - run: mvn -B test -Dtest='!IntegrationTest' -Dsurefire.failIfNoSpecifiedTests=false
