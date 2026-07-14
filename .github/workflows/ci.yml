@@ -8,12 +8,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: scheduler
+      # Sibling repo: scheduler-worker's tests depend on the scheduler-client jar.
+      - uses: actions/checkout@v4
+        with:
+          repository: m9a/scheduler-sdk
+          path: scheduler-sdk
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
-      # IntegrationTest needs a sibling scheduler-sdk checkout + docker-compose
-      # infra (MinIO, Postgres, MLflow, local registry) — excluded here, run locally.
+      # Bootstrap order matters: Maven resolves a module's full dependency tree
+      # (test scope included) before building it, so scheduler-worker cannot be
+      # built until scheduler-client exists — and scheduler-client needs
+      # scheduler-proto. So: proto only, then client, then the full test run.
+      - name: Install scheduler-proto jar
+        run: mvn -B install -pl scheduler-proto -am -Dmaven.test.skip=true
+        working-directory: scheduler
+      - name: Install scheduler-client jar
+        run: mvn -B install -pl scheduler-client -am -Dmaven.test.skip=true
+        working-directory: scheduler-sdk
+      # IntegrationTest needs docker-compose infra (MinIO, Postgres, MLflow,
+      # local registry) — excluded here, run locally.
       # Real-docker tests (JobLauncherTest etc.) run: the runner has Docker.
-      - run: mvn -B test -Dtest='!IntegrationTest' -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Test
+        run: mvn -B test -Dtest='!IntegrationTest' -Dsurefire.failIfNoSpecifiedTests=false
+        working-directory: scheduler
