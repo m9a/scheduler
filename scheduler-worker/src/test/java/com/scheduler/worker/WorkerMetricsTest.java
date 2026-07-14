@@ -35,17 +35,22 @@ class WorkerMetricsTest {
     @Test
     void testJobLifecycle() {
         WorkerMetrics metrics = new WorkerMetrics(false);
+        // Assert deltas, not absolutes: the collectors live on the JVM-global
+        // default registry, and other tests in the same fork also move them.
+        double runningBefore = sample("scheduler_worker_jobs_running", new String[]{}, new String[]{});
         double completedBefore = sample("scheduler_worker_job_duration_seconds_count",
                 new String[]{"outcome"}, new String[]{"completed"});
 
         metrics.jobStarted("job-m1", "metrics-job");
-        assertEquals(1, CollectorRegistry.defaultRegistry.getSampleValue("scheduler_worker_jobs_running"));
+        assertEquals(runningBefore + 1,
+                CollectorRegistry.defaultRegistry.getSampleValue("scheduler_worker_jobs_running"));
 
         // Sampler would normally set these; set directly to verify cleanup on finish.
         WorkerMetrics.CONTAINER_CPU.labels("job-m1", "metrics-job").set(42);
 
         metrics.jobFinished("job-m1", "metrics-job", "COMPLETED");
-        assertEquals(0, CollectorRegistry.defaultRegistry.getSampleValue("scheduler_worker_jobs_running"));
+        assertEquals(runningBefore,
+                CollectorRegistry.defaultRegistry.getSampleValue("scheduler_worker_jobs_running"));
         assertEquals(completedBefore + 1, sample("scheduler_worker_job_duration_seconds_count",
                 new String[]{"outcome"}, new String[]{"completed"}));
         // Per-job container series removed so finished jobs don't linger.
