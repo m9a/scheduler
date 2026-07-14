@@ -21,8 +21,10 @@ jobs:
           java-version: '21'
           cache: maven
       # Install this repo's jars first — scheduler-client builds against scheduler-proto.
+      # maven.test.skip (not skipTests): test *compilation* already needs the
+      # scheduler-client jar this bootstrap exists to provide.
       - name: Install scheduler jars
-        run: mvn -B install -DskipTests
+        run: mvn -B install -Dmaven.test.skip=true
         working-directory: scheduler
       - name: Install scheduler-client jar
         run: mvn -B install -pl scheduler-client -am -DskipTests
