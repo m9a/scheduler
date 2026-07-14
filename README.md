@@ -515,7 +515,12 @@ There's nothing to "bring up" for SQLite — it's an embedded library, not a ser
 When the worker **process** dies (crash, OOM, upgrade, host reboot), its job containers
 keep running — the Docker daemon owns them, not the worker (see "Job vs container
 lifecycle"). Recovery is how a restarted worker takes those jobs back instead of
-leaking or re-running them. Being built slice by slice; full plan in worker-recovery.md.
+leaking or re-running them.
+
+Worker-side recovery is **implemented**: detached containers, the durable status
+store with coordinator-acked cleanup, boot recovery with re-attach, best-effort
+failure of lost containers, and SDK WebSocket reconnect (sibling repo). Still open:
+coordinator reconciliation after a slow restart. Full plan in worker-recovery.md.
 
 ### Design choices and trade-offs
 
@@ -534,6 +539,13 @@ leaking or re-running them. Being built slice by slice; full plan in worker-reco
 - **The container is the truth.** Recovery trusts `docker inspect`, not the stored
   state: the store says what the job *was* doing, the daemon says what the container
   *is* doing. Decisions come from the live answer.
+- **Rows leave the store only on the coordinator's ack.** One coarse ack per job:
+  when the worker closes the job's `ReportStatus` stream, the coordinator — having
+  applied every update on it, including the terminal one — sends one close-ack
+  response. Only that ack triggers `store.ack(jobId)`, which drops the job's rows.
+  A timeout or a stream error before the ack keeps the rows; the register flush
+  re-delivers them on the next connect. So a job's rows always mean "the
+  coordinator may not have this yet."
 
 ### Boot recovery
 
@@ -560,8 +572,11 @@ worker first re-asserts job RUNNING — the crash may have happened before any t
 update, leaving the coordinator at STARTING. From there the job finishes exactly
 like a normal one: terminal report, output upload, container removal, store ack.
 
-The job's SDK still holds a dead WebSocket to the old worker process; SDK-side
-reconnect is the next slice. Until then a re-attached container reports no liveness.
+The job's SDK notices the dead WebSocket at its next send (a liveness ping at the
+latest) and reconnects — the worker's URL is stable across a restart. Status
+updates queue in the SDK until the worker acks them, so transitions made during
+the gap arrive once the connection is back. See "SDK delivery guarantees" in the
+scheduler-sdk README.
 
 ### Lost containers (`NOT_FOUND_ON_RECOVERY`)
 
