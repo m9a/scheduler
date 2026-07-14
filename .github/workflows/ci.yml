@@ -20,14 +20,15 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      # Install this repo's jars first — scheduler-client builds against scheduler-proto.
-      # maven.test.skip (not skipTests): test *compilation* already needs the
-      # scheduler-client jar this bootstrap exists to provide.
-      - name: Install scheduler jars
-        run: mvn -B install -Dmaven.test.skip=true
+      # Bootstrap order matters: Maven resolves a module's full dependency tree
+      # (test scope included) before building it, so scheduler-worker cannot be
+      # built until scheduler-client exists — and scheduler-client needs
+      # scheduler-proto. So: proto only, then client, then the full test run.
+      - name: Install scheduler-proto jar
+        run: mvn -B install -pl scheduler-proto -am -Dmaven.test.skip=true
         working-directory: scheduler
       - name: Install scheduler-client jar
-        run: mvn -B install -pl scheduler-client -am -DskipTests
+        run: mvn -B install -pl scheduler-client -am -Dmaven.test.skip=true
         working-directory: scheduler-sdk
       # IntegrationTest needs docker-compose infra (MinIO, Postgres, MLflow,
       # local registry) — excluded here, run locally.
