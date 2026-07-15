@@ -34,7 +34,9 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -79,8 +81,9 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                     request.getHostname(), workerId);
         }
         com.scheduler.proto.v1.ResourceRequirements resources = request.getResources();
-        log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, workerId={}",
-                request.getHostname(), resources.getMemoryMb(), resources.getCpuCores(), resources.getGpu(), workerId);
+        log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, workerId={}, knownJobs={}",
+                request.getHostname(), resources.getMemoryMb(), resources.getCpuCores(), resources.getGpu(),
+                workerId, request.getKnownJobsCount());
         workers.register(new WorkerInfo(
                 workerId,
                 request.getHostname(),
@@ -92,8 +95,23 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                 Instant.now()
         ));
 
+        // Reconcile the worker's held jobs. Any job already terminal here was
+        // failed by the heartbeat monitor while the worker was down. Its
+        // container may still run on the worker — tell the worker to kill it.
+        List<String> jobIdsToKill = new ArrayList<>();
+        for (StatusUpdate known : request.getKnownJobsList()) {
+            if (jobManager.isJobTerminal(known.getJobId())) {
+                jobIdsToKill.add(known.getJobId());
+            }
+        }
+        if (!jobIdsToKill.isEmpty()) {
+            log.warn("Register reconciliation for workerId={}: {} of {} held job(s) already terminal — telling the worker to kill: {}",
+                    workerId, jobIdsToKill.size(), request.getKnownJobsCount(), jobIdsToKill);
+        }
+
         responseObserver.onNext(RegisterWorkerResponse.newBuilder()
                 .setWorkerId(workerId)
+                .addAllJobIdsToKill(jobIdsToKill)
                 .build());
         responseObserver.onCompleted();
     }

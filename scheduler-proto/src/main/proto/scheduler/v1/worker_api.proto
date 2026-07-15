@@ -20,6 +20,7 @@ message RegisterWorkerRequest {
 message RegisterWorkerResponse {
   string worker_id = 1;
   repeated string acked_job_ids = 2;
+  repeated string job_ids_to_kill = 3;
 }
 
 // Worker -> Coordinator

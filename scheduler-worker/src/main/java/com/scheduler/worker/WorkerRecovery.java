@@ -15,19 +15,25 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Boot recovery. Runs once before the worker registers. Reads the durable status
- * store, inspects each in-flight job's container, and decides its fate.
+ * Boot recovery. Runs once, before the worker registers.
  *
- * <p>Detection only — {@link WorkerAgent} acts on the decisions after register:
- * re-attach a Running container; fail an Exited or Absent one best-effort
- * (salvage outputs/logs, report NOT_FOUND_ON_RECOVERY).
+ * <ul>
+ *   <li>Reads the durable status store: which jobs was I running?</li>
+ *   <li>Inspects each job's container: is it still there?</li>
+ *   <li>Returns one {@link JobToReconcile} per in-flight job.</li>
+ * </ul>
+ *
+ * <p>Detection only. {@link WorkerAgent} applies the fixed policy after register:
+ * a Running container is re-attached; an Exited or Absent one is failed
+ * best-effort (salvage outputs/logs, report NOT_FOUND_ON_RECOVERY); a job the
+ * coordinator already marked terminal is killed.
  */
 class WorkerRecovery {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerRecovery.class);
 
-    /** One in-flight job and the container state recovery found for it. */
-    record RecoveryDecision(String jobId, ContainerState containerState) {}
+    /** One in-flight job: its last stored state and the container state found on boot. */
+    record JobToReconcile(String jobId, JobState jobState, ContainerState containerState) {}
 
     private final WorkerStatusStore store;
     private final ContainerInspector inspector;
@@ -38,38 +44,47 @@ class WorkerRecovery {
     }
 
     /**
-     * Reads the store and inspects each non-terminal job's container. Returns the
-     * per-job decisions later slices will act on. Terminal rows are left for the
-     * register flush to deliver — recovery ignores them.
+     * Reads the store and inspects each non-terminal job's container. Terminal
+     * rows are skipped: their job already finished and was reported; the rows
+     * only wait for re-delivery + ack (the register flush), not for recovery.
      */
-    List<RecoveryDecision> recover() {
+    List<JobToReconcile> recover() {
         Map<String, JobState> jobStateById = new LinkedHashMap<>();
         for (StatusUpdate u : store.loadAllJobs()) {
-            // The job entry (no task section) carries the authoritative job state.
-            if (u.getTaskState() == TaskState.TASK_STATE_UNSPECIFIED) {
+            if (isJobEntry(u)) {
                 jobStateById.put(u.getJobId(), u.getJobState());
             }
         }
 
-        List<RecoveryDecision> decisions = new ArrayList<>();
+        List<JobToReconcile> jobs = new ArrayList<>();
         for (Map.Entry<String, JobState> entry : jobStateById.entrySet()) {
             if (JobStates.isTerminal(entry.getValue())) {
                 continue;
             }
             String jobId = entry.getKey();
             ContainerState state = inspector.containerState(jobId);
-            logDecision(jobId, entry.getValue(), state);
-            decisions.add(new RecoveryDecision(jobId, state));
+            logFinding(jobId, entry.getValue(), state);
+            jobs.add(new JobToReconcile(jobId, entry.getValue(), state));
         }
 
-        if (decisions.isEmpty()) {
+        if (jobs.isEmpty()) {
             log.info("Boot recovery: no in-flight jobs to recover");
         }
-        return decisions;
+        return jobs;
     }
 
-    /** Logs each decision; the agent acts on all of them after register. */
-    private void logDecision(String jobId, JobState jobState, ContainerState state) {
+    /**
+     * True for a job-entry row. The store holds two row kinds: task entries
+     * (task section set, from SDK updates) and one job entry per job (no task
+     * section — written at claim and at terminal). The job entry carries the
+     * authoritative job state.
+     */
+    private static boolean isJobEntry(StatusUpdate update) {
+        return update.getTaskState() == TaskState.TASK_STATE_UNSPECIFIED;
+    }
+
+    /** Logs what recovery found; the agent acts on it after register. */
+    private void logFinding(String jobId, JobState jobState, ContainerState state) {
         switch (state) {
             case RUNNING ->
                 log.info("Boot recovery: jobId={} (state={}) container running → re-attach after register", jobId, jobState);

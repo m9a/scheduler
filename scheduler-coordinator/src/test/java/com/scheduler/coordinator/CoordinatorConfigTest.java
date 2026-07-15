@@ -40,7 +40,7 @@ class CoordinatorConfigTest {
     void defaults() {
         CoordinatorConfig config = new CoordinatorConfig();
         assertEquals(9090, config.getCoordinator().getPort());
-        assertEquals(15, config.getCoordinator().getHeartbeatTimeoutSeconds());
+        assertEquals(300, config.getCoordinator().getHeartbeatTimeoutSeconds());
         assertEquals(5, config.getCoordinator().getHeartbeatScanIntervalSeconds());
     }
 }

@@ -142,6 +142,21 @@ public class JobManager {
     }
 
     /**
+     * True if the job is already terminal here — used by register reconciliation:
+     * a returning worker must not re-attach a job this coordinator gave up on
+     * (heartbeat loss fails it after {@code heartbeatTimeoutSeconds}). An unknown
+     * id is not "dead" — never tell a worker to discard work on missing data.
+     */
+    public synchronized boolean isJobTerminal(String jobId) {
+        JobStatus job = jobs.get(jobId);
+        if (job == null) {
+            log.warn("Register reconciliation asked about unknown jobId={} — treating as alive", jobId);
+            return false;
+        }
+        return JobStates.isTerminal(job.state());
+    }
+
+    /**
      * Snapshot of all jobs for the read-only HTTP API (UI). Newest first by
      * submission time. A copied list so the HTTP layer never holds the live map.
      */
