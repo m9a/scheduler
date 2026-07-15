@@ -3,7 +3,7 @@ package com.scheduler.worker;
 import com.scheduler.proto.job.StatusUpdate;
 import com.scheduler.proto.v1.JobState;
 import com.scheduler.worker.JobLauncher.ContainerState;
-import com.scheduler.worker.WorkerRecovery.RecoveryDecision;
+import com.scheduler.worker.WorkerRecovery.JobToReconcile;
 import com.scheduler.worker.persistence.InMemoryWorkerStatusStore;
 import org.junit.jupiter.api.Test;
 
@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class WorkerRecoveryTest {
 
-    // Three in-flight jobs get one decision each from their container's state;
+    // Three in-flight jobs get one job each from their container's state;
     // the already-terminal job is skipped.
     @Test
     void recover() {
@@ -35,11 +35,11 @@ class WorkerRecoveryTest {
                 "gone-1", ContainerState.ABSENT);
         WorkerRecovery recovery = new WorkerRecovery(store, byId::get);
 
-        List<RecoveryDecision> decisions = recovery.recover();
+        List<JobToReconcile> jobs = recovery.recover();
 
-        // done-1 is terminal, so it is not among the decisions.
-        Map<String, ContainerState> stateById = decisions.stream()
-                .collect(Collectors.toMap(RecoveryDecision::jobId, RecoveryDecision::containerState));
+        // done-1 is terminal, so it is not among the jobs.
+        Map<String, ContainerState> stateById = jobs.stream()
+                .collect(Collectors.toMap(JobToReconcile::jobId, JobToReconcile::containerState));
         assertEquals(3, stateById.size());
         assertEquals(ContainerState.RUNNING, stateById.get("run-1"));
         assertEquals(ContainerState.EXITED, stateById.get("exit-1"));

@@ -12,7 +12,7 @@ import com.scheduler.proto.v1.TaskState;
 import com.scheduler.proto.worker.JobCommand;
 import com.scheduler.proto.worker.SystemCommand;
 import com.scheduler.worker.JobLauncher.ContainerState;
-import com.scheduler.worker.WorkerRecovery.RecoveryDecision;
+import com.scheduler.worker.WorkerRecovery.JobToReconcile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -33,11 +33,9 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The worker's main agent. It wires the two communication legs together and
- * drives the job lifecycle. The coordinator is a passive state store; it applies
- * whatever this agent sends.
+ * The worker's main agent. It connects the two communication legs and drives
+ * the job lifecycle.
  *
- * <p>Each leg is owned by one class; this class only connects them:
  * <pre>
  *                Job → Worker leg                Worker → Coordinator leg
  *                ────────────────                ────────────────────────
@@ -46,21 +44,37 @@ import java.util.concurrent.TimeUnit;
  *    [0x03] telemetry                │                            │   CoordinatorTelemetryStream (per job)
  *                                    ▼                            │
  *           (status handler stamps job RUNNING) ──► CoordinatorStatusStream (per job)
- *
- *  WorkerAgent also runs the job itself: JobLauncher (docker run + file staging)
- *  and observes it from outside: WorkerMetrics (docker stats → /metrics).
  * </pre>
  *
- * <p><b>Main loop</b> ({@link #run()}): register → pull job → execute → repeat.
- * Per job ({@link #executeJob}): stage inputs → open status stream → wire handler
- * → spawn container → wait → report COMPLETED/FAILED/KILLED → upload outputs.
+ * <p><b>What it owns:</b>
+ * <ul>
+ *   <li>{@link JobCallbackHandler} — receives status/telemetry from job containers.</li>
+ *   <li>{@link CoordinatorClient} — all gRPC to the coordinator.</li>
+ *   <li>{@link JobLauncher} — runs the job: docker run + file staging.</li>
+ *   <li>{@link WorkerMetrics} — observes containers from outside (docker stats → /metrics).</li>
+ *   <li>{@link WorkerStatusStore} — durable copy of every update sent; read back on boot.</li>
+ * </ul>
+ *
+ * <p><b>Boot</b> ({@link #run()}):
+ * <ul>
+ *   <li>Resolve the stable worker id from the checkpoint file.</li>
+ *   <li>Run boot recovery: which jobs was I running, are their containers alive?</li>
+ *   <li>Register with those jobs; the coordinator answers which ones to kill.</li>
+ *   <li>Reconcile: kill, re-attach, or fail each in-flight job.</li>
+ *   <li>Enter the loop: pull job → execute → repeat.</li>
+ * </ul>
+ *
+ * <p><b>Per job</b> ({@link #executeJob}): stage inputs → open streams → wire
+ * handlers → run container → wait → report terminal state → upload outputs.
+ *
+ * <p>The coordinator is a passive state store. It applies what this agent sends.
  */
 public class WorkerAgent implements AutoCloseable, ContainerInspector {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerAgent.class);
 
     // Worker → Coordinator leg: all gRPC to the coordinator goes through this.
-    private final CoordinatorClient coordinator;
+    private final CoordinatorClient coordinatorClient;
 
     // Job → Worker leg: WebSocket server receiving status/telemetry from job containers.
     private final JobCallbackHandler jobCallbacks;
@@ -113,7 +127,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         this.statusStore = statusStore;
         // One retention sweep per boot bounds what a dead coordinator leaves behind.
         statusStore.prune(Duration.ofDays(config.getStatusRetentionDays()));
-        this.coordinator = new CoordinatorClient(
+        this.coordinatorClient = new CoordinatorClient(
                 config.getCoordinator().getHost(), config.getCoordinator().getPort());
         this.checkpointPath = config.getCheckpointPath();
         this.hostname = config.getHostname();
@@ -177,26 +191,27 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         // same id survives restarts, so the coordinator can reconcile our jobs.
         workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
         // Reconcile in-flight jobs against their containers before we register.
-        List<RecoveryDecision> decisions = recovery.recover();
-        // Register with the held jobs; the coordinator answers which of them it
-        // already marked terminal (heartbeat-lost while this worker was down).
-        List<StatusUpdate> knownJobs = decisions.stream()
-                .map(d -> jobUpdate(d.jobId(), d.jobState(), null, null))
+        List<JobToReconcile> jobsToReconcile = recovery.recover();
+        // Register with the held jobs. The coordinator answers with the ones it
+        // already marked terminal (heartbeat lost while this worker was down).
+        // Their containers may still run here — the worker must kill them.
+        List<StatusUpdate> knownJobs = jobsToReconcile.stream()
+                .map(j -> jobUpdate(j.jobId(), j.jobState(), null, null))
                 .toList();
-        Set<String> deadJobIds = coordinator.register(
+        Set<String> jobIdsToKill = coordinatorClient.register(
                 workerId, hostname, memory, cpu, gpu, capabilities, knownJobs);
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
-        coordinator.startHeartbeat(workerId, heartbeatSendIntervalMs);
+        coordinatorClient.startHeartbeat(workerId, heartbeatSendIntervalMs);
         // Open the coordinator → worker push channels (resync/drain, cancel/preempt).
-        coordinator.subscribeSystemCommands(workerId, this::onSystemCommand);
-        coordinator.subscribeJobCommands(workerId, this::onJobCommand);
+        coordinatorClient.subscribeSystemCommands(workerId, this::onSystemCommand);
+        coordinatorClient.subscribeJobCommands(workerId, this::onJobCommand);
         running = true;
         // Act on recovery before pulling new work: a container that survived the
         // restart is still this worker's job — resume watching it first.
-        recoverJobs(decisions, deadJobIds);
+        reconcileJobs(jobsToReconcile, jobIdsToKill);
         while (running) {
-            Optional<Job> job = draining ? Optional.empty() : coordinator.pullJob(workerId);
+            Optional<Job> job = draining ? Optional.empty() : coordinatorClient.pullJob(workerId);
             if (job.isPresent()) {
                 executeJob(job.get());
             } else {
@@ -266,36 +281,41 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
     // ── boot re-attach (recovery decisions) ─────────────────────────────────
 
     /**
-     * Acts on the boot-recovery decisions. A job the coordinator already marked
-     * terminal is discarded first — its container is stopped, never re-attached.
-     * Then: a still-running container is re-attached and watched to the end;
-     * anything else is failed best-effort — the work done so far is salvaged,
-     * never silently re-run.
+     * Applies the recovery policy to each in-flight job. Fixed rules, no choices:
+     * <ul>
+     *   <li>Coordinator marked it terminal → {@link #killJob}. Never re-attach.</li>
+     *   <li>Container running → {@link #recoverJob}: re-attach and watch to the end.</li>
+     *   <li>Container exited or absent → {@link #failLostJob}: salvage, report FAILED.</li>
+     * </ul>
+     * Work done so far is always salvaged. Nothing is ever silently re-run.
      */
-    private void recoverJobs(List<RecoveryDecision> decisions, Set<String> deadJobIds) {
-        for (RecoveryDecision decision : decisions) {
-            if (deadJobIds.contains(decision.jobId())) {
-                discardDeadJob(decision.jobId(), decision.containerState());
+    private void reconcileJobs(List<JobToReconcile> jobsToReconcile, Set<String> jobIdsToKill) {
+        for (JobToReconcile job : jobsToReconcile) {
+            if (jobIdsToKill.contains(job.jobId())) {
+                killJob(job.jobId(), job.containerState());
                 continue;
             }
-            switch (decision.containerState()) {
-                case RUNNING -> recoverJob(decision.jobId());
-                case EXITED, ABSENT -> failLostJob(decision.jobId(), decision.containerState());
+            switch (job.containerState()) {
+                case RUNNING -> recoverJob(job.jobId());
+                case EXITED, ABSENT -> failLostJob(job.jobId(), job.containerState());
             }
         }
     }
 
     /**
-     * Discards a job the coordinator already failed (heartbeat lost — this worker
-     * was down longer than {@code heartbeatTimeoutSeconds}). The job must not be
-     * re-attached or re-asserted: the coordinator's terminal state is final and
-     * the user may have already resubmitted. A running container is stopped, then
-     * the normal lost-job path salvages outputs and logs, so the work done so far
-     * (including the checkpoint) is kept. The coordinator drops the report — it
-     * only exists to draw the close ack that clears the store rows.
+     * Kills a job the coordinator already marked dead (heartbeat lost — this
+     * worker was down past {@code heartbeatTimeoutSeconds}). To this worker the
+     * job looks alive; the coordinator's verdict wins.
+     * <ul>
+     *   <li>Stop the container. The coordinator's terminal state is final; the
+     *       user may have already resubmitted the job.</li>
+     *   <li>Salvage outputs and logs — the checkpoint is kept.</li>
+     *   <li>Report once. The coordinator drops it (job already terminal), but
+     *       its close ack clears this worker's store rows.</li>
+     * </ul>
      */
-    private void discardDeadJob(String jobId, ContainerState state) {
-        log.warn("Job already terminal on the coordinator — discarding, not re-attaching: jobId={}, containerState={}",
+    private void killJob(String jobId, ContainerState state) {
+        log.warn("Job already terminal on the coordinator — killing its container: jobId={}, containerState={}",
                 jobId, state);
         if (state == ContainerState.RUNNING) {
             launcher.stopContainer(jobId);
@@ -340,7 +360,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
 
             // Status-only reporting: no telemetry stream or liveness monitor — the
             // container is not running and its SDK is gone.
-            CoordinatorStatusStream statusStream = coordinator.openStatusStream(jobId);
+            CoordinatorStatusStream statusStream = coordinatorClient.openStatusStream(jobId);
             StatusUpdate terminal = failedUpdate(jobId, FailureReason.FAILURE_REASON_NOT_FOUND_ON_RECOVERY,
                     "container " + (state == ContainerState.EXITED ? "exited" : "absent") + " on worker restart");
             statusStore.update(terminal);
@@ -475,10 +495,10 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         // Fresh per-job state before the container runs.
         currentJobTaskFailed = false;
 
-        CoordinatorStatusStream statusStream = coordinator.openStatusStream(jobId);
+        CoordinatorStatusStream statusStream = coordinatorClient.openStatusStream(jobId);
         onStatusUpdate(update -> relayTaskStatus(statusStream, update));
 
-        CoordinatorTelemetryStream telemetryStream = coordinator.openTelemetryStream(jobId);
+        CoordinatorTelemetryStream telemetryStream = coordinatorClient.openTelemetryStream(jobId);
 
         // KILL PATH 1 — liveness, purely worker-local. Every inbound SDK frame
         // bumps the monitor (via the activity listener); a container silent past
@@ -715,7 +735,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         metrics.stop();
         jobCallbacks.stop();
         log.info("WebSocket server stopped");
-        coordinator.close();
+        coordinatorClient.close();
         statusStore.close();
     }
 

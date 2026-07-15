@@ -517,10 +517,10 @@ keep running — the Docker daemon owns them, not the worker (see "Job vs contai
 lifecycle"). Recovery is how a restarted worker takes those jobs back instead of
 leaking or re-running them.
 
-Worker-side recovery is **implemented**: detached containers, the durable status
-store with coordinator-acked cleanup, boot recovery with re-attach, best-effort
-failure of lost containers, and SDK WebSocket reconnect (sibling repo). Still open:
-coordinator reconciliation after a slow restart. Full plan in worker-recovery.md.
+Recovery is **implemented end to end**: detached containers, the durable status
+store with coordinator-acked cleanup, boot recovery, re-attach, best-effort
+failure of lost containers, SDK WebSocket reconnect (sibling repo), and register
+reconciliation after a slow restart. Full plan in worker-recovery.md.
 
 ### Design choices and trade-offs
 
@@ -537,8 +537,8 @@ coordinator reconciliation after a slow restart. Full plan in worker-recovery.md
   job/task, written through before every send) is what a restarted worker reads to
   know which jobs it owned. No store row → the worker never claimed it.
 - **The container is the truth.** Recovery trusts `docker inspect`, not the stored
-  state: the store says what the job *was* doing, the daemon says what the container
-  *is* doing. Decisions come from the live answer.
+  state. The store says what the job *was* doing. The daemon says what the container
+  *is* doing. The live answer wins.
 - **Rows leave the store only on the coordinator's ack.** One coarse ack per job:
   when the worker closes the job's `ReportStatus` stream, the coordinator — having
   applied every update on it, including the terminal one — sends one close-ack
@@ -549,18 +549,21 @@ coordinator reconciliation after a slow restart. Full plan in worker-recovery.md
 
 ### Boot recovery
 
-On boot, before registering, the worker runs `recover()`: read the status store, and
-for each non-terminal job inspect its container (`ContainerState`):
+On boot, before registering, the worker reads the status store and inspects each
+in-flight job's container. The action per container state is a fixed policy —
+there is nothing to decide:
 
-| Container | Decision |
-|-----------|----------|
+| Container | Action (always) |
+|-----------|-----------------|
 | RUNNING | Re-attach: resume `docker wait`, restart liveness, re-open streams |
 | EXITED | Fail best-effort: salvage logs + outputs, report FAILED / `NOT_FOUND_ON_RECOVERY`, remove the container after the ack |
 | ABSENT | Fail best-effort: salvage leftover outputs, report FAILED / `NOT_FOUND_ON_RECOVERY`, never relaunch |
 
-Terminal rows in the store are skipped — they only wait for the register flush to
-deliver them. Boot order: resolve worker id → `recover()` → register → heartbeat →
-subscribe → re-attach running jobs → pull loop.
+One exception overrides the table: a job the coordinator already marked dead is
+killed, never re-attached (see "Register reconciliation" below).
+
+Boot order: resolve worker id → boot recovery → register → heartbeat →
+subscribe → reconcile in-flight jobs → pull loop.
 
 ### Register reconciliation (slow restart)
 
@@ -569,15 +572,17 @@ the coordinator's monitor failed them as `HEARTBEAT_LOST`. The returning worker
 must not resurrect them.
 
 - At register, the worker sends the jobs it still holds (`known_jobs`).
-- The coordinator answers with `dead_job_ids`: the held jobs it already marked
-  terminal. An unknown job id is never called dead — the coordinator does not
-  tell a worker to discard work on missing data.
-- The worker **discards** each dead job before acting on any recovery decision:
-  a running container is stopped, outputs and logs are salvaged, temp dirs are
-  cleaned. It is never re-attached or re-asserted — the coordinator's verdict is
-  final, and the user may have already resubmitted the job.
-- The discard report is dropped by the coordinator (the job is terminal); it
-  exists to draw the close ack that clears the worker's store rows.
+- The coordinator answers with `job_ids_to_kill`: held jobs it already marked
+  terminal. Their containers may still run on the worker — the worker kills them.
+- An unknown job id is never in the kill list. The coordinator does not tell a
+  worker to destroy work based on missing data.
+- The worker kills each such job before anything else: stop the container,
+  salvage outputs and logs (the checkpoint survives), clean temp dirs. It is
+  never re-attached — the coordinator's verdict is final, and the user may have
+  already resubmitted the job.
+- The worker still sends one terminal report for the killed job. The coordinator
+  drops it (the job is already terminal there), but it acks the stream close —
+  and that ack is what clears the worker's store rows.
 
 The default `heartbeatTimeoutSeconds` is 300 — deliberately generous, so a
 worker upgrade or host reboot re-attaches instead of losing jobs. This mirrors
@@ -586,19 +591,26 @@ dead → fence the orphan.
 
 ### Re-attach
 
-A RUNNING decision re-runs the same per-job wiring a fresh job gets, minus staging
-and `docker run`: re-open the status and telemetry streams, start a fresh liveness
-monitor (its startup window gives the briefly-unwatched container time to ping
-again), rebind the WebSocket handlers, and block on `docker wait job-{id}`. The
-worker first re-asserts job RUNNING — the crash may have happened before any task
-update, leaving the coordinator at STARTING. From there the job finishes exactly
-like a normal one: terminal report, output upload, container removal, store ack.
+Re-attach is the fixed policy for a running container. It re-runs the same
+per-job wiring a fresh job gets, minus staging and `docker run`:
 
-The job's SDK notices the dead WebSocket at its next send (a liveness ping at the
-latest) and reconnects — the worker's URL is stable across a restart. Status
-updates queue in the SDK until the worker acks them, so transitions made during
-the gap arrive once the connection is back. See "SDK delivery guarantees" in the
-scheduler-sdk README.
+- Re-open the status and telemetry streams to the coordinator.
+- Start a fresh liveness monitor. Its startup window gives the briefly-unwatched
+  container time to ping again.
+- Rebind the WebSocket handlers for the job's SDK.
+- Send one job-RUNNING update. This is the job's true current state — the
+  container is running and the worker owns job state; it is not a synthetic
+  fill-in. It matters when the worker crashed before any task reported, leaving
+  the coordinator at STARTING: the state machine has no STARTING → COMPLETED
+  edge, so without this update the job could never finish. A coordinator
+  already at RUNNING de-dupes it. Kept deliberately.
+- Block on `docker wait job-{id}`. From here the job finishes like a normal one:
+  terminal report, output upload, container removal, store ack.
+
+The job's SDK notices the dead WebSocket at its next send (a liveness ping at
+the latest) and reconnects — the worker's URL is stable across a restart. Status
+updates queue in the SDK until the worker acks them. See "SDK delivery
+guarantees" in the scheduler-sdk README.
 
 ### Lost containers (`NOT_FOUND_ON_RECOVERY`)
 
@@ -622,6 +634,34 @@ All the scenarios that land here:
 TODO (TODO.md #24): differentiate these scenarios and recover the real outcome
 (read the exit code for `EXITED`; persist the terminal state before container
 removal) instead of the coarse FAILED.
+
+### What recovery covers, and known gaps
+
+Covered today:
+
+- **Worker restart inside the heartbeat timeout.** The coordinator never noticed.
+  The worker re-registers, its jobs come back alive, and it re-attaches running
+  containers. Exited/absent ones take the lost-container path.
+- **Worker restart past the heartbeat timeout.** The coordinator already failed
+  the jobs (`HEARTBEAT_LOST`). Register reconciliation tells the worker which
+  jobs to kill; work done so far is salvaged, nothing is resurrected.
+
+Known gaps (deliberate, for now):
+
+- **Network partition with both sides alive.** The worker's heartbeats stop
+  arriving, so the coordinator fails its jobs — but the worker never restarts,
+  so reconciliation never runs. Today: the worker keeps running the job to
+  completion; its later updates are dropped (job already terminal); its store
+  rows wait for the next restart. Our clusters are small and sit on one VPN, so
+  a partition that outlasts the timeout is rare — not handled for now.
+  TODO: reconcile on heartbeat resume (coordinator pushes a kill when a "lost"
+  worker's heartbeats return).
+- **Worker dies before receiving the ack.** The worker reported a job's terminal
+  state, but crashed before the coordinator's close ack arrived. The rows stay
+  in the store (correct — the ack never came), but re-delivering them at
+  register (the "register flush", via `known_jobs` / `acked_job_ids`) is not
+  wired yet. Today those rows sit until the retention sweep prunes them. This is
+  the next planned slice.
 
 ## Input/Output Files
 

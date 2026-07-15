@@ -76,10 +76,10 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     /**
-     * Registers this worker (with its own stable id, resources, and the jobs it
-     * still holds from before a restart). Returns the ids of held jobs the
-     * coordinator has already marked terminal — the worker must discard those
-     * (kill + salvage), never re-attach them.
+     * Registers this worker: stable id, resources, and the jobs it still holds
+     * from before a restart. Returns the ids the worker must kill — the
+     * coordinator already marked those jobs dead (heartbeat lost), but their
+     * containers may still run here.
      */
     Set<String> register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu,
                          Set<String> capabilities, List<StatusUpdate> knownJobs) {
@@ -96,10 +96,10 @@ class CoordinatorClient implements AutoCloseable {
                         .addAllCapabilities(capabilities))
                 .addAllKnownJobs(knownJobs)
                 .build());
-        Set<String> deadJobIds = new HashSet<>(response.getDeadJobIdsList());
+        Set<String> jobIdsToKill = new HashSet<>(response.getJobIdsToKillList());
         log.info("Registered with coordinator: workerId={}{}", response.getWorkerId(),
-                deadJobIds.isEmpty() ? "" : ", deadJobs=" + deadJobIds);
-        return deadJobIds;
+                jobIdsToKill.isEmpty() ? "" : ", jobsToKill=" + jobIdsToKill);
+        return jobIdsToKill;
     }
 
     Optional<Job> pullJob(String workerId) {

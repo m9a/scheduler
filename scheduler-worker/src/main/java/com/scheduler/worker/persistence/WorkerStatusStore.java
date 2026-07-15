@@ -24,10 +24,15 @@ public interface WorkerStatusStore extends AutoCloseable {
     void update(StatusUpdate update);
 
     /**
-     * All persisted updates, rebuilt as {@link StatusUpdate}s — the
-     * {@code known_jobs} payload sent on register. Per job, task entries come
-     * before the job entry, so task state lands before a terminal update trips
-     * the coordinator's already-terminal guard.
+     * All persisted updates, rebuilt as {@link StatusUpdate}s.
+     * <ul>
+     *   <li>Read on boot: recovery learns which jobs this worker was running.</li>
+     *   <li>Ordering rule: per job, task rows come before the job row.</li>
+     * </ul>
+     * Why the ordering: these rows may be replayed to the coordinator. The
+     * coordinator refuses any update for a job it already has as terminal. If a
+     * terminal job row were replayed first, the job would go terminal and the
+     * task rows behind it would be refused. Tasks first, then the job row.
      */
     List<StatusUpdate> loadAllJobs();
 

@@ -95,23 +95,23 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                 Instant.now()
         ));
 
-        // Reconcile the worker's held jobs: any that are already terminal here
-        // (heartbeat-lost while the worker was down) go back as dead_job_ids so
-        // the worker discards them instead of re-attaching.
-        List<String> deadJobIds = new ArrayList<>();
+        // Reconcile the worker's held jobs. Any job already terminal here was
+        // failed by the heartbeat monitor while the worker was down. Its
+        // container may still run on the worker — tell the worker to kill it.
+        List<String> jobIdsToKill = new ArrayList<>();
         for (StatusUpdate known : request.getKnownJobsList()) {
             if (jobManager.isJobTerminal(known.getJobId())) {
-                deadJobIds.add(known.getJobId());
+                jobIdsToKill.add(known.getJobId());
             }
         }
-        if (!deadJobIds.isEmpty()) {
-            log.warn("Register reconciliation for workerId={}: {} of {} held job(s) already terminal: {}",
-                    workerId, deadJobIds.size(), request.getKnownJobsCount(), deadJobIds);
+        if (!jobIdsToKill.isEmpty()) {
+            log.warn("Register reconciliation for workerId={}: {} of {} held job(s) already terminal — telling the worker to kill: {}",
+                    workerId, jobIdsToKill.size(), request.getKnownJobsCount(), jobIdsToKill);
         }
 
         responseObserver.onNext(RegisterWorkerResponse.newBuilder()
                 .setWorkerId(workerId)
-                .addAllDeadJobIds(deadJobIds)
+                .addAllJobIdsToKill(jobIdsToKill)
                 .build());
         responseObserver.onCompleted();
     }
