@@ -344,7 +344,7 @@ predicted, so nothing caps it. The guards below watch behavior instead.
 | Job startup | worker `liveness.startupTimeoutSeconds` (30 s) | First SDK activity after launch | JobLivenessMonitor (worker) | Gracefully stop the container (when `autoKill`) | STARTING/RUNNING → KILLED (`UNRESPONSIVE`) |
 | Job silence | worker `liveness.maxMissedPings` × `pingIntervalSeconds` (3 × 15 s = 45 s) | SDK activity after the first frame | JobLivenessMonitor (worker) | Gracefully stop the container (when `autoKill`) | RUNNING → KILLED (`UNRESPONSIVE`) |
 | Stop grace | worker `liveness.shutdownGraceSeconds` (10 s) | SIGTERM → SIGKILL window inside any graceful stop | Docker (told by JobLauncher) | Force kill | none — part of the stop |
-| Worker silence | coordinator `heartbeatTimeoutSeconds` (15 s) | Time since the worker's last heartbeat | Heartbeat monitor (coordinator) | Evict the worker. Fail its jobs. The container is not killed — it keeps running, unwatched. | RUNNING → FAILED (`HEARTBEAT_LOST`) |
+| Worker silence | coordinator `heartbeatTimeoutSeconds` (300 s) | Time since the worker's last heartbeat | Heartbeat monitor (coordinator) | Evict the worker. Fail its jobs. The container is not killed — it keeps running, unwatched. | RUNNING → FAILED (`HEARTBEAT_LOST`) |
 | Boot grace | coordinator `reregistrationTimeoutSeconds` (30 s) | Time workers get to re-register after a coordinator restart | Heartbeat monitor (coordinator) | Sweeps begin | none |
 
 One missed heartbeat changes nothing. Silence is what counts: ~3 consecutive
@@ -420,7 +420,7 @@ Two triggers can end a running container. One is worker-driven (it owns the job)
 | Trigger | Detected by | Config (default) | Action | Status propagated |
 |---------|-------------|------------------|--------|-------------------|
 | **Job stall** (unresponsive) | Worker — `JobLivenessMonitor` | `liveness.startupTimeoutSeconds` (30), `pingIntervalSeconds` (15), `maxMissedPings` (3), `shutdownGraceSeconds` (10), `autoKill` (true) | Graceful container stop | `KILLED` / `UNRESPONSIVE` |
-| **Worker dead** (heartbeat lost) | Coordinator — heartbeat monitor | worker `heartbeatIntervalSeconds` (5); coordinator `heartbeatTimeoutSeconds` (15), `heartbeatScanIntervalSeconds` (5) | No container kill — worker is gone | job `FAILED` / `HEARTBEAT_LOST` |
+| **Worker dead** (heartbeat lost) | Coordinator — heartbeat monitor | worker `heartbeatIntervalSeconds` (5); coordinator `heartbeatTimeoutSeconds` (300), `heartbeatScanIntervalSeconds` (5) | No container kill — worker is gone | job `FAILED` / `HEARTBEAT_LOST` |
 
 The worker-dead case never kills a container (the coordinator can't reach it) — it only fails the job state.
 
@@ -561,6 +561,28 @@ for each non-terminal job inspect its container (`ContainerState`):
 Terminal rows in the store are skipped — they only wait for the register flush to
 deliver them. Boot order: resolve worker id → `recover()` → register → heartbeat →
 subscribe → re-attach running jobs → pull loop.
+
+### Register reconciliation (slow restart)
+
+A worker down longer than `heartbeatTimeoutSeconds` has already lost its jobs:
+the coordinator's monitor failed them as `HEARTBEAT_LOST`. The returning worker
+must not resurrect them.
+
+- At register, the worker sends the jobs it still holds (`known_jobs`).
+- The coordinator answers with `dead_job_ids`: the held jobs it already marked
+  terminal. An unknown job id is never called dead — the coordinator does not
+  tell a worker to discard work on missing data.
+- The worker **discards** each dead job before acting on any recovery decision:
+  a running container is stopped, outputs and logs are salvaged, temp dirs are
+  cleaned. It is never re-attached or re-asserted — the coordinator's verdict is
+  final, and the user may have already resubmitted the job.
+- The discard report is dropped by the coordinator (the job is terminal); it
+  exists to draw the close ack that clears the worker's store rows.
+
+The default `heartbeatTimeoutSeconds` is 300 — deliberately generous, so a
+worker upgrade or host reboot re-attaches instead of losing jobs. This mirrors
+what Kubernetes and YARN do: short outage → work-preserving recovery; declared
+dead → fence the orphan.
 
 ### Re-attach
 

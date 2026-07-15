@@ -39,7 +39,9 @@ public class CoordinatorConfig {
         private String uiDir = "";
         // SQLite file mirroring job state for restart recovery.
         private String dbPath = "scheduler.db";
-        private int heartbeatTimeoutSeconds = 15;
+        // Generous by design: a worker upgrade or host reboot must not fail its
+        // jobs. Register reconciliation cleans up if the timeout does fire.
+        private int heartbeatTimeoutSeconds = 300;
         private int heartbeatScanIntervalSeconds = 5;
         // After a restart, hold the heartbeat monitor this long so re-registering
         // workers aren't evicted (and their in-flight jobs failed) before they reconnect.

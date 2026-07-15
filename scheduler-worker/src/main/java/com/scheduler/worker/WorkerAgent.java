@@ -178,7 +178,13 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
         // Reconcile in-flight jobs against their containers before we register.
         List<RecoveryDecision> decisions = recovery.recover();
-        coordinator.register(workerId, hostname, memory, cpu, gpu, capabilities);
+        // Register with the held jobs; the coordinator answers which of them it
+        // already marked terminal (heartbeat-lost while this worker was down).
+        List<StatusUpdate> knownJobs = decisions.stream()
+                .map(d -> jobUpdate(d.jobId(), d.jobState(), null, null))
+                .toList();
+        Set<String> deadJobIds = coordinator.register(
+                workerId, hostname, memory, cpu, gpu, capabilities, knownJobs);
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
         coordinator.startHeartbeat(workerId, heartbeatSendIntervalMs);
@@ -188,7 +194,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         running = true;
         // Act on recovery before pulling new work: a container that survived the
         // restart is still this worker's job — resume watching it first.
-        recoverJobs(decisions);
+        recoverJobs(decisions, deadJobIds);
         while (running) {
             Optional<Job> job = draining ? Optional.empty() : coordinator.pullJob(workerId);
             if (job.isPresent()) {
@@ -260,17 +266,42 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
     // ── boot re-attach (recovery decisions) ─────────────────────────────────
 
     /**
-     * Acts on the boot-recovery decisions. A still-running container is re-attached
-     * and watched to the end; anything else is failed best-effort — the work done
-     * so far is salvaged, never silently re-run.
+     * Acts on the boot-recovery decisions. A job the coordinator already marked
+     * terminal is discarded first — its container is stopped, never re-attached.
+     * Then: a still-running container is re-attached and watched to the end;
+     * anything else is failed best-effort — the work done so far is salvaged,
+     * never silently re-run.
      */
-    private void recoverJobs(List<RecoveryDecision> decisions) {
+    private void recoverJobs(List<RecoveryDecision> decisions, Set<String> deadJobIds) {
         for (RecoveryDecision decision : decisions) {
+            if (deadJobIds.contains(decision.jobId())) {
+                discardDeadJob(decision.jobId(), decision.containerState());
+                continue;
+            }
             switch (decision.containerState()) {
                 case RUNNING -> recoverJob(decision.jobId());
                 case EXITED, ABSENT -> failLostJob(decision.jobId(), decision.containerState());
             }
         }
+    }
+
+    /**
+     * Discards a job the coordinator already failed (heartbeat lost — this worker
+     * was down longer than {@code heartbeatTimeoutSeconds}). The job must not be
+     * re-attached or re-asserted: the coordinator's terminal state is final and
+     * the user may have already resubmitted. A running container is stopped, then
+     * the normal lost-job path salvages outputs and logs, so the work done so far
+     * (including the checkpoint) is kept. The coordinator drops the report — it
+     * only exists to draw the close ack that clears the store rows.
+     */
+    private void discardDeadJob(String jobId, ContainerState state) {
+        log.warn("Job already terminal on the coordinator — discarding, not re-attaching: jobId={}, containerState={}",
+                jobId, state);
+        if (state == ContainerState.RUNNING) {
+            launcher.stopContainer(jobId);
+            state = ContainerState.EXITED;  // stopped just now; logs are salvageable
+        }
+        failLostJob(jobId, state);
     }
 
     /**

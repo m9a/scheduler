@@ -21,6 +21,8 @@ import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -73,10 +75,16 @@ class CoordinatorClient implements AutoCloseable {
         this.asyncStub = WorkerServiceGrpc.newStub(channel);
     }
 
-    /** Registers this worker (with its own stable id) and resources; returns the id the coordinator acked. */
-    String register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu, Set<String> capabilities) {
-        log.info("Registering with coordinator: workerId={}, hostname={}, memory={}, cpu={}, gpu={}, capabilities={}",
-                workerId, hostname, memoryMb, cpuCores, gpu, capabilities);
+    /**
+     * Registers this worker (with its own stable id, resources, and the jobs it
+     * still holds from before a restart). Returns the ids of held jobs the
+     * coordinator has already marked terminal — the worker must discard those
+     * (kill + salvage), never re-attach them.
+     */
+    Set<String> register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu,
+                         Set<String> capabilities, List<StatusUpdate> knownJobs) {
+        log.info("Registering with coordinator: workerId={}, hostname={}, memory={}, cpu={}, gpu={}, capabilities={}, knownJobs={}",
+                workerId, hostname, memoryMb, cpuCores, gpu, capabilities, knownJobs.size());
         RegisterWorkerResponse response = blockingStub.registerWorker(RegisterWorkerRequest.newBuilder()
                 .setWorkerId(workerId)
                 .setHostname(hostname)
@@ -86,9 +94,12 @@ class CoordinatorClient implements AutoCloseable {
                         .setCpuCores(cpuCores)
                         .setGpu(gpu)
                         .addAllCapabilities(capabilities))
+                .addAllKnownJobs(knownJobs)
                 .build());
-        log.info("Registered with coordinator: workerId={}", response.getWorkerId());
-        return response.getWorkerId();
+        Set<String> deadJobIds = new HashSet<>(response.getDeadJobIdsList());
+        log.info("Registered with coordinator: workerId={}{}", response.getWorkerId(),
+                deadJobIds.isEmpty() ? "" : ", deadJobs=" + deadJobIds);
+        return deadJobIds;
     }
 
     Optional<Job> pullJob(String workerId) {

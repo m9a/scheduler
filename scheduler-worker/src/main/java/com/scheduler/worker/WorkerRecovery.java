@@ -26,8 +26,8 @@ class WorkerRecovery {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerRecovery.class);
 
-    /** One in-flight job and the container state recovery found for it. */
-    record RecoveryDecision(String jobId, ContainerState containerState) {}
+    /** One in-flight job: its last stored state and the container state recovery found. */
+    record RecoveryDecision(String jobId, JobState jobState, ContainerState containerState) {}
 
     private final WorkerStatusStore store;
     private final ContainerInspector inspector;
@@ -59,7 +59,7 @@ class WorkerRecovery {
             String jobId = entry.getKey();
             ContainerState state = inspector.containerState(jobId);
             logDecision(jobId, entry.getValue(), state);
-            decisions.add(new RecoveryDecision(jobId, state));
+            decisions.add(new RecoveryDecision(jobId, entry.getValue(), state));
         }
 
         if (decisions.isEmpty()) {

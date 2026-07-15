@@ -94,13 +94,14 @@ class WorkerJobLifecycleTest {
     private Server server;
     private ManagedChannel clientChannel;
     private ClientServiceGrpc.ClientServiceBlockingStub clientStub;
+    private JobManager jobManager;
     private WorkerHandler workerHandler;
     private TestableWorkerAgent worker;
     private Thread workerThread;
 
     @BeforeEach
     void setUp() throws Exception {
-        JobManager jobManager = TestJobManager.create();
+        jobManager = TestJobManager.create();
         workerHandler = TestJobManager.workerHandler(jobManager);
 
         server = ServerBuilder.forPort(0)
@@ -424,6 +425,47 @@ class WorkerJobLifecycleTest {
         assertEquals(JobState.JOB_STATE_FAILED, job.getState());
         assertEquals(FailureReason.FAILURE_REASON_NOT_FOUND_ON_RECOVERY, job.getFailureReason());
         assertEquals("container exited on worker restart", job.getFailureDetail());
+    }
+
+    // Worker dies mid-job for longer than the heartbeat timeout, so the coordinator
+    // already failed the job (HEARTBEAT_LOST). The restarted worker must discard it:
+    // container stopped, no re-attach, coordinator verdict untouched, rows dropped.
+    @Test
+    void deadOnRecovery() throws Exception {
+        CountDownLatch claimed = new CountDownLatch(1);
+        CountDownLatch blockForever = new CountDownLatch(1);
+        worker.setSpawnBehavior((details, url) -> {
+            claimed.countDown();
+            blockForever.await();
+            return 0;
+        });
+
+        String jobId = submitJob("dead-on-recovery");
+        startWorker();
+        assertTrue(claimed.await(10, TimeUnit.SECONDS), "job should be claimed");
+        awaitTrue(() -> !worker.statusStore.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "job entry should be persisted before the crash");
+        String workerId = awaitWorkerId();
+
+        InMemoryWorkerStatusStore store = worker.statusStore;
+        worker.close();
+        // The heartbeat monitor's action, applied directly: the worker is gone too long.
+        jobManager.failJobsForWorker(workerId, FailureReason.FAILURE_REASON_HEARTBEAT_LOST);
+
+        worker = new TestableWorkerAgent(testConfig(server.getPort()), store);
+        // The container survived the worker — but the job is dead on the coordinator,
+        // so it must be discarded, not re-attached (no attach behavior is set: a
+        // re-attach attempt would NPE and fail the test).
+        worker.containerStateStub = JobLauncher.ContainerState.RUNNING;
+        worker.setSpawnBehavior((details, url) -> 0);
+        startWorker();
+
+        awaitTrue(() -> store.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "close ack should drop the dead job's rows");
+        Job job = pollUntilTerminal(jobId, 5, TimeUnit.SECONDS);
+        assertEquals(JobState.JOB_STATE_FAILED, job.getState());
+        assertEquals(FailureReason.FAILURE_REASON_HEARTBEAT_LOST, job.getFailureReason(),
+                "the coordinator's verdict must not be overwritten by the discard report");
     }
 
     /**

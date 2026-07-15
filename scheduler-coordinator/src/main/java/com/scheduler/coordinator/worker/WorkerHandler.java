@@ -34,7 +34,9 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -79,8 +81,9 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                     request.getHostname(), workerId);
         }
         com.scheduler.proto.v1.ResourceRequirements resources = request.getResources();
-        log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, workerId={}",
-                request.getHostname(), resources.getMemoryMb(), resources.getCpuCores(), resources.getGpu(), workerId);
+        log.info("Received registerWorker from hostname={}, memoryMb={}, cpuCores={}, gpu={}, workerId={}, knownJobs={}",
+                request.getHostname(), resources.getMemoryMb(), resources.getCpuCores(), resources.getGpu(),
+                workerId, request.getKnownJobsCount());
         workers.register(new WorkerInfo(
                 workerId,
                 request.getHostname(),
@@ -92,8 +95,23 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                 Instant.now()
         ));
 
+        // Reconcile the worker's held jobs: any that are already terminal here
+        // (heartbeat-lost while the worker was down) go back as dead_job_ids so
+        // the worker discards them instead of re-attaching.
+        List<String> deadJobIds = new ArrayList<>();
+        for (StatusUpdate known : request.getKnownJobsList()) {
+            if (jobManager.isJobTerminal(known.getJobId())) {
+                deadJobIds.add(known.getJobId());
+            }
+        }
+        if (!deadJobIds.isEmpty()) {
+            log.warn("Register reconciliation for workerId={}: {} of {} held job(s) already terminal: {}",
+                    workerId, deadJobIds.size(), request.getKnownJobsCount(), deadJobIds);
+        }
+
         responseObserver.onNext(RegisterWorkerResponse.newBuilder()
                 .setWorkerId(workerId)
+                .addAllDeadJobIds(deadJobIds)
                 .build());
         responseObserver.onCompleted();
     }
