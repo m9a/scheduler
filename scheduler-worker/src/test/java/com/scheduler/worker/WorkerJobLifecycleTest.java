@@ -468,6 +468,51 @@ class WorkerJobLifecycleTest {
                 "the coordinator's verdict must not be overwritten by the discard report");
     }
 
+    // Worker reported the job terminal but died before the coordinator's ack, so
+    // the rows stayed in the store. On restart the register flush delivers them:
+    // the coordinator records the task then the terminal job state, acks, and the
+    // worker drops the rows. Nothing is killed or re-attached.
+    @Test
+    void registerFlush() throws Exception {
+        CountDownLatch claimed = new CountDownLatch(1);
+        CountDownLatch blockForever = new CountDownLatch(1);
+        worker.setSpawnBehavior((details, url) -> {
+            claimed.countDown();
+            blockForever.await();
+            return 0;
+        });
+
+        String jobId = submitJob("register-flush");
+        startWorker();
+        assertTrue(claimed.await(10, TimeUnit.SECONDS), "job should be claimed");
+        awaitTrue(() -> !worker.statusStore.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "job entry should be persisted before the crash");
+
+        InMemoryWorkerStatusStore store = worker.statusStore;
+        worker.close();
+
+        // Simulate "reported terminal, ack lost": write what the worker would
+        // have written — the task row, then the terminal job row.
+        store.update(StatusUpdate.newBuilder()
+                .setJobId(jobId).setJobState(JobState.JOB_STATE_RUNNING)
+                .setTaskIndex(0).setTaskName("extract")
+                .setTaskState(TaskState.TASK_STATE_COMPLETED).build());
+        store.update(StatusUpdate.newBuilder()
+                .setJobId(jobId).setJobState(JobState.JOB_STATE_COMPLETED).build());
+
+        worker = new TestableWorkerAgent(testConfig(server.getPort()), store);
+        worker.setSpawnBehavior((details, url) -> 0);
+        startWorker();
+
+        awaitTrue(() -> store.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
+                "register-flush ack should drop the job's rows");
+        Job job = pollUntilTerminal(jobId, 5, TimeUnit.SECONDS);
+        assertEquals(JobState.JOB_STATE_COMPLETED, job.getState(),
+                "the flushed terminal state must be recorded, not re-derived");
+        assertEquals(TaskState.TASK_STATE_COMPLETED, job.getTasks(0).getState(),
+                "the flushed task state must land before the terminal job row");
+    }
+
     /**
      * Shared crash-and-restart scaffold: worker 1 claims a job and dies mid-run;
      * worker 2 boots on the same store with the stubbed container state. Returns

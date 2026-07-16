@@ -65,6 +65,11 @@ PENDING → RUNNING → COMPLETED
 | COMPLETED | sdk | method returned normally |
 | FAILED | sdk | method threw/raised (carries the error) |
 
+One extra edge exists for replay: PENDING → COMPLETED. The worker's status
+store keeps only a task's latest state, so a register flush after a worker
+crash may deliver a task already completed — the RUNNING step happened live
+but was never seen here.
+
 A task is only ever advanced by the SDK. If the container dies (crash, kill, or
 dead worker) while a task is mid-execution, that task keeps its **last reported
 state** (typically RUNNING) — only the job goes terminal. Tasks that never
@@ -562,8 +567,9 @@ there is nothing to decide:
 One exception overrides the table: a job the coordinator already marked dead is
 killed, never re-attached (see "Register reconciliation" below).
 
-Boot order: resolve worker id → boot recovery → register → heartbeat →
-subscribe → reconcile in-flight jobs → pull loop.
+Boot order: resolve worker id → boot recovery → register (flushing all stored
+rows) → drop acked rows → heartbeat → subscribe → reconcile in-flight jobs →
+pull loop.
 
 ### Register reconciliation (slow restart)
 
@@ -645,6 +651,11 @@ Covered today:
 - **Worker restart past the heartbeat timeout.** The coordinator already failed
   the jobs (`HEARTBEAT_LOST`). Register reconciliation tells the worker which
   jobs to kill; work done so far is salvaged, nothing is resurrected.
+- **Worker dies before receiving the ack.** The job's rows stay in the store
+  (correct — the ack never came). The next register flushes them: the
+  coordinator ingests what it missed, answers `acked_job_ids`, and the worker
+  drops exactly those rows. A job that finished during the outage is recorded
+  with its real outcome instead of being failed.
 
 Known gaps (deliberate, for now):
 
@@ -656,12 +667,6 @@ Known gaps (deliberate, for now):
   a partition that outlasts the timeout is rare — not handled for now.
   TODO: reconcile on heartbeat resume (coordinator pushes a kill when a "lost"
   worker's heartbeats return).
-- **Worker dies before receiving the ack.** The worker reported a job's terminal
-  state, but crashed before the coordinator's close ack arrived. The rows stay
-  in the store (correct — the ack never came), but re-delivering them at
-  register (the "register flush", via `known_jobs` / `acked_job_ids`) is not
-  wired yet. Today those rows sit until the retention sweep prunes them. This is
-  the next planned slice.
 
 ## Input/Output Files
 

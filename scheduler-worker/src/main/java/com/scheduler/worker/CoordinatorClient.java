@@ -75,14 +75,21 @@ class CoordinatorClient implements AutoCloseable {
         this.asyncStub = WorkerServiceGrpc.newStub(channel);
     }
 
+    /** What the coordinator answered at register. */
+    record RegisterResult(Set<String> jobIdsToKill, Set<String> ackedJobIds) {}
+
     /**
-     * Registers this worker: stable id, resources, and the jobs it still holds
-     * from before a restart. Returns the ids the worker must kill — the
-     * coordinator already marked those jobs dead (heartbeat lost), but their
-     * containers may still run here.
+     * Registers this worker: stable id, resources, and every stored status row
+     * (the register flush). The coordinator ingests what it missed and answers:
+     * <ul>
+     *   <li>{@code jobIdsToKill} — jobs it already marked dead (heartbeat lost);
+     *       their containers may still run here and must be killed.</li>
+     *   <li>{@code ackedJobIds} — flushed terminal jobs it has now recorded;
+     *       the worker drops their rows.</li>
+     * </ul>
      */
-    Set<String> register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu,
-                         Set<String> capabilities, List<StatusUpdate> knownJobs) {
+    RegisterResult register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu,
+                            Set<String> capabilities, List<StatusUpdate> knownJobs) {
         log.info("Registering with coordinator: workerId={}, hostname={}, memory={}, cpu={}, gpu={}, capabilities={}, knownJobs={}",
                 workerId, hostname, memoryMb, cpuCores, gpu, capabilities, knownJobs.size());
         RegisterWorkerResponse response = blockingStub.registerWorker(RegisterWorkerRequest.newBuilder()
@@ -97,9 +104,11 @@ class CoordinatorClient implements AutoCloseable {
                 .addAllKnownJobs(knownJobs)
                 .build());
         Set<String> jobIdsToKill = new HashSet<>(response.getJobIdsToKillList());
-        log.info("Registered with coordinator: workerId={}{}", response.getWorkerId(),
-                jobIdsToKill.isEmpty() ? "" : ", jobsToKill=" + jobIdsToKill);
-        return jobIdsToKill;
+        Set<String> ackedJobIds = new HashSet<>(response.getAckedJobIdsList());
+        log.info("Registered with coordinator: workerId={}{}{}", response.getWorkerId(),
+                jobIdsToKill.isEmpty() ? "" : ", jobsToKill=" + jobIdsToKill,
+                ackedJobIds.isEmpty() ? "" : ", ackedJobs=" + ackedJobIds);
+        return new RegisterResult(jobIdsToKill, ackedJobIds);
     }
 
     Optional<Job> pullJob(String workerId) {

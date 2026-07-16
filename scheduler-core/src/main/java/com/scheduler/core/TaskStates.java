@@ -24,7 +24,11 @@ public final class TaskStates {
             return false;
         }
         return switch (from) {
-            case TASK_STATE_PENDING -> to == TaskState.TASK_STATE_RUNNING || to == TaskState.TASK_STATE_FAILED;
+            // PENDING may jump straight to a terminal state: the worker's status
+            // store is latest-wins, so a register flush replays only a task's
+            // final state — the RUNNING step it took live may never arrive here.
+            case TASK_STATE_PENDING -> to == TaskState.TASK_STATE_RUNNING
+                    || to == TaskState.TASK_STATE_COMPLETED || to == TaskState.TASK_STATE_FAILED;
             case TASK_STATE_RUNNING -> to == TaskState.TASK_STATE_COMPLETED || to == TaskState.TASK_STATE_FAILED;
             default -> false;
         };

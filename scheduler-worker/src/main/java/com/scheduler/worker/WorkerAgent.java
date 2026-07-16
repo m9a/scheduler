@@ -192,14 +192,19 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
         // Reconcile in-flight jobs against their containers before we register.
         List<JobToReconcile> jobsToReconcile = recovery.recover();
-        // Register with the held jobs. The coordinator answers with the ones it
-        // already marked terminal (heartbeat lost while this worker was down).
-        // Their containers may still run here — the worker must kill them.
-        List<StatusUpdate> knownJobs = jobsToReconcile.stream()
-                .map(j -> jobUpdate(j.jobId(), j.jobState(), null, null))
-                .toList();
-        Set<String> jobIdsToKill = coordinatorClient.register(
+        // Register flush: send every stored row — in-flight jobs plus terminal
+        // rows whose ack never arrived. Per job, task rows come before the job
+        // row (see WorkerStatusStore.loadAllJobs). The coordinator ingests what
+        // it missed and answers:
+        //  - ackedJobIds: terminal jobs it has now recorded → drop their rows.
+        //  - jobIdsToKill: jobs it already marked dead → kill their containers.
+        List<StatusUpdate> knownJobs = statusStore.loadAllJobs();
+        CoordinatorClient.RegisterResult result = coordinatorClient.register(
                 workerId, hostname, memory, cpu, gpu, capabilities, knownJobs);
+        for (String ackedJobId : result.ackedJobIds()) {
+            log.info("Register flush acked by coordinator — dropping rows: jobId={}", ackedJobId);
+            statusStore.ack(ackedJobId);
+        }
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
         coordinatorClient.startHeartbeat(workerId, heartbeatSendIntervalMs);
@@ -209,7 +214,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         running = true;
         // Act on recovery before pulling new work: a container that survived the
         // restart is still this worker's job — resume watching it first.
-        reconcileJobs(jobsToReconcile, jobIdsToKill);
+        reconcileJobs(jobsToReconcile, result.jobIdsToKill());
         while (running) {
             Optional<Job> job = draining ? Optional.empty() : coordinatorClient.pullJob(workerId);
             if (job.isPresent()) {
