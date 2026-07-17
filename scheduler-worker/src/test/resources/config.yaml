@@ -3,6 +3,7 @@ coordinator:
   port: 0
   heartbeatIntervalSeconds: 5
   pollIntervalSeconds: 5
+  reconnectRetrySeconds: 2
 
 hostname: localhost
 port: 0

@@ -131,6 +131,9 @@ public class WorkerConfig {
         private int heartbeatIntervalSeconds = 5;
         // How often the worker polls the coordinator for a job to claim.
         private int pollIntervalSeconds = 5;
+        // Retry period after the command streams drop: re-register + resubscribe.
+        // Generous — the heartbeat grace after a coordinator restart is minutes.
+        private int reconnectRetrySeconds = 60;
 
         public String getHost() { return host; }
         public void setHost(String host) { this.host = host; }
@@ -140,6 +143,8 @@ public class WorkerConfig {
         public void setHeartbeatIntervalSeconds(int v) { this.heartbeatIntervalSeconds = v; }
         public int getPollIntervalSeconds() { return pollIntervalSeconds; }
         public void setPollIntervalSeconds(int v) { this.pollIntervalSeconds = v; }
+        public int getReconnectRetrySeconds() { return reconnectRetrySeconds; }
+        public void setReconnectRetrySeconds(int v) { this.reconnectRetrySeconds = v; }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

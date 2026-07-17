@@ -20,10 +20,15 @@ final class TestJobManager {
 
     static JobManager create() {
         try {
-            return new JobManager(new SqliteJobStore(Files.createTempFile("coord", ".db")));
+            return create(Files.createTempFile("coord", ".db"));
         } catch (IOException e) {
             throw new RuntimeException("Failed to create temp SQLite job store for test", e);
         }
+    }
+
+    /** Same, on a caller-owned db file — failover tests reuse it across "restarts". */
+    static JobManager create(java.nio.file.Path dbPath) {
+        return new JobManager(new SqliteJobStore(dbPath));
     }
 
     static WorkerHandler workerHandler(JobManager jobManager) {

@@ -98,7 +98,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                 Instant.now()
         ));
 
-        // Register flush + reconciliation. The worker sends every stored status
+        // Register reconciliation. The worker sends every stored status
         // row (per job: task rows first, then the job row). Ingest each row via
         // the normal status path, then decide per job row:
         //  - worker says terminal, recorded here → acked_job_ids (worker drops rows).
@@ -106,7 +106,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
         Set<String> jobIdsToKill = new LinkedHashSet<>();
         Set<String> ackedJobIds = new LinkedHashSet<>();
         for (StatusUpdate known : request.getKnownJobsList()) {
-            if (!ingestFlushedUpdate(known)) {
+            if (!ingestKnownJob(known)) {
                 continue;  // unknown/unappliable job: never kill or ack on missing data
             }
             if (known.getTaskState() != TaskState.TASK_STATE_UNSPECIFIED) {
@@ -126,7 +126,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                     workerId, jobIdsToKill.size(), jobIdsToKill);
         }
         if (!ackedJobIds.isEmpty()) {
-            log.info("Register flush from workerId={}: recorded + acked {} terminal job(s): {}",
+            log.info("Register reconciliation from workerId={}: recorded + acked {} terminal job(s): {}",
                     workerId, ackedJobIds.size(), ackedJobIds);
         }
 
@@ -139,7 +139,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     /**
-     * Ingests one flushed status row. False means "do not reconcile this job" —
+     * Ingests one known_jobs row. False means "do not reconcile this job" —
      * the row referenced a job this coordinator cannot apply.
      * <ul>
      *   <li>A non-terminal job row (STARTING) carries no news: the coordinator
@@ -150,7 +150,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
      *       never kill or ack based on a row that could not be applied.</li>
      * </ul>
      */
-    private boolean ingestFlushedUpdate(StatusUpdate update) {
+    private boolean ingestKnownJob(StatusUpdate update) {
         boolean isJobRow = update.getTaskState() == TaskState.TASK_STATE_UNSPECIFIED;
         if (isJobRow && !JobStates.isTerminal(update.getJobState())) {
             return true;
@@ -159,7 +159,7 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
             jobManager.handleStatusUpdate(update);
             return true;
         } catch (Exception e) {
-            log.error("Register flush row could not be applied — skipping job: jobId={}, jobState={}, taskState={}, error={}",
+            log.error("Register reconciliation row could not be applied — skipping job: jobId={}, jobState={}, taskState={}, error={}",
                     update.getJobId(), update.getJobState(), update.getTaskState(), e.getMessage());
             return false;
         }

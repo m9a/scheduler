@@ -278,6 +278,13 @@ public class JobManager {
                                  TaskState taskState, String errorMessage) {
         TaskStatus task = job.taskStatuses().computeIfAbsent(taskIndex,
                 idx -> new TaskStatus(UUID.randomUUID().toString(), idx, "task-" + idx));
+        // Same-state update is a no-op, like the job-side de-dupe. Register
+        // reconciliation replays task rows this coordinator may already have.
+        if (task.state() == taskState) {
+            log.debug("Ignoring duplicate task state: jobId={}, taskIndex={}, state={}",
+                    job.id(), taskIndex, taskState);
+            return;
+        }
         switch (taskState) {
             case TASK_STATE_RUNNING -> task.start(taskName);
             case TASK_STATE_COMPLETED -> task.complete(taskName);

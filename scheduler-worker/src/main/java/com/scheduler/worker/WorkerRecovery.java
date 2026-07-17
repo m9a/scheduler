@@ -46,7 +46,7 @@ class WorkerRecovery {
     /**
      * Reads the store and inspects each non-terminal job's container. Terminal
      * rows are skipped: their job already finished and was reported; the rows
-     * only wait for re-delivery + ack (the register flush), not for recovery.
+     * only wait for re-delivery + ack (register reconciliation), not for recovery.
      */
     List<JobToReconcile> recover() {
         Map<String, JobState> jobStateById = new LinkedHashMap<>();

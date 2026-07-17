@@ -469,11 +469,11 @@ class WorkerJobLifecycleTest {
     }
 
     // Worker reported the job terminal but died before the coordinator's ack, so
-    // the rows stayed in the store. On restart the register flush delivers them:
+    // the rows stayed in the store. On restart register reconciliation delivers them:
     // the coordinator records the task then the terminal job state, acks, and the
     // worker drops the rows. Nothing is killed or re-attached.
     @Test
-    void registerFlush() throws Exception {
+    void registerReconciliation() throws Exception {
         CountDownLatch claimed = new CountDownLatch(1);
         CountDownLatch blockForever = new CountDownLatch(1);
         worker.setSpawnBehavior((details, url) -> {
@@ -482,7 +482,7 @@ class WorkerJobLifecycleTest {
             return 0;
         });
 
-        String jobId = submitJob("register-flush");
+        String jobId = submitJob("register-reconciliation");
         startWorker();
         assertTrue(claimed.await(10, TimeUnit.SECONDS), "job should be claimed");
         awaitTrue(() -> !worker.statusStore.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
@@ -505,12 +505,12 @@ class WorkerJobLifecycleTest {
         startWorker();
 
         awaitTrue(() -> store.loadAllJobs().isEmpty(), 5, TimeUnit.SECONDS,
-                "register-flush ack should drop the job's rows");
+                "register-reconciliation ack should drop the job's rows");
         Job job = pollUntilTerminal(jobId, 5, TimeUnit.SECONDS);
         assertEquals(JobState.JOB_STATE_COMPLETED, job.getState(),
-                "the flushed terminal state must be recorded, not re-derived");
+                "the replayed terminal state must be recorded, not re-derived");
         assertEquals(TaskState.TASK_STATE_COMPLETED, job.getTasks(0).getState(),
-                "the flushed task state must land before the terminal job row");
+                "the replayed task state must land before the terminal job row");
     }
 
     /**
