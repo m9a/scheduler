@@ -86,7 +86,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
     private final WorkerMetrics metrics;
 
     // Durable mirror of every status update this agent sends. Survives a worker
-    // crash: recover() reads it on boot, register flushes it to the coordinator.
+    // crash: recover() reads it on boot, register reconciliation replays it to the coordinator.
     private final WorkerStatusStore statusStore;
 
     // Boot recovery: reconciles in-flight jobs against their containers before register.
@@ -128,7 +128,8 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         // One retention sweep per boot bounds what a dead coordinator leaves behind.
         statusStore.prune(Duration.ofDays(config.getStatusRetentionDays()));
         this.coordinatorClient = new CoordinatorClient(
-                config.getCoordinator().getHost(), config.getCoordinator().getPort());
+                config.getCoordinator().getHost(), config.getCoordinator().getPort(),
+                config.getCoordinator().getReconnectRetrySeconds() * 1000L);
         this.checkpointPath = config.getCheckpointPath();
         this.hostname = config.getHostname();
         this.memory = config.getResources().getMemory();
@@ -192,26 +193,30 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         workerId = WorkerCheckpoint.resolveOrCreate(java.nio.file.Path.of(checkpointPath));
         // Reconcile in-flight jobs against their containers before we register.
         List<JobToReconcile> jobsToReconcile = recovery.recover();
-        // Register with the held jobs. The coordinator answers with the ones it
-        // already marked terminal (heartbeat lost while this worker was down).
-        // Their containers may still run here — the worker must kill them.
-        List<StatusUpdate> knownJobs = jobsToReconcile.stream()
-                .map(j -> jobUpdate(j.jobId(), j.jobState(), null, null))
-                .toList();
-        Set<String> jobIdsToKill = coordinatorClient.register(
-                workerId, hostname, memory, cpu, gpu, capabilities, knownJobs);
+        Set<String> jobIdsToKill = connect();
         log.info("Worker running: workerId={}, hostname={}", workerId, hostname);
 
         coordinatorClient.startHeartbeat(workerId, heartbeatSendIntervalMs);
         // Open the coordinator → worker push channels (resync/drain, cancel/preempt).
-        coordinatorClient.subscribeSystemCommands(workerId, this::onSystemCommand);
+        // A dropped system stream means the coordinator went away; when it returns,
+        // the worker re-runs connect() — same reconciliation as boot.
+        coordinatorClient.subscribeSystemCommands(workerId, this::onSystemCommand, this::onCoordinatorReconnect);
         coordinatorClient.subscribeJobCommands(workerId, this::onJobCommand);
         running = true;
         // Act on recovery before pulling new work: a container that survived the
         // restart is still this worker's job — resume watching it first.
         reconcileJobs(jobsToReconcile, jobIdsToKill);
         while (running) {
-            Optional<Job> job = draining ? Optional.empty() : coordinatorClient.pullJob(workerId);
+            Optional<Job> job;
+            try {
+                job = draining ? Optional.empty() : coordinatorClient.pullJob(workerId);
+            } catch (Exception e) {
+                // Coordinator unreachable (restart or blip). Ride it out: the
+                // command-stream resubscribe loop re-registers when it returns.
+                log.warn("pullJob failed — coordinator unreachable, retrying in {}ms: {}",
+                        jobPullIntervalMs, e.getMessage());
+                job = Optional.empty();
+            }
             if (job.isPresent()) {
                 executeJob(job.get());
             } else {
@@ -279,6 +284,45 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
     }
 
     // ── boot re-attach (recovery decisions) ─────────────────────────────────
+
+    /**
+     * Registers with the coordinator, carrying the reconciliation payload. One
+     * routine for both triggers — worker boot and coordinator return:
+     * <ul>
+     *   <li>Sends every stored status row as {@code known_jobs} (per job, task
+     *       rows first — see {@link WorkerStatusStore#loadAllJobs}).</li>
+     *   <li>Drops the rows of jobs the coordinator acked as recorded.</li>
+     *   <li>Returns the ids the coordinator says to kill (it already marked
+     *       them dead); the caller routes the kill.</li>
+     * </ul>
+     * Synchronized: boot (main thread) and reconnect (resubscribe thread) must
+     * not interleave two registrations.
+     */
+    private synchronized Set<String> connect() {
+        List<StatusUpdate> knownJobs = statusStore.loadAllJobs();
+        CoordinatorClient.RegisterResult result = coordinatorClient.register(
+                workerId, hostname, memory, cpu, gpu, capabilities, knownJobs);
+        for (String ackedJobId : result.ackedJobIds()) {
+            log.info("Register reconciliation acked by coordinator — dropping rows: jobId={}", ackedJobId);
+            statusStore.ack(ackedJobId);
+        }
+        return result.jobIdsToKill();
+    }
+
+    /**
+     * Runs when the command streams come back after a drop — the coordinator
+     * restarted or the connection blipped. Re-registers with reconciliation so
+     * a restarted coordinator re-learns this worker's jobs. A kill verdict here
+     * targets the live job, so it routes through {@link #stopRunningJob}, not
+     * the boot-recovery path.
+     */
+    private void onCoordinatorReconnect() {
+        log.info("Coordinator connection restored — re-registering with reconciliation: workerId={}", workerId);
+        Set<String> jobIdsToKill = connect();
+        for (String jobId : jobIdsToKill) {
+            stopRunningJob(jobId, "reconcile");
+        }
+    }
 
     /**
      * Applies the recovery policy to each in-flight job. Fixed rules, no choices:
@@ -535,7 +579,7 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         if (awaitStatusClose(reporting.statusStream())) {
             statusStore.ack(jobId);
         } else {
-            log.warn("No close ack from coordinator for jobId={}; keeping status rows for the register flush",
+            log.warn("No close ack from coordinator for jobId={}; keeping status rows for register reconciliation",
                     jobId);
         }
     }

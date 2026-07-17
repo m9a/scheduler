@@ -54,10 +54,10 @@ class CoordinatorClient implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(CoordinatorClient.class);
 
-    // Fixed delay before re-opening a dropped command stream — keeps reconnect simple.
-    private static final long RESUBSCRIBE_DELAY_MS = 2000;
-
     private final ManagedChannel channel;
+    // Delay before each reconnect attempt (re-register + resubscribe) after a
+    // dropped command stream. From worker.yaml coordinator.reconnectRetrySeconds.
+    private final long resubscribeDelayMs;
     private final WorkerServiceGrpc.WorkerServiceBlockingStub blockingStub;
     private final WorkerServiceGrpc.WorkerServiceStub asyncStub;
     private ScheduledExecutorService heartbeatExecutor;
@@ -67,7 +67,8 @@ class CoordinatorClient implements AutoCloseable {
     // unlike a stream close, which triggers one.
     private volatile boolean shuttingDown;
 
-    CoordinatorClient(String host, int port) {
+    CoordinatorClient(String host, int port, long resubscribeDelayMs) {
+        this.resubscribeDelayMs = resubscribeDelayMs;
         this.channel = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .build();
@@ -75,14 +76,21 @@ class CoordinatorClient implements AutoCloseable {
         this.asyncStub = WorkerServiceGrpc.newStub(channel);
     }
 
+    /** What the coordinator answered at register. */
+    record RegisterResult(Set<String> jobIdsToKill, Set<String> ackedJobIds) {}
+
     /**
-     * Registers this worker: stable id, resources, and the jobs it still holds
-     * from before a restart. Returns the ids the worker must kill — the
-     * coordinator already marked those jobs dead (heartbeat lost), but their
-     * containers may still run here.
+     * Registers this worker: stable id, resources, and every stored status row
+     * (register reconciliation). The coordinator ingests what it missed and answers:
+     * <ul>
+     *   <li>{@code jobIdsToKill} — jobs it already marked dead (heartbeat lost);
+     *       their containers may still run here and must be killed.</li>
+     *   <li>{@code ackedJobIds} — flushed terminal jobs it has now recorded;
+     *       the worker drops their rows.</li>
+     * </ul>
      */
-    Set<String> register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu,
-                         Set<String> capabilities, List<StatusUpdate> knownJobs) {
+    RegisterResult register(String workerId, String hostname, int memoryMb, int cpuCores, boolean gpu,
+                            Set<String> capabilities, List<StatusUpdate> knownJobs) {
         log.info("Registering with coordinator: workerId={}, hostname={}, memory={}, cpu={}, gpu={}, capabilities={}, knownJobs={}",
                 workerId, hostname, memoryMb, cpuCores, gpu, capabilities, knownJobs.size());
         RegisterWorkerResponse response = blockingStub.registerWorker(RegisterWorkerRequest.newBuilder()
@@ -97,9 +105,11 @@ class CoordinatorClient implements AutoCloseable {
                 .addAllKnownJobs(knownJobs)
                 .build());
         Set<String> jobIdsToKill = new HashSet<>(response.getJobIdsToKillList());
-        log.info("Registered with coordinator: workerId={}{}", response.getWorkerId(),
-                jobIdsToKill.isEmpty() ? "" : ", jobsToKill=" + jobIdsToKill);
-        return jobIdsToKill;
+        Set<String> ackedJobIds = new HashSet<>(response.getAckedJobIdsList());
+        log.info("Registered with coordinator: workerId={}{}{}", response.getWorkerId(),
+                jobIdsToKill.isEmpty() ? "" : ", jobsToKill=" + jobIdsToKill,
+                ackedJobIds.isEmpty() ? "" : ", ackedJobs=" + ackedJobIds);
+        return new RegisterResult(jobIdsToKill, ackedJobIds);
     }
 
     Optional<Job> pullJob(String workerId) {
@@ -139,16 +149,23 @@ class CoordinatorClient implements AutoCloseable {
      * Subscribes to the coordinator's system-command push stream (drain).
      * The call returns immediately; {@code handler} runs on a gRPC thread per
      * pushed command. A dropped stream re-subscribes after a fixed delay.
+     *
+     * <p>{@code reconnectHandler} runs before each re-subscribe attempt — a
+     * dropped stream means the coordinator went away, so the worker must
+     * re-register with reconciliation when it returns. If the handler throws
+     * (coordinator still down), the attempt is rescheduled. Only this stream
+     * carries the hook: all streams share one channel and drop together, so one
+     * trigger is enough.
      */
-    void subscribeSystemCommands(String workerId, Consumer<SystemCommand> handler) {
+    void subscribeSystemCommands(String workerId, Consumer<SystemCommand> handler, Runnable reconnectHandler) {
         ensureCommandExecutor();
-        subscribe("system", workerId, asyncStub::systemCommands, handler);
+        subscribe("system", workerId, asyncStub::systemCommands, handler, reconnectHandler);
     }
 
     /** Job-command counterpart of {@link #subscribeSystemCommands} (cancel, preempt). */
     void subscribeJobCommands(String workerId, Consumer<JobCommand> handler) {
         ensureCommandExecutor();
-        subscribe("job", workerId, asyncStub::jobCommands, handler);
+        subscribe("job", workerId, asyncStub::jobCommands, handler, null);
     }
 
     private synchronized void ensureCommandExecutor() {
@@ -162,7 +179,8 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     private <T> void subscribe(String name, String workerId,
-                               BiConsumer<SubscribeRequest, StreamObserver<T>> rpc, Consumer<T> handler) {
+                               BiConsumer<SubscribeRequest, StreamObserver<T>> rpc, Consumer<T> handler,
+                               Runnable reconnectHandler) {
         if (shuttingDown) {
             return;
         }
@@ -178,12 +196,12 @@ class CoordinatorClient implements AutoCloseable {
 
             @Override
             public void onError(Throwable t) {
-                resubscribe(name, workerId, rpc, handler, t.getMessage());
+                resubscribe(name, workerId, rpc, handler, reconnectHandler, t.getMessage());
             }
 
             @Override
             public void onCompleted() {
-                resubscribe(name, workerId, rpc, handler, "stream closed by coordinator");
+                resubscribe(name, workerId, rpc, handler, reconnectHandler, "stream closed by coordinator");
             }
         };
         log.info("Subscribing to {} command stream: workerId={}", name, workerId);
@@ -191,13 +209,27 @@ class CoordinatorClient implements AutoCloseable {
     }
 
     private <T> void resubscribe(String name, String workerId,
-                                 BiConsumer<SubscribeRequest, StreamObserver<T>> rpc, Consumer<T> handler, String why) {
+                                 BiConsumer<SubscribeRequest, StreamObserver<T>> rpc, Consumer<T> handler,
+                                 Runnable reconnectHandler, String why) {
         if (shuttingDown) {
             return;
         }
-        log.warn("{} command stream lost ({}); resubscribing in {}ms", name, why, RESUBSCRIBE_DELAY_MS);
-        commandExecutor.schedule(() -> subscribe(name, workerId, rpc, handler),
-                RESUBSCRIBE_DELAY_MS, TimeUnit.MILLISECONDS);
+        log.warn("{} command stream lost ({}); resubscribing in {}ms", name, why, resubscribeDelayMs);
+        commandExecutor.schedule(() -> {
+            // Re-register first: a lost stream means the coordinator went away,
+            // and a returning coordinator must get the reconciliation payload
+            // before this worker resumes. Still down → try again next cycle.
+            if (reconnectHandler != null) {
+                try {
+                    reconnectHandler.run();
+                } catch (Exception e) {
+                    log.warn("Coordinator still unreachable ({}); retrying in {}ms", e.getMessage(), resubscribeDelayMs);
+                    resubscribe(name, workerId, rpc, handler, reconnectHandler, "re-register failed");
+                    return;
+                }
+            }
+            subscribe(name, workerId, rpc, handler, reconnectHandler);
+        }, resubscribeDelayMs, TimeUnit.MILLISECONDS);
     }
 
     /**

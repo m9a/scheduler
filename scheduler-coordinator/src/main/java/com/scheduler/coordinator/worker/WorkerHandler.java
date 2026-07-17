@@ -5,6 +5,7 @@ import com.scheduler.coordinator.JobManager;
 import com.scheduler.coordinator.ProtoMapper;
 import com.scheduler.coordinator.persistence.WorkerStore;
 import com.scheduler.core.FailureMessages;
+import com.scheduler.core.JobStates;
 import com.scheduler.core.JobStatus;
 import com.scheduler.core.WorkerInfo;
 import com.scheduler.proto.job.Report;
@@ -36,7 +37,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -95,25 +98,71 @@ public class WorkerHandler extends WorkerServiceGrpc.WorkerServiceImplBase {
                 Instant.now()
         ));
 
-        // Reconcile the worker's held jobs. Any job already terminal here was
-        // failed by the heartbeat monitor while the worker was down. Its
-        // container may still run on the worker — tell the worker to kill it.
-        List<String> jobIdsToKill = new ArrayList<>();
+        // Register reconciliation. The worker sends every stored status
+        // row (per job: task rows first, then the job row). Ingest each row via
+        // the normal status path, then decide per job row:
+        //  - worker says terminal, recorded here → acked_job_ids (worker drops rows).
+        //  - worker says alive, terminal here → job_ids_to_kill (worker kills it).
+        Set<String> jobIdsToKill = new LinkedHashSet<>();
+        Set<String> ackedJobIds = new LinkedHashSet<>();
         for (StatusUpdate known : request.getKnownJobsList()) {
-            if (jobManager.isJobTerminal(known.getJobId())) {
+            if (!ingestKnownJob(known)) {
+                continue;  // unknown/unappliable job: never kill or ack on missing data
+            }
+            if (known.getTaskState() != TaskState.TASK_STATE_UNSPECIFIED) {
+                continue;  // task row — decisions are made on the job row only
+            }
+            if (!jobManager.isJobTerminal(known.getJobId())) {
+                continue;  // alive on both sides — nothing to reconcile
+            }
+            if (JobStates.isTerminal(known.getJobState())) {
+                ackedJobIds.add(known.getJobId());
+            } else {
                 jobIdsToKill.add(known.getJobId());
             }
         }
         if (!jobIdsToKill.isEmpty()) {
-            log.warn("Register reconciliation for workerId={}: {} of {} held job(s) already terminal — telling the worker to kill: {}",
-                    workerId, jobIdsToKill.size(), request.getKnownJobsCount(), jobIdsToKill);
+            log.warn("Register reconciliation for workerId={}: {} held job(s) already terminal here — telling the worker to kill: {}",
+                    workerId, jobIdsToKill.size(), jobIdsToKill);
+        }
+        if (!ackedJobIds.isEmpty()) {
+            log.info("Register reconciliation from workerId={}: recorded + acked {} terminal job(s): {}",
+                    workerId, ackedJobIds.size(), ackedJobIds);
         }
 
         responseObserver.onNext(RegisterWorkerResponse.newBuilder()
                 .setWorkerId(workerId)
                 .addAllJobIdsToKill(jobIdsToKill)
+                .addAllAckedJobIds(ackedJobIds)
                 .build());
         responseObserver.onCompleted();
+    }
+
+    /**
+     * Ingests one known_jobs row. False means "do not reconcile this job" —
+     * the row referenced a job this coordinator cannot apply.
+     * <ul>
+     *   <li>A non-terminal job row (STARTING) carries no news: the coordinator
+     *       set that state itself at claim. Skipped, but still reconcilable.</li>
+     *   <li>Task rows and terminal job rows go through the normal status path,
+     *       which applies, de-dupes, or drops them (already-terminal guard).</li>
+     *   <li>An unknown job or an illegal transition is logged and skipped —
+     *       never kill or ack based on a row that could not be applied.</li>
+     * </ul>
+     */
+    private boolean ingestKnownJob(StatusUpdate update) {
+        boolean isJobRow = update.getTaskState() == TaskState.TASK_STATE_UNSPECIFIED;
+        if (isJobRow && !JobStates.isTerminal(update.getJobState())) {
+            return true;
+        }
+        try {
+            jobManager.handleStatusUpdate(update);
+            return true;
+        } catch (Exception e) {
+            log.error("Register reconciliation row could not be applied — skipping job: jobId={}, jobState={}, taskState={}, error={}",
+                    update.getJobId(), update.getJobState(), update.getTaskState(), e.getMessage());
+            return false;
+        }
     }
 
     @Override

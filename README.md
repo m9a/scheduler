@@ -65,6 +65,11 @@ PENDING → RUNNING → COMPLETED
 | COMPLETED | sdk | method returned normally |
 | FAILED | sdk | method threw/raised (carries the error) |
 
+One extra edge exists for replay: PENDING → COMPLETED. The worker's status
+store keeps only a task's latest state, so a register reconciliation after a worker
+crash may deliver a task already completed — the RUNNING step happened live
+but was never seen here.
+
 A task is only ever advanced by the SDK. If the container dies (crash, kill, or
 dead worker) while a task is mid-execution, that task keeps its **last reported
 state** (typically RUNNING) — only the job goes terminal. Tasks that never
@@ -543,7 +548,7 @@ reconciliation after a slow restart. Full plan in worker-recovery.md.
   when the worker closes the job's `ReportStatus` stream, the coordinator — having
   applied every update on it, including the terminal one — sends one close-ack
   response. Only that ack triggers `store.ack(jobId)`, which drops the job's rows.
-  A timeout or a stream error before the ack keeps the rows; the register flush
+  A timeout or a stream error before the ack keeps the rows; the register reconciliation
   re-delivers them on the next connect. So a job's rows always mean "the
   coordinator may not have this yet."
 
@@ -562,8 +567,44 @@ there is nothing to decide:
 One exception overrides the table: a job the coordinator already marked dead is
 killed, never re-attached (see "Register reconciliation" below).
 
-Boot order: resolve worker id → boot recovery → register → heartbeat →
-subscribe → reconcile in-flight jobs → pull loop.
+Boot order: resolve worker id → boot recovery → register (sending all stored
+rows) → drop acked rows → heartbeat → subscribe → reconcile in-flight jobs →
+pull loop.
+
+### The two stores, by example
+
+Job `job-42`, two tasks (task 0 done, task 1 running), on worker `w-1`.
+
+**Coordinator store** (`scheduler.db`) — a snapshot. One row per job; tasks
+ride inside the row as JSON:
+
+| id | state | assigned_worker_id | tasks (JSON) |
+|----|-------|--------------------|--------------|
+| job-42 | RUNNING | w-1 | `[{"taskIndex":0,"state":"COMPLETED"}, {"taskIndex":1,"state":"RUNNING"}]` |
+
+On coordinator reboot: non-terminal rows are loaded back into memory
+(`JobStatus` with tasks), QUEUED jobs re-queued, the job→worker map rebuilt.
+Terminal rows stay on disk. The heartbeat monitor waits
+`reregistrationTimeoutSeconds` before failing anything.
+
+**Worker store** (`worker-status.db`) — an outbox, not a snapshot. One row per
+job/task, latest state only; `task_idx = -1` is the job row:
+
+| job_id | task_idx | job_state | task_state |
+|--------|----------|-----------|------------|
+| job-42 | 0 | RUNNING | COMPLETED |
+| job-42 | 1 | RUNNING | RUNNING |
+| job-42 | -1 | STARTING | — |
+
+On worker reboot: the job row is non-terminal → inspect the container
+(running → re-attach; exited/absent → fail best-effort). Register sends all
+rows as `known_jobs`, task rows first; the coordinator applies what it missed
+and de-dupes the rest. The worker never rebuilds task state in memory — the
+container is the runtime truth; the rows exist to be replayed.
+
+If the worker had died just after the job finished (ack never arrived), the
+job row would read COMPLETED: recovery skips it, the flush replays it, the
+coordinator records the real outcome and acks, and the rows drop.
 
 ### Register reconciliation (slow restart)
 
@@ -588,6 +629,44 @@ The default `heartbeatTimeoutSeconds` is 300 — deliberately generous, so a
 worker upgrade or host reboot re-attaches instead of losing jobs. This mirrors
 what Kubernetes and YARN do: short outage → work-preserving recovery; declared
 dead → fence the orphan.
+
+### Failover message flow
+
+Worker restart inside the heartbeat timeout — re-attach:
+
+```
+SDK (in container)         Worker                          Coordinator
+  │                          ✗ crash                          │
+  │ send fails → queue        │                               │ heartbeats stop;
+  │ updates, reconnect        │                               │ timeout NOT reached
+  │ with backoff              │ restart                       │
+  │                           │ boot recovery: job row STARTING,
+  │                           │ container running → re-attach
+  │                           │── register(known_jobs) ──────►│ jobs alive here
+  │                           │◄─ no kills, acks if any ──────│
+  │                           │ re-open status/telemetry streams
+  │                           │── job RUNNING ───────────────►│ (de-duped if known)
+  │◄── WS reconnect ──────────│ resume docker wait            │
+  │── queued task updates ───►│── forward ───────────────────►│
+  │── task COMPLETED ────────►│── terminal COMPLETED ────────►│
+  │                           │◄─ close ack ──────────────────│ → rows drop
+```
+
+Worker restart past the heartbeat timeout — kill:
+
+```
+SDK (in container)         Worker                          Coordinator
+  │                          ✗ down                           │
+  │ send fails → queue        │                               │ timeout fires:
+  │ updates, keep retrying    │                               │ job FAILED / HEARTBEAT_LOST
+  │                           │ restart                       │
+  │                           │── register(known_jobs) ──────►│ job terminal here,
+  │                           │◄─ job_ids_to_kill=[job-42] ───│ worker says alive
+  │                           │ docker stop job-job-42        │
+  ✗ container killed          │ salvage outputs + logs        │
+                              │── FAILED report ─────────────►│ dropped (already terminal)
+                              │◄─ close ack ──────────────────│ → rows drop
+```
 
 ### Re-attach
 
@@ -645,6 +724,11 @@ Covered today:
 - **Worker restart past the heartbeat timeout.** The coordinator already failed
   the jobs (`HEARTBEAT_LOST`). Register reconciliation tells the worker which
   jobs to kill; work done so far is salvaged, nothing is resurrected.
+- **Worker dies before receiving the ack.** The job's rows stay in the store
+  (correct — the ack never came). The next register reconciliationes them: the
+  coordinator ingests what it missed, answers `acked_job_ids`, and the worker
+  drops exactly those rows. A job that finished during the outage is recorded
+  with its real outcome instead of being failed.
 
 Known gaps (deliberate, for now):
 
@@ -656,12 +740,60 @@ Known gaps (deliberate, for now):
   a partition that outlasts the timeout is rare — not handled for now.
   TODO: reconcile on heartbeat resume (coordinator pushes a kill when a "lost"
   worker's heartbeats return).
-- **Worker dies before receiving the ack.** The worker reported a job's terminal
-  state, but crashed before the coordinator's close ack arrived. The rows stay
-  in the store (correct — the ack never came), but re-delivering them at
-  register (the "register flush", via `known_jobs` / `acked_job_ids`) is not
-  wired yet. Today those rows sit until the retention sweep prunes them. This is
-  the next planned slice.
+- **Orphaned containers.** Not addressed for now. A container is orphaned when
+  no worker will ever reconcile it:
+  - The worker process never comes back (no supervision layer yet — TODO #16).
+    Its containers keep running under the Docker daemon indefinitely.
+  - The worker's status store is lost or deleted while containers run. No row
+    means "never claimed" — recovery will not look for the container.
+  - A crash in the narrow window after the coordinator's ack but before
+    container removal. The rows are gone; the *exited* container stays behind
+    (disk, not compute).
+  Cleanup would be a worker-side sweep: list `job-*` containers, remove any
+  with no store row and no live job. Deliberately deferred.
+
+## Coordinator Failover & Recovery
+
+**A coordinator going down never kills jobs.** Workers stay up. Containers keep
+running. The coordinator rebuilds from its SQLite store, and workers re-declare
+the rest.
+
+### Restart sequence
+
+- On boot the coordinator reloads non-terminal jobs from `scheduler.db`.
+  QUEUED jobs are re-queued. Job→worker assignments are rebuilt.
+- The worker registry is seeded from its store. Every heartbeat is reset to
+  "now". The monitor also holds off for `reregistrationTimeoutSeconds`.
+- Workers get the full `heartbeatTimeoutSeconds` (300s) to reappear before any
+  job is failed.
+- Each worker notices its command streams dropped. It retries every
+  `coordinator.reconnectRetrySeconds` (60s, worker.yaml): re-register, then
+  resubscribe. Each attempt reads the status store fresh and sends every row.
+- The coordinator ingests what it missed. A job that finished during the
+  outage is recorded with its real outcome. Terminal jobs are acked; the
+  worker drops their rows.
+
+### Jobs are never killed by a failover
+
+The register response carries `job_ids_to_kill`. On a coordinator failover
+this list is **empty**, by construction:
+
+- A kill verdict exists only for a job the coordinator holds as terminal.
+- Jobs go terminal only two ways: the worker's own report, or the heartbeat
+  monitor.
+- After a restart the monitor is held off and heartbeats are re-seeded — it
+  cannot have failed anything yet.
+
+The only way a worker is told to kill: its job was already failed **before**
+the coordinator went down (that worker had been silent past the timeout).
+
+### Known limitation (next slice)
+
+The per-job status/telemetry streams are not yet re-opened after a reconnect.
+A job still running when the coordinator returns keeps working, but its live
+updates don't flow until it ends; its outcome then arrives via the next
+reconciliation. Re-opening the streams on reconnect is the next slice
+(persistence.md Phase 5, slice 5).
 
 ## Input/Output Files
 
