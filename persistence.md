@@ -50,7 +50,7 @@ reconnect. No external DB, no orchestrator (see CLAUDE.md non-goals).
   re-asserted, and a job that *finished* during the outage has its terminal status
   replayed instead of looking orphaned.
 - **Ack is terminal-only and coarse.** Non-terminal jobs need no ack — they're
-  re-asserted on every reconnect flush, so a missed non-terminal update (only possible
+  re-asserted on every reconnect replay, so a missed non-terminal update (only possible
   on a stream break, which always triggers a reconnect) self-heals. Only a terminal
   status needs an ack, so the worker knows when to prune a job that's no longer active.
   No per-update acks, no batch ids, no bidi stream.
@@ -151,7 +151,7 @@ outage. Settled model (no per-update acks, no batch ids, no bidi):
 - **Ack = terminal-only, coarse.** A terminal status is pruned when the coordinator
   confirms it applied it — via the live `ReportStatus` final response, or, if that path
   broke mid-outage, via `RegisterWorkerResponse.acked_job_ids` on the next reconnect
-  flush. Non-terminal jobs need no ack: re-asserted on every reconnect flush, so a missed
+  flush. Non-terminal jobs need no ack: re-asserted on every reconnect replay, so a missed
   non-terminal update self-heals.
 - **Retention bound.** Terminal rows are normally pruned on ack; a `worker` config
   `statusRetentionDays` (default 7) also prunes terminal-unacked rows older than the
@@ -166,18 +166,30 @@ Recovery flow (why this works):
 
 ### Phase 5/6 implementation slices (reviewable steps)
 Build in order; each is 1–2 classes per CLAUDE.md.
-1. **Proto** — `RegisterWorkerRequest.known_jobs` (`repeated StatusUpdate`),
-   `RegisterWorkerResponse.acked_job_ids` (`repeated string`); remove `Resync` + the
-   worker's resync dispatch + `requestResync`. Regenerate.
-2. **Worker status store** — `WorkerStatusStore` + Sqlite impl. See "Worker persistence
-   — data model" below for the schema and API (`update` / `loadAllJobs` / `ack` / `prune`).
-3. **Worker reconnect routine** — single `(re)connect` (register-with-`known_jobs` →
-   heartbeat → resubscribe → prune `acked_job_ids`), fired off the main loop from the
-   command-stream reconnect path.
-4. **Coordinator ingest + ack** — ingest re-sent snapshots via `handleStatusUpdate`,
-   persist terminals, return `acked_job_ids`.
-5. **Re-open per-job streams** — on reconnect re-establish the per-job status + telemetry
-   streams so the in-flight job resumes reporting.
+1. ✅ **Proto** — `RegisterWorkerRequest.known_jobs` (`repeated StatusUpdate`),
+   `RegisterWorkerResponse.acked_job_ids` + `job_ids_to_kill` (`repeated string`).
+2. ✅ **Worker status store** — `WorkerStatusStore` + Sqlite impl (landed as
+   worker-recovery Slice 2).
+3. ✅ **Worker reconnect routine** — one `connect()` (register with
+   `loadAllJobs()` → prune `acked_job_ids` → route kills), called at boot and
+   from the command-stream resubscribe path (system stream only — one channel,
+   one trigger; a kill at reconnect routes to the live job via
+   `stopRunningJob`). `pullJob` now tolerates an unreachable coordinator
+   (rides out the restart instead of crashing — the #19 slice this needed).
+   Task same-state updates de-dupe like job ones (replays). Verified:
+   `CoordinatorFailoverTest` (hard restart mid-job, fresh JobManager on the
+   same store; outcome recorded from the replayed rows, rows acked).
+4. ✅ **Coordinator ingest + ack** — `WorkerHandler.ingestFlushedUpdate` feeds
+   `handleStatusUpdate` (terminal-job guard drops stale rows; unknown/unappliable
+   rows are logged and never acked or killed), answers `acked_job_ids` and
+   `job_ids_to_kill`. Task PENDING→terminal edge added for latest-wins replay.
+   Verified: `registerReconciliation` lifecycle test.
+5. ✅ **Re-open per-job streams** — the running job's reporting pipes live in a
+   swappable holder (`WorkerAgent.currentReporting`); handlers and the terminal
+   path read it per use. `onCoordinatorReconnect` swaps in fresh streams after
+   reconciliation (dead ones abandoned; no re-declare — replay + the RUNNING
+   stamp on task updates cover it). Verified: `testStreamsReopenAfterCoordinatorRestart`
+   (task update after reconnect arrives live; terminal ack clears the rows).
 6. **Orphan decision (coordinator-knows, worker-doesn't)** — fail-only vs fail+requeue vs
    grace-then-fail. Lean: fail with a distinct reason; requeue deferred to #6/#13.
 7. **Reverse decision (worker-knows, coordinator-doesn't)** — terminal → ack + ignore
@@ -283,7 +295,7 @@ are evicted (memory = active only, or query the DB).
 - #15 coordinator→worker command streams (✅, enables Drain/Cancel/Preempt).
 - #18 resubscribe backoff + jitter.
 - #19 worker tolerates coordinator-down on pull/heartbeat.
-- #20 registration thundering-herd after outage (pace/stagger the reconnect flush).
+- #20 registration thundering-herd after outage (pace/stagger the reconnect replay).
 
 ## Open decisions
 - Scope of Phase 5: whether re-opening the per-job status/telemetry streams (resume live

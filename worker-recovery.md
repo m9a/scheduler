@@ -9,9 +9,10 @@ Status: ✅ done · 🔄 in progress · ⬜ pending.
 
 ## Resume point (updated 2026-07-10)
 
-Slices 1–5 are done and tested (worker-repo slices uncommitted on branch
-`worker-recovery`; Slice 4 uncommitted in the sibling `scheduler-sdk` repo).
-**Next: Slice 6 (coordinator slow-restart reconciliation).**
+All Stage 1 slices (1–6) are done and tested. **The worker-recovery epic Stage 1
+is complete** — next: return to persistence.md (coordinator recovery), plus the
+deferred items below. Slice 6 is uncommitted; a small pending fix: the Java SDK's
+`onBinary` should verify the ack byte (`0x02`) like the Python SDK does.
 The docker-java client migration (TODO #22) is deferred to after the epic.
 
 What exists now:
@@ -28,7 +29,7 @@ What exists now:
 - **Ack integrity:** the close ack is the `StatusUpdateResponse` on the per-job
   `ReportStatus` stream; the worker records it in `onNext` (logged) and
   `CoordinatorStatusStream.awaitCompletion` returns true only if it arrived. A
-  stream error before the ack keeps the rows for the register flush — it no
+  stream error before the ack keeps the rows for the register reconciliation — it no
   longer counts as acked. Documented in README ("Rows leave the store only on
   the coordinator's ack").
 - `WorkerRecovery.recover()` runs before register: reads store, inspects each
@@ -155,9 +156,9 @@ For each non-terminal job found in the store on boot, pick one:
 **Coordinator interaction**
 - [x] Fast restart (< `heartbeatTimeout`): coordinator never noticed; worker re-declares
   (re-attach re-asserts job RUNNING) and continues.
-- [ ] Slow restart (> `heartbeatTimeout`): coordinator's monitor already failed the job as
-  HEARTBEAT_LOST and may have rescheduled it. The returning worker must reconcile with that
-  — it cannot re-assert a job the coordinator already gave to someone else. (Slice 6.)
+- [x] Slow restart (> `heartbeatTimeout`): register reconciliation (Slice 6) — the worker
+  sends its held jobs (`known_jobs`); the coordinator answers `dead_job_ids`; the worker
+  discards those (stop container, salvage, ack drops rows), never re-attaching them.
 - [x] Register with the **reconciled** state (after boot recovery), never the raw stale
   "still RUNNING" state.
 
@@ -302,10 +303,18 @@ The container and its SDK never died, so the SDK's in-memory task state is intac
      removed only after the ack, so a crash mid-recovery re-runs safely.
    - Verified: `absentOnRecovery` / `exitedOnRecovery` agent tests + a
      real-docker `salvageLogs` test in JobLauncherTest.
-6. ⬜ **Coordinator reconciliation** for the slow-restart case — the coordinator
-   already failed the job (HEARTBEAT_LOST); the returning worker must detect the
-   job is terminal on the coordinator and stop + clean up its container instead
-   of re-asserting it.
+6. ✅ **Coordinator reconciliation** for the slow-restart case — register
+   reconciliation: the worker sends its held jobs at register (`known_jobs`,
+   built from the recovery decisions); the coordinator answers `dead_job_ids`
+   (held jobs already terminal there; unknown ids are never called dead). The
+   worker discards each dead job before acting on recovery decisions: stop the
+   container, salvage outputs/logs (checkpoint kept), status-only report — the
+   coordinator drops it, but its close ack clears the store rows. The
+   coordinator's verdict (FAILED / HEARTBEAT_LOST) stays untouched. Landed with
+   it: `heartbeatTimeoutSeconds` default 15 → 300, so an upgrade/reboot
+   re-attaches instead of losing jobs (k8s/YARN-style: short outage →
+   work-preserving; declared dead → fence). Verified: `deadOnRecovery` agent
+   test + full suite; README "Register reconciliation (slow restart)".
 
 ## Later phases (after Stage 1)
 - **Drain/drained state across restart** — persist and resume it (open question from #16).
