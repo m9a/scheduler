@@ -787,13 +787,50 @@ this list is **empty**, by construction:
 The only way a worker is told to kill: its job was already failed **before**
 the coordinator went down (that worker had been silent past the timeout).
 
-### Known limitation (next slice)
+### A running job survives the failover fully connected
 
-The per-job status/telemetry streams are not yet re-opened after a reconnect.
-A job still running when the coordinator returns keeps working, but its live
-updates don't flow until it ends; its outcome then arrives via the next
-reconciliation. Re-opening the streams on reconnect is the next slice
-(persistence.md Phase 5, slice 5).
+After re-registering, the worker re-opens the running job's status and
+telemetry streams — the old ones died with the coordinator. The next task
+update flows live to the new coordinator, and the job's terminal report and
+ack ride the fresh stream. No re-declare is needed: reconciliation already
+replayed the store, and every forwarded task update carries the job-RUNNING
+stamp.
+
+### Reconciliation at register
+
+The coordinator reconciles what it persisted against what the worker declares:
+
+**Worker knows, coordinator doesn't** — a job whose status updates were sent
+during the outage. The coordinator restarted from SQLite without them; the
+worker's outbox has the rows. The worker flushes them at register;
+`handleStatusUpdate` applies each idempotently. Terminal jobs are acked back
+in `acked_job_ids`; the worker drops those rows.
+
+**Coordinator knows, worker doesn't** — a job the coordinator has assigned
+to this worker (STARTING/RUNNING in the coordinator's store) that the worker
+didn't send back in `known_jobs`. This is an **orphan**: the worker crashed
+in the narrow window between claiming the job and its first status-store
+write (or the store was lost). Today this case is not yet handled — the
+coordinator logs and ignores it. A future slice will fail the orphan with a
+distinct reason so the user can resubmit (requeue is deferred to #6/#13).
+
+### Failover message flow (coordinator restart, worker stays up)
+
+```
+Worker (up, running job J)                Coordinator (restarting)
+      │                                          │ boot: recover() from SQLite;
+      │                                          │ seed registry; hold monitor
+      │  command stream onError ──────────►      │ (reregistrationTimeoutSeconds)
+      │  channel TRANSIENT_FAILURE → READY       │ up
+      │                                          │
+      │  register(worker_id, known_jobs=[J]) ───►│ ingest J (idempotent);
+      │                                          │ reconcile assigned-vs-known
+      │  ◄─ RegisterWorkerResponse(acked_job_ids)│
+      │  prune acked terminals                   │
+      │  restart heartbeat; resubscribe streams  │
+      │  re-open per-job status+telemetry ──────►│ live reporting resumes
+      │  resume PullJob                          │
+```
 
 ## Input/Output Files
 

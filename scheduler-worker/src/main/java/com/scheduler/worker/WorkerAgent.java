@@ -116,6 +116,10 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
     // exit to fail the job even if the container exited 0. Reset per job in
     // openReportingChannel.
     private volatile boolean currentJobTaskFailed;
+    // The running job's reporting pipes. The WebSocket handlers and the terminal
+    // path read this field on every use, so a coordinator reconnect can swap in
+    // fresh streams mid-job (see onCoordinatorReconnect). Null when idle.
+    private volatile JobReporting currentReporting;
     private String workerId;
 
     public WorkerAgent(WorkerConfig config, ObjectStore objectStore) throws IOException {
@@ -322,6 +326,28 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         for (String jobId : jobIdsToKill) {
             stopRunningJob(jobId, "reconcile");
         }
+        reopenReportingStreams();
+    }
+
+    /**
+     * Swaps fresh per-job streams into the running job's reporting pipes — the
+     * old ones died with the coordinator. The handlers read {@code currentReporting}
+     * per update, so the swap takes effect on the next one. The dead streams are
+     * abandoned, not closed: their calls are already broken. No state re-declare
+     * is needed — reconciliation just replayed the store, and every forwarded
+     * task update carries the job-RUNNING stamp.
+     */
+    private void reopenReportingStreams() {
+        String jobId = currentJobId;
+        JobReporting reporting = currentReporting;
+        if (jobId == null || reporting == null) {
+            return;  // idle — nothing to re-open
+        }
+        log.info("Re-opening per-job streams after coordinator reconnect: jobId={}", jobId);
+        currentReporting = new JobReporting(
+                coordinatorClient.openStatusStream(jobId),
+                coordinatorClient.openTelemetryStream(jobId),
+                reporting.liveness());
     }
 
     /**
@@ -455,7 +481,8 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
             statusStore.update(runningUpdate);
             reporting.statusStream().report(runningUpdate);
             StatusUpdate terminal = reattachJob(jobId, logFile, reporting.liveness());
-            reportTerminalUpdate(jobId, jobId, terminal, reporting);
+            // currentReporting, not the local: the streams may have been swapped.
+            reportTerminalUpdate(jobId, jobId, terminal, currentReporting);
             launcher.uploadOutputs(jobId, outputDir, logFile);
         } finally {
             currentJobId = null;
@@ -515,7 +542,8 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         metrics.jobStarted(job.getId(), job.getName());
         StatusUpdate terminal = spawnJob(job, inputDir, outputDir, logFile,
                 reporting.liveness());
-        reportTerminalUpdate(job.getId(), job.getName(), terminal, reporting);
+        // currentReporting, not the local: the streams may have been swapped.
+        reportTerminalUpdate(job.getId(), job.getName(), terminal, currentReporting);
     }
 
     /** Persists and sends the terminal update, then tears down the reporting pipes. */
@@ -540,7 +568,9 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         currentJobTaskFailed = false;
 
         CoordinatorStatusStream statusStream = coordinatorClient.openStatusStream(jobId);
-        onStatusUpdate(update -> relayTaskStatus(statusStream, update));
+        // Read currentReporting per update, not the local: a coordinator
+        // reconnect may have swapped in a fresh stream since this job started.
+        onStatusUpdate(update -> relayTaskStatus(currentReporting.statusStream(), update));
 
         CoordinatorTelemetryStream telemetryStream = coordinatorClient.openTelemetryStream(jobId);
 
@@ -556,11 +586,12 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         // Telemetry: forward each SDK Report, re-stamped with the monitor's last
         // liveness time (see relayTelemetry). The activity listener above runs
         // before this handler on each frame, so that time is this report's arrival.
-        jobCallbacks.setReportHandler(report -> relayTelemetry(telemetryStream, liveness, report));
+        jobCallbacks.setReportHandler(report -> relayTelemetry(currentReporting.telemetryStream(), liveness, report));
 
         liveness.start();
 
-        return new JobReporting(statusStream, telemetryStream, liveness);
+        currentReporting = new JobReporting(statusStream, telemetryStream, liveness);
+        return currentReporting;
     }
 
     /** Unbinds the WebSocket handlers, then closes the monitor and both streams. */
@@ -570,6 +601,8 @@ public class WorkerAgent implements AutoCloseable, ContainerInspector {
         // Stop routing telemetry before closing the stream. A late frame after
         // this is dropped — telemetry is lossy by design.
         jobCallbacks.setReportHandler(null);
+        // Only after the handlers are unbound — they read this field per update.
+        currentReporting = null;
         reporting.telemetryStream().complete();
         awaitTelemetryClose(reporting.telemetryStream());
         metrics.jobFinished(jobId, jobName, metricsOutcomeLabel(terminalState));
